@@ -1,0 +1,15 @@
+<root main_tree_to_execute="MUMT_Autopilot">
+  <BehaviorTree ID="MUMT_Autopilot">
+    <Sequence name="MUMT_Autopilot_Main">
+      <HasAircraftState name="HasAircraftState"/>
+      <SelectControlledAircraft name="SelectUAVs"/>
+
+      <Selector name="FlightModeSelector">
+        <RecoverIfBadAttitude name="RecoverIfBadAttitude"/>
+        <ParallelFlightControl name="ParallelFlightControl"/>
+      </Selector>
+
+      <PublishCommands name="PublishCommands"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

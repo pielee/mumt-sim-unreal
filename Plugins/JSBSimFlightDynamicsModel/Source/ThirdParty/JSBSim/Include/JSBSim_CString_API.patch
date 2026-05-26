@@ -1,0 +1,16 @@
+--- FGFDMExec.h
++++ FGFDMExec.h
+@@ -290,6 +290,13 @@
+   bool LoadModel(const std::string& model, bool addModelToPath = true);
+ 
++  // C-String API to avoid std::string ABI issues across DLL boundaries
++  bool LoadModel(const char* model, bool addModelToPath = true);
++  void SetRootDir(const char* dir);
++  void SetAircraftPath(const char* path);
++  void SetEnginePath(const char* path);
++  void SetSystemsPath(const char* path);
++  const char* GetModelNameCString() const;
++
+   /** Load a script
+       @param script the script file name
+       @param deltaT the time step size

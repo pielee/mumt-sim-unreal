@@ -1,0 +1,51 @@
+mumt_bt_controller:
+  ros__parameters:
+    state_topic: /mumt/aircraft_states
+    command_topic: /mumt/aircraft_commands
+    controlled_name_pattern: UAV
+    max_controlled_aircraft: 3
+
+    tick_rate_hz: 20.0
+    invert_pitch_cmd: true
+
+    low_speed_mps: 140.0
+    high_speed_mps: 185.0
+
+    accel_throttle: 1.0
+    cruise_throttle: 0.75
+    slow_throttle: 0.0
+
+    accel_target_pitch_deg: 12.0
+    cruise_target_pitch_deg: 2.0
+    slow_target_pitch_deg: 10.0
+
+    pitch_gain: 0.10
+    roll_gain: 0.03
+    pitch_limit: 0.8
+    roll_limit: 0.5
+    pitch_deadband_deg: 1.5
+
+    bad_roll_deg: 70.0
+    bad_pitch_down_deg: -20.0
+    recovery_target_pitch_deg: 8.0
+    recovery_throttle: 0.8
+
+    parallel_leader_name: ""
+    parallel_reference_speed_mps: 165.0
+    parallel_target_pitch_deg: 2.0
+    parallel_throttle_base: 0.75
+    parallel_speed_gain: 0.018
+    parallel_speed_damping: 0.006
+    parallel_pitch_gain: 0.065
+    parallel_pitch_limit: 0.45
+    parallel_pitch_deadband_deg: 2.5
+    parallel_heading_gain: 0.02
+    parallel_heading_damping: 0.008
+    parallel_yaw_limit: 0.4
+    parallel_heading_deadband_deg: 2.0
+    parallel_throttle_slew_per_tick: 0.03
+    parallel_attitude_slew_per_tick: 0.06
+    parallel_yaw_slew_per_tick: 0.04
+
+    pitch_hold_ticks: 6
+    pitch_cooldown_ticks: 8
