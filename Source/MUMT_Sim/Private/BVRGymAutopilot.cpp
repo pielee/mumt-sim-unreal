@@ -52,18 +52,11 @@ FAutopilotOutput FAircraftAutopilot::GetControlInput(
         // ── Hard-turn mode ────────────────────────────────────────────────
         AltActSpace = NavParams.AltActSpaceMax;
 
-        const float RollDir = (DiffHeadDeg >= 0.f) ? 1.f : -1.f;
-        SetRollPID(RollDir * NavParams.RollMax, false, CurrentPhiDeg);
+        const float BankRef = (DiffHeadDeg >= 0.f ? 1.f : -1.f) * NavParams.RollMax;
+        SetRollPID(BankRef, false, CurrentPhiDeg);
 
-        if (FMath::Abs(DiffAltM) < 200.f)
-        {
-            ElevatorCmd = (NavParams.RollMax - FMath::Abs(CurrentPhiDeg) < 30.f)
-                          ? -0.3f : -0.9f;
-        }
-        else
-        {
-            SetPitchPID(FMath::RadiansToDegrees(FMath::Atan2(DiffAltM, NavParams.TanRef)), CurrentThetaDeg);
-        }
+        SetPitchPID(FMath::RadiansToDegrees(FMath::Atan2(DiffAltM, NavParams.TanRef)),
+                    CurrentThetaDeg);
 
         HeadActSpace = NavParams.HeadActSpaceMin;
 

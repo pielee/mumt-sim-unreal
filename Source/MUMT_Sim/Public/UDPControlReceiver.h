@@ -88,9 +88,10 @@ private:
     FAircraftAutopilot Autopilot;
     FTimerHandle AutopilotTimerHandle;
     FTimerHandle StateSendTimerHandle;
-    float ActiveHeadingDeg = 0.f;
-    float ActiveAltitudeM  = 3000.f;
-    float ActiveThrottle   = 0.8f;
+    float ActiveHeadingDeg  = 0.f;
+    float ActiveAltitudeM   = 3000.f;
+    float ActiveThrottle    = 0.8f;
+    bool  bSetpointReceived = false;  // autopilot inactive until first setpoint arrives
 
 public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Receiver")

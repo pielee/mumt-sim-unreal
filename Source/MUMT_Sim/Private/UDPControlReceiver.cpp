@@ -275,11 +275,12 @@ void AUDPControlReceiver::ReceiveSetpointData()
                 Autopilot.PitchPID   = PitchPIDConfig;
                 Autopilot.NavParams  = NavParams;
             }
-            ActiveHeadingDeg = Pkt.HeadingDeg;
-            ActiveAltitudeM  = Pkt.AltitudeM;
-            ActiveThrottle   = Pkt.ThrottleNorm;
-            LatestSeq        = Pkt.Seq;
-            bGotPacket       = true;
+            ActiveHeadingDeg  = Pkt.HeadingDeg;
+            ActiveAltitudeM   = Pkt.AltitudeM;
+            ActiveThrottle    = Pkt.ThrottleNorm;
+            LatestSeq         = Pkt.Seq;
+            bGotPacket        = true;
+            bSetpointReceived = true;
         }
     }
 }
@@ -302,7 +303,8 @@ void AUDPControlReceiver::AutopilotTick()
     Autopilot.PitchPID   = PitchPIDConfig;
     Autopilot.NavParams  = NavParams;
 
-    // Apply to the primary controlled pawn
+    // Apply to the primary controlled pawn (only after first setpoint received)
+    if (!bSetpointReceived && !bUseDebugSetpoint) return;
     if (APawn* Pawn = CachedTargetPawn ? CachedTargetPawn : FindTargetPawn())
         ApplyAutopilotToPawn(Pawn);
 }

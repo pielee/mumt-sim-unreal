@@ -80,6 +80,10 @@ struct MUMT_SIM_API FAutopilotNavParams
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Autopilot|Nav")
     float ClimbThetaMax =  45.f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Autopilot|Nav")
+    float BankGain = 0.8f;
+
 };
 
 // ─── Autopilot output ──────────────────────────────────────────────────────
