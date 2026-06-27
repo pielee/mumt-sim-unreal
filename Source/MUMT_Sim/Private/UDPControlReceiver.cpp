@@ -19,39 +19,6 @@
 namespace
 {
     constexpr float FeetToMeters = 0.3048f;
-    constexpr int32 SetpointPacketSize = 17;
-
-    // Binary setpoint packet layout (little-endian, 17 bytes):
-    //   [0]     uint8  msg_type  (0x01)
-    //   [1..4]  float  heading_deg
-    //   [5..8]  float  altitude_m
-    //   [9..12] float  throttle_norm
-    //   [13]    uint8  launch_missile
-    //   [14]    uint8  reset
-    //   [15..16] uint16 seq
-    struct FSetpointPacket
-    {
-        float   HeadingDeg   = 0.f;
-        float   AltitudeM    = 0.f;
-        float   ThrottleNorm = 0.8f;
-        bool    Reset        = false;
-        uint16  Seq          = 0;
-    };
-
-    bool ParseSetpointPacket(const uint8* Buf, int32 Len, FSetpointPacket& Out)
-    {
-        if (Len < SetpointPacketSize || Buf[0] != 0x01) return false;
-
-        auto R32 = [&](int O) { float V; FMemory::Memcpy(&V, Buf + O, 4); return V; };
-        auto R16 = [&](int O) { uint16 V; FMemory::Memcpy(&V, Buf + O, 2); return V; };
-
-        Out.HeadingDeg   = R32(1);
-        Out.AltitudeM    = R32(5);
-        Out.ThrottleNorm = FMath::Clamp(R32(9), 0.f, 1.f);
-        Out.Reset        = Buf[14] != 0;
-        Out.Seq          = R16(15);
-        return true;
-    }
 }
 
 namespace
@@ -95,11 +62,7 @@ void AUDPControlReceiver::BeginPlay()
         UE_LOG(LogTemp, Error, TEXT("[Autopilot] Failed to start setpoint receiver on port %d"), SetpointListenPort);
     }
 
-    // Apply initial gain configs to the autopilot
-    Autopilot.RollPID    = RollPIDConfig;
-    Autopilot.RollSecPID = RollSecPIDConfig;
-    Autopilot.PitchPID   = PitchPIDConfig;
-    Autopilot.NavParams  = NavParams;
+    // Per-UAV autopilots are created lazily as setpoints arrive (see AutopilotTick).
 
     // 60 Hz autopilot timer
     GetWorldTimerManager().SetTimer(
@@ -125,7 +88,7 @@ void AUDPControlReceiver::Tick(float DeltaTime)
     Super::Tick(DeltaTime);
 
     ReceiveUDPData();
-    ReceiveSetpointData();   // drain binary setpoint packets
+    ReceiveSetpointData();   // drain JSON setpoint packets (per-UAV)
 
     const TArray<APawn*> ControlledPawns = FindTargetPawns(ControlledPawnNamePatterns, MaxControlledUavs);
     CachedTargetPawn = ControlledPawns.Num() > 0 ? ControlledPawns[0] : FindTargetPawn();
@@ -246,112 +209,167 @@ void AUDPControlReceiver::ReceiveSetpointData()
     if (!SetpointSocket) return;
 
     uint32 PendingSize = 0;
-    uint16 LatestSeq   = 0;
-    bool   bGotPacket  = false;
-
     while (SetpointSocket->HasPendingData(PendingSize))
     {
-        uint8 Buf[SetpointPacketSize + 4] = {};
+        TArray<uint8> Data;
+        Data.SetNumZeroed(FMath::Min(PendingSize, 65507u) + 1);
         int32 BytesRead = 0;
-        TSharedRef<FInternetAddr> Sender =
-            ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->CreateInternetAddr();
+        FInternetAddr& Sender = *ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->CreateInternetAddr();
 
-        if (!SetpointSocket->RecvFrom(Buf, sizeof(Buf), BytesRead, *Sender))
+        if (!SetpointSocket->RecvFrom(Data.GetData(), Data.Num() - 1, BytesRead, Sender))
             break;
 
-        FSetpointPacket Pkt;
-        if (!ParseSetpointPacket(Buf, BytesRead, Pkt)) continue;
+        Data[BytesRead] = '\0';
+        const FString Msg = FString(UTF8_TO_TCHAR(reinterpret_cast<const char*>(Data.GetData()))).Left(BytesRead);
 
-        // Keep only the newest packet (wrapping-safe comparison)
-        if (!bGotPacket || (uint16)(Pkt.Seq - LatestSeq) < 32768u)
+        TSharedPtr<FJsonObject> Root;
+        const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Msg);
+        if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+            continue;
+
+        // Store one setpoint object into the per-UAV map (keyed by aircraft_name).
+        auto StoreOne = [this](const TSharedPtr<FJsonObject>& O)
         {
-            if (Pkt.Reset)
+            FString Name;
+            if (!O->TryGetStringField(TEXT("aircraft_name"), Name) || Name.IsEmpty())
+                return;
+
+            bool bReset = false;
+            if (O->TryGetBoolField(TEXT("reset"), bReset) && bReset)
+                Autopilots.Remove(Name);   // next tick rebuilds a fresh controller
+
+            FUavSetpoint SP;
+            double V;
+            if (O->TryGetNumberField(TEXT("heading_deg"),   V)) SP.HeadingDeg = (float)V;
+            if (O->TryGetNumberField(TEXT("altitude_m"),    V)) SP.AltitudeM  = (float)V;
+            if (O->TryGetNumberField(TEXT("throttle_norm"), V)) SP.Throttle   = FMath::Clamp((float)V, 0.f, 1.f);
+            O->TryGetBoolField(TEXT("launch_missile"), SP.LaunchMissile);
+
+            Setpoints.Add(Name, SP);   // latest-wins per aircraft
+        };
+
+        if (Root->HasTypedField<EJson::Array>(TEXT("setpoints")))
+        {
+            for (const TSharedPtr<FJsonValue>& V : Root->GetArrayField(TEXT("setpoints")))
             {
-                Autopilot = FAircraftAutopilot();
-                Autopilot.RollPID    = RollPIDConfig;
-                Autopilot.RollSecPID = RollSecPIDConfig;
-                Autopilot.PitchPID   = PitchPIDConfig;
-                Autopilot.NavParams  = NavParams;
+                const TSharedPtr<FJsonObject>* O = nullptr;
+                if (V.IsValid() && V->TryGetObject(O) && O && O->IsValid())
+                    StoreOne(*O);
             }
-            ActiveHeadingDeg  = Pkt.HeadingDeg;
-            ActiveAltitudeM   = Pkt.AltitudeM;
-            ActiveThrottle    = Pkt.ThrottleNorm;
-            LatestSeq         = Pkt.Seq;
-            bGotPacket        = true;
-            bSetpointReceived = true;
+        }
+        else
+        {
+            StoreOne(Root);   // single setpoint object
         }
     }
 }
 
-// ─── Autopilot: 60 Hz tick ────────────────────────────────────────────────────
+// ─── Autopilot: 60 Hz tick (per-UAV) ──────────────────────────────────────────
 
 void AUDPControlReceiver::AutopilotTick()
 {
-    // Resolve setpoint: debug UPROPERTY takes priority over UDP
-    if (bUseDebugSetpoint)
+    // Debug: inject a setpoint for the cached target (PIE tuning without ROS)
+    if (bUseDebugSetpoint && IsValid(CachedTargetPawn))
     {
-        ActiveHeadingDeg = DebugTargetHeadingDeg;
-        ActiveAltitudeM  = DebugTargetAltitudeM;
-        ActiveThrottle   = DebugTargetThrottle;
+        FUavSetpoint& SP = Setpoints.FindOrAdd(CachedTargetPawn->GetName());
+        SP.HeadingDeg = DebugTargetHeadingDeg;
+        SP.AltitudeM  = DebugTargetAltitudeM;
+        SP.Throttle   = DebugTargetThrottle;
     }
 
-    // Sync gains in case they were changed live in PIE
-    Autopilot.RollPID    = RollPIDConfig;
-    Autopilot.RollSecPID = RollSecPIDConfig;
-    Autopilot.PitchPID   = PitchPIDConfig;
-    Autopilot.NavParams  = NavParams;
+    if (Setpoints.Num() == 0) return;
 
-    // Apply to the primary controlled pawn (only after first setpoint received)
-    if (!bSetpointReceived && !bUseDebugSetpoint) return;
-    if (APawn* Pawn = CachedTargetPawn ? CachedTargetPawn : FindTargetPawn())
-        ApplyAutopilotToPawn(Pawn);
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    // Build the current pawn list once, then drive each aircraft that has a setpoint.
+    TArray<AActor*> Pawns;
+    UGameplayStatics::GetAllActorsOfClass(World, APawn::StaticClass(), Pawns);
+
+    for (const TPair<FString, FUavSetpoint>& Entry : Setpoints)
+    {
+        const FString& Key = Entry.Key;
+        if (Key.IsEmpty()) continue;
+
+        // 1) Exact name match — preferred and collision-free. With names like
+        //    "F16_UAV" and "F16_UAV2" (one a prefix of the other), this resolves
+        //    each to the right pawn before any substring logic runs.
+        APawn* Match = nullptr;
+        for (AActor* A : Pawns)
+            if (APawn* P = Cast<APawn>(A))
+                if (P->GetName() == Key) { Match = P; break; }
+
+        // 2) Substring fallback (tolerates spawn suffixes, e.g. "M_F16" -> "M_F16_C_0"),
+        //    but ONLY when exactly one pawn contains the key. If several match
+        //    (key "F16_UAV" would otherwise grab "F16_UAV2"), the name is ambiguous —
+        //    skip and warn rather than drive the wrong aircraft.
+        if (!Match)
+        {
+            APawn* Candidate = nullptr;
+            int32 NumMatches = 0;
+            for (AActor* A : Pawns)
+                if (APawn* P = Cast<APawn>(A))
+                    if (P->GetName().Contains(Key)) { Candidate = P; ++NumMatches; }
+
+            if (NumMatches == 1)
+            {
+                Match = Candidate;
+            }
+            else if (NumMatches > 1)
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("[AP] setpoint name '%s' is ambiguous (%d pawns contain it) — ignored. "
+                         "Use the exact pawn name as the aircraft_name."), *Key, NumMatches);
+            }
+        }
+
+        if (Match)
+            ApplyAutopilotToPawn(Match, Key, Entry.Value);
+    }
 }
 
-void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn)
+void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, const FUavSetpoint& Setpoint)
 {
     if (!IsValid(Pawn)) return;
 
     UJSBSimMovementComponent* JSBSim = FindJSBSimMovementComponent(Pawn);
     if (!JSBSim) return;
 
-    // Read flight state
-    const FAircraftState& S    = JSBSim->AircraftState;
-    const float PhiDeg         = (float)S.LocalEulerAngles.Roll;
-    const float ThetaDeg       = (float)S.LocalEulerAngles.Pitch;
-    const float PsiDeg         = (float)S.LocalEulerAngles.Yaw;
-    const float AltM           = (float)S.AltitudeASLFt * FeetToMeters;
+    // This UAV's own controller — separate PID/hysteresis state, created on first use.
+    FAircraftAutopilot& Autopilot = Autopilots.FindOrAdd(Key);
+    Autopilot.RollPID    = RollPIDConfig;      // sync gains (allows live PIE tuning)
+    Autopilot.RollSecPID = RollSecPIDConfig;
+    Autopilot.PitchPID   = PitchPIDConfig;
+    Autopilot.NavParams  = NavParams;
 
-    // Compute errors
-    const float DiffHead = FAircraftAutopilot::DeltaHeading(ActiveHeadingDeg, PsiDeg);
-    const float DiffAlt  = ActiveAltitudeM - AltM;
+    const FAircraftState& S = JSBSim->AircraftState;
+    const float PhiDeg   = (float)S.LocalEulerAngles.Roll;
+    const float ThetaDeg = (float)S.LocalEulerAngles.Pitch;
+    const float PsiDeg   = (float)S.LocalEulerAngles.Yaw;
+    const float AltM     = (float)S.AltitudeASLFt * FeetToMeters;
 
-    static int32 LogCounter = 0;
-    const bool bLogState = (++LogCounter % 10 == 0);  // 6Hz
+    const float DiffHead = FAircraftAutopilot::DeltaHeading(Setpoint.HeadingDeg, PsiDeg);
+    const float DiffAlt  = Setpoint.AltitudeM - AltM;
 
-    // Run outer-loop PID
-    const FAutopilotOutput Out = Autopilot.GetControlInput(
-        DiffHead, DiffAlt, PhiDeg, ThetaDeg);
+    const FAutopilotOutput Out = Autopilot.GetControlInput(DiffHead, DiffAlt, PhiDeg, ThetaDeg);
 
-    // Write to JSBSim Commands struct — plugin pushes this to FDM every Tick
     JSBSim->Commands.Aileron  = Out.Aileron;
     JSBSim->Commands.Elevator = Out.Elevator;
     JSBSim->Commands.Rudder   = Out.Rudder;
-
     if (JSBSim->EngineCommands.Num() > 0)
-        JSBSim->EngineCommands[0].Throttle = ActiveThrottle;
+        JSBSim->EngineCommands[0].Throttle = Setpoint.Throttle;
 
-    // Cache for HUD / Blueprint read
+    // Last-applied (HUD/debug)
     AutopilotAileron  = Out.Aileron;
     AutopilotElevator = Out.Elevator;
 
-    if (bLogState)
+    static int32 LogCounter = 0;
+    if (++LogCounter % 60 == 0)
     {
         UE_LOG(LogTemp, Warning,
-            TEXT("[AP-STATE] Psi=%.1f Phi=%.1f Theta=%.1f Alt=%.0f | Target(Hdg=%.1f Alt=%.0f) | DiffHead=%.1f DiffAlt=%.0f | Ail=%.3f Elv=%.3f"),
-            PsiDeg, PhiDeg, ThetaDeg, AltM,
-            ActiveHeadingDeg, ActiveAltitudeM,
-            DiffHead, DiffAlt,
-            Out.Aileron, Out.Elevator);
+            TEXT("[AP] %s -> Hdg=%.0f Alt=%.0f thr=%.2f | Psi=%.0f Alt=%.0f | Ail=%.2f Elv=%.2f"),
+            *Key, Setpoint.HeadingDeg, Setpoint.AltitudeM, Setpoint.Throttle,
+            PsiDeg, AltM, Out.Aileron, Out.Elevator);
     }
 }
 

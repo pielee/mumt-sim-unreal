@@ -102,10 +102,12 @@ There are **three independent ways** commands reach the JSBSim component, two of
           SetBlueprintNumber(pawn,"UDP_Roll"/"UDP_Pitch"/"UDP_Yaw"/"UDP_Throttle")
         └─► pawn BP graph reads UDP_* ──► JSBSimMovementComponent.Commands
 
-(C) AUTOPILOT / SETPOINT  (remote)   — DIRECT, bypasses Blueprint variables
-    AUDPControlReceiver::ReceiveSetpointData (port 5010, binary 17B)
-      → FBVRGymAutopilot cascade PID (heading→bank→aileron, alt→pitch→elevator), 60 Hz
-      → ApplyAutopilotToPawn(pawn)
+(C) AUTOPILOT / SETPOINT  (remote, PER-UAV)   — DIRECT, bypasses Blueprint variables
+    AUDPControlReceiver::ReceiveSetpointData (port 5010, JSON {aircraft_name,...})
+      → store in TMap<name,FUavSetpoint> Setpoints  (latest-wins per aircraft)
+      → AutopilotTick (60 Hz) loops setpoints, matches pawn by name, per-UAV FBVRGymAutopilot
+        (cascade PID: heading→bank→aileron, alt→pitch→elevator)
+      → ApplyAutopilotToPawn(pawn, name, setpoint)
           FindComponentByClass<UJSBSimMovementComponent>()
         └─► JSBSim->Commands.Aileron/Elevator/Rudder, EngineCommands[0].Throttle  (direct)
 ```

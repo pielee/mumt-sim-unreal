@@ -69,7 +69,7 @@ Node class `MumtBridgeNode`, node name **`mumt_bridge`**, console_script **`brid
 | `unreal_ip` | `127.0.0.1` | UE host |
 | `control_port` | `5005` | JSON command → UE |
 | `state_port` | `5006` | state ← UE (bridge binds `0.0.0.0:5006`) |
-| `setpoint_port` | `5010` | binary setpoint → UE |
+| `setpoint_port` | `5010` | JSON per-UAV setpoint → UE |
 
 (No launch/yaml overrides these, so they always run at defaults.)
 
@@ -77,19 +77,19 @@ Node class `MumtBridgeNode`, node name **`mumt_bridge`**, console_script **`brid
 | ROS topic | Type | Direction | UDP action |
 |---|---|---|---|
 | `/mumt/aircraft_commands` | `std_msgs/String` (JSON inside) | SUB | validate JSON → `sendto(unreal_ip, 5005)` (passthrough) |
-| `/aircraft/setpoint` | `custom_msgs/AircraftSetpoint` | SUB | `struct.pack("<BfffBBH", 0x01, heading, alt, clamp(throttle,0,1), launch_missile, 0, seq)` → `sendto(..., 5010)` |
+| `/aircraft/setpoint` | `custom_msgs/AircraftSetpoint` | SUB | `json.dumps({aircraft_name, heading_deg, altitude_m, throttle_norm(clamped 0..1), launch_missile})` → `sendto(..., 5010)` |
 | `/mumt/aircraft_states` | `std_msgs/String` (JSON) | PUB | 50 Hz timer (`create_timer(0.02)`) → `recvfrom(65535)` on 5006 → validate JSON → publish |
 
 ### Behavior details
 - **Three UDP sockets**: `_cmd_sock` (→5005), `_sp_sock` (→5010), `_recv_sock` (bound `0.0.0.0:5006`, `SO_REUSEADDR`, non-blocking).
 - **`_recv_state`** (50 Hz): drains the recv socket in a loop (`while True … except BlockingIOError: break`), validates each datagram as JSON, republishes as a `String`. Invalid JSON → warn + skip.
 - **`_on_command`**: validates the incoming String is JSON, then forwards the **raw bytes** to UE (no transform — the ROS String already carries the JSON the UE side expects).
-- **`_on_setpoint`**: serializes the typed message to the 17-byte wire format. **Hardcodes `reset=0`** and **generates `seq`** internally (`self._seq & 0xFFFF`, incrementing).
+- **`_on_setpoint`**: serializes the typed message to a JSON object (`aircraft_name`, `heading_deg`, `altitude_m`, `throttle_norm` clamped to [0,1], `launch_missile`) and sends it to 5010. The name carries through so UE routes the setpoint to the addressed UAV.
 
 ### What it does NOT do
-- No namespacing — single global topics, not `/{ns}/cmd` / `/{ns}/state`.
+- No namespacing of the bridge **topics** — `/aircraft/setpoint` is one shared global topic. Multi-UAV addressing is done **in the message** via `aircraft_name`, not via per-UAV topics. (Each BT runs under its own `--ns` and tags its own name.)
 - No QoS tuning (depth-10 default), no rate limiting on commands, no command echo/ack.
-- `reset` can't be driven from ROS (forced to 0); `launch_missile` is serialized but UE ignores it.
+- `launch_missile` is forwarded as a JSON bool (UE reads it into `FUavSetpoint`).
 
 ---
 
