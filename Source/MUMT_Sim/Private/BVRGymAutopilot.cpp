@@ -21,6 +21,14 @@ void FPID::Reset()
     Integrator = 0.f;
 }
 
+void FPID::SetGains(const FPID& Cfg)
+{
+    Kp = Cfg.Kp; Ki = Cfg.Ki; Kd = Cfg.Kd;
+    IntegMin = Cfg.IntegMin; IntegMax = Cfg.IntegMax;
+    Derivator = 0.f;   // matches prior per-tick reset (roll/pitch D unchanged)
+    // Integrator intentionally preserved → autothrottle trim accumulates.
+}
+
 // ─── FAircraftAutopilot ────────────────────────────────────────────────────
 
 FAircraftAutopilot::FAircraftAutopilot()
@@ -29,6 +37,9 @@ FAircraftAutopilot::FAircraftAutopilot()
     RollPID    = {0.01f, 0.f, 0.9f, -0.2f,  0.2f};
     RollSecPID = {0.2f,  0.f, 0.2f, -1.0f,  1.0f};
     PitchPID   = {0.3f,  0.f, 1.0f, -1.0f,  1.0f};
+    // Speed-hold (autothrottle): PI on airspeed error. Integrator provides the
+    // steady-state trim throttle (Ki*IntegMax ≈ 1). Output clamped to [0,1].
+    ThrottlePID = {0.02f, 0.004f, 0.f, 0.f, 250.f};
 
     AltActSpace   = NavParams.AltActSpaceMin;
     HeadActSpace  = NavParams.HeadActSpaceMin;
@@ -39,7 +50,9 @@ FAutopilotOutput FAircraftAutopilot::GetControlInput(
     float DiffHeadDeg,
     float DiffAltM,
     float CurrentPhiDeg,
-    float CurrentThetaDeg)
+    float CurrentThetaDeg,
+    float CurrentSpeedMps,
+    float TargetSpeedMps)
 {
     const float AbsHead = FMath::Abs(DiffHeadDeg);
     const float AbsAlt  = FMath::Abs(DiffAltM);
@@ -103,7 +116,10 @@ FAutopilotOutput FAircraftAutopilot::GetControlInput(
         HeadActSpace = NavParams.HeadActSpaceMax;
     }
 
-    return {AileronCmd, ElevatorCmd, 0.f};
+    // Speed-hold runs regardless of turn/precision mode (energy management).
+    SetThrottlePID(CurrentSpeedMps, TargetSpeedMps);
+
+    return {AileronCmd, ElevatorCmd, 0.f, ThrottleCmd};
 }
 
 void FAircraftAutopilot::SetRollPID(float RollRef, bool bUseSecondary,
@@ -120,6 +136,19 @@ void FAircraftAutopilot::SetPitchPID(float ThetaRef, float CurrentThetaDeg)
     ThetaRef = FMath::Clamp(ThetaRef, -90.f, 90.f);
     ElevatorCmd = FMath::Clamp(PitchPID.Update(ThetaRef - CurrentThetaDeg),
                                -1.f, 1.f);
+}
+
+void FAircraftAutopilot::SetThrottlePID(float CurrentSpeedMps, float TargetSpeedMps)
+{
+    if (TargetSpeedMps <= 0.f)
+    {
+        ThrottleCmd = -1.f;   // speed-hold disabled → caller uses external throttle
+        return;
+    }
+    // FPID error = 0 - CurrentValue, so pass (V - V_target) → error = (V_target - V):
+    // slower than target → positive error → throttle up.
+    ThrottleCmd = FMath::Clamp(ThrottlePID.Update(CurrentSpeedMps - TargetSpeedMps),
+                               0.f, 1.f);
 }
 
 float FAircraftAutopilot::DeltaHeading(float TargetDeg, float CurrentDeg)

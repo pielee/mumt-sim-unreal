@@ -21,13 +21,14 @@ struct FRemoteControlCommand
     bool bValid = false;
 };
 
-// High-level autopilot setpoint for one UAV (heading/altitude/throttle).
+// High-level autopilot setpoint for one UAV (heading/altitude/speed-or-throttle).
 struct FUavSetpoint
 {
-    float HeadingDeg    = 0.f;
-    float AltitudeM     = 0.f;
-    float Throttle      = 0.8f;
-    bool  LaunchMissile = false;
+    float HeadingDeg     = 0.f;
+    float AltitudeM      = 0.f;
+    float Throttle       = 0.8f;  // used only when TargetSpeedMps <= 0 (open-loop)
+    float TargetSpeedMps = 0.f;   // >0 → autothrottle holds this airspeed
+    bool  LaunchMissile  = false;
 };
 
 UCLASS()
@@ -157,6 +158,12 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Gains")
     FPID PitchPIDConfig   = {0.3f,  0.f, 1.0f, -1.0f,  1.0f};
+
+    // Autothrottle (speed-hold). Output is throttle [0,1]; integrator carries the
+    // trim throttle, so Ki*IntegMax should be ≈ 1. Active only when a setpoint
+    // provides target_speed_mps > 0.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Gains")
+    FPID ThrottlePIDConfig = {0.02f, 0.004f, 0.f, 0.f, 250.f};
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Nav")
     FAutopilotNavParams NavParams;

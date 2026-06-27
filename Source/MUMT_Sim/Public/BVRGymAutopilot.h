@@ -42,6 +42,10 @@ struct MUMT_SIM_API FPID
 
     float Update(float CurrentValue);
     void  Reset();
+    // Copy gains only (Kp/Ki/Kd/IntegMin/IntegMax) and KEEP the Integrator.
+    // Used to sync live-tuned gains every tick WITHOUT wiping the integral term —
+    // critical for the autothrottle, whose integrator carries the trim throttle.
+    void  SetGains(const FPID& Cfg);
 };
 
 // ─── Navigation parameters ─────────────────────────────────────────────────
@@ -93,6 +97,7 @@ struct FAutopilotOutput
     float Aileron  = 0.f;  // [-1, 1]
     float Elevator = 0.f;  // [-1, 1]
     float Rudder   = 0.f;  // always 0
+    float Throttle = -1.f; // [0, 1] from speed-hold; <0 = no speed control (use external throttle)
 };
 
 // ─── FAircraftAutopilot ────────────────────────────────────────────────────
@@ -107,11 +112,15 @@ public:
     //   DiffAltM        = TargetAltM - CurrentAltM
     //   CurrentPhiDeg   = AircraftState.LocalEulerAngles.Roll
     //   CurrentThetaDeg = AircraftState.LocalEulerAngles.Pitch
+    //   CurrentSpeedMps = current airspeed (m/s)
+    //   TargetSpeedMps  = desired airspeed; <=0 disables speed-hold (Throttle output = -1)
     FAutopilotOutput GetControlInput(
         float DiffHeadDeg,
         float DiffAltM,
         float CurrentPhiDeg,
-        float CurrentThetaDeg);
+        float CurrentThetaDeg,
+        float CurrentSpeedMps = 0.f,
+        float TargetSpeedMps  = 0.f);
 
     // ((target - current + 180) % 360) - 180  →  [-180, 180]
     static float DeltaHeading(float TargetDeg, float CurrentDeg);
@@ -120,6 +129,7 @@ public:
     FPID RollPID;
     FPID RollSecPID;
     FPID PitchPID;
+    FPID ThrottlePID;              // speed-hold (autothrottle): drives throttle to hold TargetSpeed
     FAutopilotNavParams NavParams;
 
 private:
@@ -128,8 +138,10 @@ private:
     float ThetaActSpace;
     float AileronCmd  = 0.f;
     float ElevatorCmd = 0.f;
+    float ThrottleCmd = -1.f;
 
     void SetRollPID (float RollRef,  bool bUseSecondary, float CurrentPhiDeg);
     void SetPitchPID(float ThetaRef, float CurrentThetaDeg);
+    void SetThrottlePID(float CurrentSpeedMps, float TargetSpeedMps);
     static float RollCircleClip(float D);
 };
