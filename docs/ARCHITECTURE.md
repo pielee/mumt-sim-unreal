@@ -20,7 +20,7 @@ setpoint); state flows out one way (JSON batch).
                               ┌─────────────────────────────────────────────────────────────┐
                               │                  ROS2 side (optional, partial)                │
    /aircraft/setpoint ───────▶│  bridge_node.py (node "mumt_bridge")                         │
-   (custom_msgs/AircraftSetpoint)  _on_setpoint: struct.pack("<BfffBBH")=17B ───┐             │
+   (custom_msgs/AircraftSetpoint)  _on_setpoint: json.dumps({aircraft_name,...}) ┐             │
                               │                                                  │             │
    /mumt/aircraft_commands ──▶│  _on_command: JSON UTF-8 passthrough ──┐         │             │
    (std_msgs/String, JSON)    │                                        │         │             │
@@ -36,10 +36,10 @@ setpoint); state flows out one way (JSON batch).
    ║  Unreal Engine 5.4  (AUDPControlReceiver, Source/MUMT_Sim)              │              ║
    ║   ListenPort 5005      ◀── JSON control RX  {roll,pitch,yaw,throttle}   │              ║
    ║                            or {commands:[{...,aircraft_name?}]}         │              ║
-   ║   SetpointListenPort 5010 ◀── binary 17B setpoint RX ───────────────────┘              ║
-   ║        [0]u8=0x01 [1..4]f heading_deg [5..8]f altitude_m                               ║
-   ║        [9..12]f throttle_norm [13]u8 launch_missile(ignored) [14]u8 reset [15..16]u16  ║
-   ║          │  60Hz AutopilotTick                                                         ║
+   ║   SetpointListenPort 5010 ◀── JSON per-UAV setpoint RX ──────────────────┘              ║
+   ║        {aircraft_name, heading_deg, altitude_m, throttle_norm, launch_missile}         ║
+   ║        → TMap<name,FUavSetpoint> Setpoints / TMap<name,FAircraftAutopilot> Autopilots  ║
+   ║          │  60Hz AutopilotTick — loops every setpoint, matches pawn by name            ║
    ║          ▼                                                                             ║
    ║   FBVRGymAutopilot (cascade PID)  heading→bank(BankGain0.8,RollMax80°)→Aileron         ║
    ║                                   altitude→pitch(PitchPID)→Elevator                    ║
@@ -71,7 +71,7 @@ single global topic `/mumt/aircraft_states`, not `/{ns}/state`.
 - `ListenPort = 5005` — JSON control RX. Accepts two schemas:
   - top-level `{roll, pitch, yaw, throttle}` (broadcast to all)
   - `{commands:[{roll,pitch,yaw,throttle,aircraft_name?}, ...]}` (per-name/index; matched via `FindTargetPawns`)
-- `SetpointListenPort = 5010` — binary 17B setpoint RX, `ParseSetpointPacket` parses `<BfffBBH`. **byte13 (launch_missile) is packed but UE never reads it** (only reset@14, seq@15-16). Applied on the 60Hz `AutopilotTick`.
+- `SetpointListenPort = 5010` — **JSON per-UAV** setpoint RX `{aircraft_name, heading_deg, altitude_m, throttle_norm, launch_missile, reset?}`. Stored in `TMap<name,FUavSetpoint> Setpoints` (latest-wins per aircraft); `reset:true` drops that name's controller. Applied on the 60Hz `AutopilotTick`, which loops the map and drives each named pawn via its own `FAircraftAutopilot` (`Autopilots` map). A `{setpoints:[...]}` batch form is also accepted.
 - `PythonIP = 127.0.0.1`, `PythonStatePort = 5006`, `StateSendInterval = 0.05` (20Hz) — state out. JSON fields: `aircraft_name, x, y, z (UE cm), speed_mps (knots×0.514444), pitch/roll/yaw (deg), throttle, team, weapons:{bullet_ammo, rocket_ammo}`. team/weapons read optionally from pawn variables.
 
 **FBVRGymAutopilot** — cascade PID control law:
@@ -97,10 +97,10 @@ single global topic `/mumt/aircraft_states`, not `/{ns}/state`.
 
 - **The only implemented node**: `MumtBridgeNode` in `bridge_node.py` (node name `mumt_bridge`, console_script `bridge`). A pure UDP↔ROS relay.
   - SUB `/mumt/aircraft_commands` (String/JSON) → UDP 5005
-  - SUB `/aircraft/setpoint` (custom_msgs/AircraftSetpoint) → 17B binary → UDP 5010
+  - SUB `/aircraft/setpoint` (custom_msgs/AircraftSetpoint) → JSON `{aircraft_name,...}` → UDP 5010
   - PUB `/mumt/aircraft_states` (String/JSON) ← UDP 5006 (50Hz drain)
   - Ports are ROS params (`unreal_ip/control_port/state_port/setpoint_port`) but **no launch/yaml overrides them**, so all default to 127.0.0.1.
-- `custom_msgs/AircraftSetpoint.msg`: `heading_deg, altitude_m, throttle_norm (float32), launch_missile (bool)`. **No reset/seq fields** — both exist on the wire but the bridge hardcodes reset=0 (so a ROS-side reset can't reach UE) and generates seq internally.
+- `custom_msgs/AircraftSetpoint.msg`: `aircraft_name (string), heading_deg, altitude_m, throttle_norm (float32), launch_missile (bool)`. `aircraft_name` is the per-UAV address: every BT (one per UAV) tags its own name so the single shared `/aircraft/setpoint` topic carries all UAVs' commands and UE routes each to the right pawn.
 - **Behavior Tree: XML only, zero node implementations.** `behavior_trees/mumt_autopilot.xml` is BehaviorTree.CPP syntax (`main_tree_to_execute=MUMT_Autopilot`, Sequence: HasAircraftState → SelectControlledAircraft → Selector[RecoverIfBadAttitude, ParallelFlightControl] → PublishCommands). None of those node classes exist in Python or C++. **No generic MoveTo-style nodes, no blackboard keys.**
 - launch: `bt_controller.launch.py` tries to start `executable='bt_controller'`, but setup.py only registers `bridge` → **launch fails ("executable not found")**.
 - `bt_controller.yaml` holds detailed gains (pitch/roll/parallel-formation) that nothing reads.

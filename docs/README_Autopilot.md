@@ -19,15 +19,17 @@
   - **`Source/MUMT_Sim/Public/BVRGymAutopilot.h`** — declarations (`FPID`, `FAutopilotNavParams`, `FAutopilotOutput`, `FAircraftAutopilot`)
   - **`Source/MUMT_Sim/Private/BVRGymAutopilot.cpp`** — the control-law implementation
   - Part of the **`MUMT_Sim` runtime module** (game C++, not a plugin).
-- **Runtime location:** it is **not** a standalone Actor or Component. It exists only as a **member object**
-  `FAircraftAutopilot Autopilot;` inside **`AUDPControlReceiver`** (the level Actor that listens on UDP). So at
-  runtime the autopilot lives *inside the UDP receiver actor*, sitting between the binary setpoint input (port 5010)
-  and the target aircraft's `UJSBSimMovementComponent`. It has exactly **one instance** and drives **one pawn** (the
-  primary controlled UAV).
+- **Runtime location:** it is **not** a standalone Actor or Component. It exists only as **member objects**
+  inside **`AUDPControlReceiver`** (the level Actor that listens on UDP). So at runtime the autopilot lives
+  *inside the UDP receiver actor*, sitting between the JSON setpoint input (port 5010) and each aircraft's
+  `UJSBSimMovementComponent`. There is **one `FAircraftAutopilot` instance per UAV**, held in
+  `TMap<FString, FAircraftAutopilot> Autopilots` keyed by aircraft name (`FindOrAdd` on first setpoint), so
+  every UAV keeps its **own** PID / hysteresis state and they never interfere.
 
 ```
-  UDP 5010 setpoint ─► AUDPControlReceiver { FAircraftAutopilot Autopilot } ─► UJSBSimMovementComponent.Commands
-                          (60 Hz AutopilotTick)
+  UDP 5010 setpoint ─► AUDPControlReceiver { TMap<name,FUavSetpoint>       Setpoints,  ─► UJSBSimMovementComponent.Commands
+   {aircraft_name,...}                       TMap<name,FAircraftAutopilot> Autopilots }    (per matched pawn)
+                          (60 Hz AutopilotTick — loops over every setpoint, drives each named pawn)
 ```
 
 ---

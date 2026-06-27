@@ -21,6 +21,15 @@ struct FRemoteControlCommand
     bool bValid = false;
 };
 
+// High-level autopilot setpoint for one UAV (heading/altitude/throttle).
+struct FUavSetpoint
+{
+    float HeadingDeg    = 0.f;
+    float AltitudeM     = 0.f;
+    float Throttle      = 0.8f;
+    bool  LaunchMissile = false;
+};
+
 UCLASS()
 class MUMT_SIM_API AUDPControlReceiver : public AActor
 {
@@ -47,7 +56,7 @@ private:
     void StopSetpointReceiver();
     void ReceiveSetpointData();   // called every Tick, drains SetpointSocket
     void AutopilotTick();         // called at 60 Hz via FTimerHandle
-    void ApplyAutopilotToPawn(APawn* Pawn);
+    void ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, const FUavSetpoint& Setpoint);
 
     bool StartUDPSender();
     void StopUDPSender();
@@ -84,14 +93,13 @@ private:
     TMap<FString, FRemoteControlCommand> NamedControlCommands;
     TArray<FRemoteControlCommand> IndexedControlCommands;
 
-    // Autopilot state (game-thread only)
-    FAircraftAutopilot Autopilot;
+    // Autopilot state (game-thread only) — PER-UAV, keyed by aircraft name.
+    // Multiple UAVs (each driven by its own BT) get their own setpoint slot and
+    // their own PID controller instance (so their control state never mixes).
+    TMap<FString, FUavSetpoint>       Setpoints;    // aircraft name -> latest setpoint
+    TMap<FString, FAircraftAutopilot> Autopilots;   // aircraft name -> dedicated controller
     FTimerHandle AutopilotTimerHandle;
     FTimerHandle StateSendTimerHandle;
-    float ActiveHeadingDeg  = 0.f;
-    float ActiveAltitudeM   = 3000.f;
-    float ActiveThrottle    = 0.8f;
-    bool  bSetpointReceived = false;  // autopilot inactive until first setpoint arrives
 
 public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Receiver")

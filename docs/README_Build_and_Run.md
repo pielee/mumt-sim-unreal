@@ -200,7 +200,7 @@ ros2 topic echo /mumt/aircraft_states     # watch state come back
 | Port | Dir | Format | Bound by |
 |---|---|---|---|
 | 5005 | in → UE | JSON command | UE `ListenSocket` |
-| 5010 | in → UE | binary 17B setpoint | UE `SetpointSocket` |
+| 5010 | in → UE | JSON per-UAV setpoint `{aircraft_name,...}` | UE `SetpointSocket` |
 | 5006 | out ← UE | JSON state batch | UE sends here; ROS bridge / `control_sender.py` bind `0.0.0.0:5006` |
 
 Full message formats: [README_UDP_Comms.md](README_UDP_Comms.md).
