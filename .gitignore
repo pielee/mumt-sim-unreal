@@ -1,0 +1,27 @@
+# UE5 generated
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+*.sln
+
+# Cesium
+Plugins/CesiumForUnreal/
+cesium-request-cache.sqlite
+cesium-request-cache.sqlite-shm
+cesium-request-cache.sqlite-wal
+
+# JSBSim plugin compiled outputs
+Plugins/JSBSimFlightDynamicsModel/Binaries/
+Plugins/JSBSimFlightDynamicsModel/Intermediate/
+
+# ROS build artifacts
+ros2/*/build/
+ros2/*/install/
+ros2/*/log/
+ros2/*/__pycache__/
+ros2/*/*/__pycache__/
+ros2/*/*.egg-info/
+
+# Cesium ion token (set your own in-editor)
+Content/CesiumSettings/CesiumIonServers/CesiumIonSaaS.uasset
