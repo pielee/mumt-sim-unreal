@@ -18,11 +18,6 @@
 
 namespace
 {
-    constexpr float FeetToMeters = 0.3048f;
-}
-
-namespace
-{
     constexpr double KnotToMetersPerSecond = 0.514444;
 }
 
@@ -240,9 +235,10 @@ void AUDPControlReceiver::ReceiveSetpointData()
 
             FUavSetpoint SP;
             double V;
-            if (O->TryGetNumberField(TEXT("heading_deg"),   V)) SP.HeadingDeg = (float)V;
-            if (O->TryGetNumberField(TEXT("altitude_m"),    V)) SP.AltitudeM  = (float)V;
-            if (O->TryGetNumberField(TEXT("throttle_norm"), V)) SP.Throttle   = FMath::Clamp((float)V, 0.f, 1.f);
+            if (O->TryGetNumberField(TEXT("heading_deg"),     V)) SP.HeadingDeg     = (float)V;
+            if (O->TryGetNumberField(TEXT("altitude_m"),      V)) SP.AltitudeM      = (float)V;
+            if (O->TryGetNumberField(TEXT("throttle_norm"),   V)) SP.Throttle       = FMath::Clamp((float)V, 0.f, 1.f);
+            if (O->TryGetNumberField(TEXT("target_speed_mps"),V)) SP.TargetSpeedMps = (float)V;
             O->TryGetBoolField(TEXT("launch_missile"), SP.LaunchMissile);
 
             Setpoints.Add(Name, SP);   // latest-wins per aircraft
@@ -337,27 +333,40 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
 
     // This UAV's own controller — separate PID/hysteresis state, created on first use.
     FAircraftAutopilot& Autopilot = Autopilots.FindOrAdd(Key);
-    Autopilot.RollPID    = RollPIDConfig;      // sync gains (allows live PIE tuning)
-    Autopilot.RollSecPID = RollSecPIDConfig;
-    Autopilot.PitchPID   = PitchPIDConfig;
-    Autopilot.NavParams  = NavParams;
+    // Sync live-tuned gains WITHOUT wiping runtime state (esp. the autothrottle
+    // integrator — copying the whole struct would zero it every tick).
+    Autopilot.RollPID.SetGains(RollPIDConfig);
+    Autopilot.RollSecPID.SetGains(RollSecPIDConfig);
+    Autopilot.PitchPID.SetGains(PitchPIDConfig);
+    Autopilot.ThrottlePID.SetGains(ThrottlePIDConfig);
+    Autopilot.NavParams   = NavParams;
 
     const FAircraftState& S = JSBSim->AircraftState;
     const float PhiDeg   = (float)S.LocalEulerAngles.Roll;
     const float ThetaDeg = (float)S.LocalEulerAngles.Pitch;
     const float PsiDeg   = (float)S.LocalEulerAngles.Yaw;
-    const float AltM     = (float)S.AltitudeASLFt * FeetToMeters;
+    // Altitude feedback uses UE world Z (Location.Z, cm→m) — the SAME value
+    // BuildPawnState publishes as "z" and the BT computes setpoints against.
+    // Using JSBSim ASL here instead made the controller sit at (setpoint + origin
+    // altitude offset), so the BT (reading UE Z) never saw the target reached.
+    const float AltM     = (float)Pawn->GetActorLocation().Z / 100.0f;
+    const float SpeedMps = (float)(S.TotalVelocityKts * KnotToMetersPerSecond);
 
     const float DiffHead = FAircraftAutopilot::DeltaHeading(Setpoint.HeadingDeg, PsiDeg);
     const float DiffAlt  = Setpoint.AltitudeM - AltM;
 
-    const FAutopilotOutput Out = Autopilot.GetControlInput(DiffHead, DiffAlt, PhiDeg, ThetaDeg);
+    const FAutopilotOutput Out = Autopilot.GetControlInput(
+        DiffHead, DiffAlt, PhiDeg, ThetaDeg, SpeedMps, Setpoint.TargetSpeedMps);
+
+    // Throttle: autothrottle output when speed-hold active (>=0), else the
+    // open-loop throttle from the setpoint (backward compatible).
+    const float ThrottleOut = (Out.Throttle >= 0.f) ? Out.Throttle : Setpoint.Throttle;
 
     JSBSim->Commands.Aileron  = Out.Aileron;
     JSBSim->Commands.Elevator = Out.Elevator;
     JSBSim->Commands.Rudder   = Out.Rudder;
     if (JSBSim->EngineCommands.Num() > 0)
-        JSBSim->EngineCommands[0].Throttle = Setpoint.Throttle;
+        JSBSim->EngineCommands[0].Throttle = ThrottleOut;
 
     // Last-applied (HUD/debug)
     AutopilotAileron  = Out.Aileron;
@@ -367,9 +376,9 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     if (++LogCounter % 60 == 0)
     {
         UE_LOG(LogTemp, Warning,
-            TEXT("[AP] %s -> Hdg=%.0f Alt=%.0f thr=%.2f | Psi=%.0f Alt=%.0f | Ail=%.2f Elv=%.2f"),
-            *Key, Setpoint.HeadingDeg, Setpoint.AltitudeM, Setpoint.Throttle,
-            PsiDeg, AltM, Out.Aileron, Out.Elevator);
+            TEXT("[AP] %s -> Hdg=%.0f Alt=%.0f Vtgt=%.0f | Psi=%.0f Alt=%.0f V=%.0f | Ail=%.2f Elv=%.2f Thr=%.2f"),
+            *Key, Setpoint.HeadingDeg, Setpoint.AltitudeM, Setpoint.TargetSpeedMps,
+            PsiDeg, AltM, SpeedMps, Out.Aileron, Out.Elevator, ThrottleOut);
     }
 }
 
