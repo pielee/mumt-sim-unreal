@@ -1,4 +1,0 @@
-float32 heading_deg
-float32 altitude_m
-float32 throttle_norm
-bool launch_missile

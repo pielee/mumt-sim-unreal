@@ -130,23 +130,21 @@ void AUDPControlReceiver::Tick(float DeltaTime)
     const TArray<APawn*> ControlledPawns = FindTargetPawns(ControlledPawnNamePatterns, MaxControlledUavs);
     CachedTargetPawn = ControlledPawns.Num() > 0 ? ControlledPawns[0] : FindTargetPawn();
 
-    for (int32 Index = 0; Index < ControlledPawns.Num(); ++Index)
+    for (APawn* Pawn : ControlledPawns)
     {
-        APawn* Pawn = ControlledPawns[Index];
-        FRemoteControlCommand CommandToApply = BroadcastCommand;
-
-        if (const FRemoteControlCommand* NamedCommand = NamedControlCommands.Find(Pawn->GetName()))
+        // Name-matched commands ONLY. Each pawn responds solely to a command whose aircraft_name is
+        // contained in the pawn's instance name (e.g. command "M_F16" -> pawn "M_F16_C_0";
+        // command "F16_UAV_C_2" -> that exact UAV). This lets independent senders run simultaneously
+        // over the shared topic — joystick -> manned, controller -> UAVs — without the old positional
+        // / broadcast fallback cross-applying one vehicle's command to another.
+        const FString PawnName = Pawn->GetName();
+        for (const TPair<FString, FRemoteControlCommand>& Entry : NamedControlCommands)
         {
-            CommandToApply = *NamedCommand;
-        }
-        else if (IndexedControlCommands.IsValidIndex(Index))
-        {
-            CommandToApply = IndexedControlCommands[Index];
-        }
-
-        if (CommandToApply.bValid)
-        {
-            ApplyControlCommandToPawn(Pawn, CommandToApply);
+            if (!Entry.Key.IsEmpty() && Entry.Value.bValid && PawnName.Contains(Entry.Key))
+            {
+                ApplyControlCommandToPawn(Pawn, Entry.Value);
+                break;
+            }
         }
     }
 
@@ -594,10 +592,24 @@ bool AUDPControlReceiver::ApplyControlCommandToPawn(APawn* Pawn, const FRemoteCo
         return false;
     }
 
+    // Keep setting the Blueprint variables (for any BP that reads them / for HUD display).
     const bool bRollOk = SetBlueprintNumber(Pawn, TEXT("UDP_Roll"), Command.Roll);
     const bool bPitchOk = SetBlueprintNumber(Pawn, TEXT("UDP_Pitch"), Command.Pitch);
     const bool bYawOk = SetBlueprintNumber(Pawn, TEXT("UDP_Yaw"), Command.Yaw);
     const bool bThrottleOk = SetBlueprintNumber(Pawn, TEXT("UDP_Throttle"), Command.Throttle);
+
+    // Also apply DIRECTLY to the flight model — same path the autopilot uses — so raw joystick
+    // control works even when the pawn's Blueprint doesn't forward UDP_* into Commands.
+    if (UJSBSimMovementComponent* JSBSim = FindJSBSimMovementComponent(Pawn))
+    {
+        JSBSim->Commands.Aileron  = Command.Roll;
+        JSBSim->Commands.Elevator = Command.Pitch;
+        JSBSim->Commands.Rudder   = Command.Yaw;
+        if (JSBSim->EngineCommands.Num() > 0)
+        {
+            JSBSim->EngineCommands[0].Throttle = Command.Throttle;
+        }
+    }
 
     return bRollOk && bPitchOk && bYawOk && bThrottleOk;
 }

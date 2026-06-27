@@ -113,7 +113,7 @@ public:
     TArray<FString> ObservedPawnNamePatterns = { TEXT("F16"), TEXT("UAV") };
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
-    TArray<FString> ControlledPawnNamePatterns = { TEXT("F16_UAV"), TEXT("UAV") };
+    TArray<FString> ControlledPawnNamePatterns = { TEXT("F16_UAV"), TEXT("UAV"), TEXT("M_F16") };
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
     FString UavNamePattern = TEXT("UAV");
@@ -160,8 +160,10 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Autopilot|State")
     float AutopilotElevator = 0.f;
 
+    // Cap on how many name-matched pawns the 5005 JSON path drives at once.
+    // Must be >= (number of UAVs + the manned M_F16) or the sorted list gets truncated.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
-    int32 MaxControlledUavs = 2;
+    int32 MaxControlledUavs = 4;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|State Mapping")
     FString TeamVarName = TEXT("Team");
