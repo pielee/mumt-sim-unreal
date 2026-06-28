@@ -203,7 +203,7 @@ A pure UDP↔ROS adapter. ROS params (defaults): `unreal_ip=127.0.0.1`, `control
 |---|---|---|
 | SUB `/mumt/aircraft_commands` | `std_msgs/String` (JSON inside) | validate JSON, then `sendto(unreal_ip, 5005)` — passthrough |
 | SUB `/aircraft/setpoint` | `custom_msgs/AircraftSetpoint` | `json.dumps({aircraft_name, heading_deg, altitude_m, throttle_norm(clamped), target_speed_mps, launch_missile})` → `sendto(..., 5010)` |
-| PUB `/mumt/aircraft_states` | `std_msgs/String` (JSON) | drain `recvfrom(65535)` on `0.0.0.0:5006` via a 50 Hz timer (`create_timer(0.02)`, drains all queued datagrams per tick), validate JSON, publish each datagram |
+| PUB `/mumt/aircraft_states` | `std_msgs/String` (JSON) | drain `recvfrom(65535)` on `0.0.0.0:5006` via a 60 Hz timer (`create_timer(1.0/60.0)`, drains all queued datagrams per tick), validate JSON, publish each datagram |
 
 Bridge-specific notes:
 - The setpoint is forwarded as **JSON**, so the variable-length `aircraft_name` rides along and UE can route it

@@ -79,11 +79,11 @@ Node class `MumtBridgeNode`, node name **`mumt_bridge`**, console_script **`brid
 |---|---|---|---|
 | `/mumt/aircraft_commands` | `std_msgs/String` (JSON inside) | SUB | validate JSON → `sendto(unreal_ip, 5005)` (passthrough) |
 | `/aircraft/setpoint` | `custom_msgs/AircraftSetpoint` | SUB | `json.dumps({aircraft_name, heading_deg, altitude_m, throttle_norm(clamped 0..1), target_speed_mps, launch_missile})` → `sendto(..., 5010)` |
-| `/mumt/aircraft_states` | `std_msgs/String` (JSON) | PUB | 50 Hz timer (`create_timer(0.02)`) → `recvfrom(65535)` on 5006 → validate JSON → publish |
+| `/mumt/aircraft_states` | `std_msgs/String` (JSON) | PUB | 60 Hz timer (`create_timer(1.0/60.0)`) → `recvfrom(65535)` on 5006 → validate JSON → publish |
 
 ### Behavior details
 - **Three UDP sockets**: `_cmd_sock` (→5005), `_sp_sock` (→5010), `_recv_sock` (bound `0.0.0.0:5006`, `SO_REUSEADDR`, non-blocking).
-- **`_recv_state`** (50 Hz): drains the recv socket in a loop (`while True … except BlockingIOError: break`), so it forwards every queued datagram per tick and does not cap state throughput; validates each datagram as JSON, republishes as a `String`. Invalid JSON → warn + skip.
+- **`_recv_state`** (60 Hz): drains the recv socket in a loop (`while True … except BlockingIOError: break`), so it forwards every queued datagram per tick and does not cap state throughput; validates each datagram as JSON, republishes as a `String`. Invalid JSON → warn + skip.
 - **`_on_command`**: validates the incoming String is JSON, then forwards the **raw bytes** to UE (no transform — the ROS String already carries the JSON the UE side expects).
 - **`_on_setpoint`**: serializes the typed message to a JSON object (`aircraft_name`, `heading_deg`, `altitude_m`, `throttle_norm` clamped to [0,1], `target_speed_mps`, `launch_missile`) and sends it to 5010. The name carries through so UE routes the setpoint to the addressed UAV; `target_speed_mps` drives the UE-side autothrottle (≤0 disables it, falling back to open-loop `throttle_norm`).
 
