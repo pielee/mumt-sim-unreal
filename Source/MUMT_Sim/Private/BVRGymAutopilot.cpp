@@ -71,7 +71,11 @@ FAutopilotOutput FAircraftAutopilot::GetControlInput(
         SetPitchPID(FMath::RadiansToDegrees(FMath::Atan2(DiffAltM, NavParams.TanRef)),
                     CurrentThetaDeg);
 
-        HeadActSpace = NavParams.HeadActSpaceMin;
+        // Stay-in-turn threshold must be <= the enter threshold (HeadActSpaceMax).
+        // A level's NavParams override that sets HeadActSpaceMin > Max would invert
+        // the hysteresis → hard-turn flickers off every tick → aircraft never turns.
+        // Clamp defensively so turning works regardless of the configured value.
+        HeadActSpace = FMath::Min(NavParams.HeadActSpaceMin, NavParams.HeadActSpaceMax);
 
         if (bLog) UE_LOG(LogTemp, Warning,
             TEXT("[AP-MODE] HARDTURN  DiffHead=%.1f DiffAlt=%.0f Phi=%.1f | Ail=%.3f Elv=%.3f"),

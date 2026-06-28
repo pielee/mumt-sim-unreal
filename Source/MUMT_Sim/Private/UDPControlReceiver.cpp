@@ -19,6 +19,23 @@
 namespace
 {
     constexpr double KnotToMetersPerSecond = 0.514444;
+
+    // Identity name used for state output AND command/setpoint routing.
+    // In editor/PIE this is the World Outliner label (e.g. "F16_UAV1"/"M_F16"),
+    // which the user sets, instead of the auto object name ("F16_UAV_C_0").
+    // Falls back to GetName() outside the editor or when the label is empty.
+    FString PawnIdName(const AActor* P)
+    {
+#if WITH_EDITOR
+        if (P)
+        {
+            const FString Label = P->GetActorLabel(false);
+            if (!Label.IsEmpty())
+                return Label;
+        }
+#endif
+        return P ? P->GetName() : FString();
+    }
 }
 
 AUDPControlReceiver::AUDPControlReceiver()
@@ -95,7 +112,7 @@ void AUDPControlReceiver::Tick(float DeltaTime)
         // command "F16_UAV_C_2" -> that exact UAV). This lets independent senders run simultaneously
         // over the shared topic — joystick -> manned, controller -> UAVs — without the old positional
         // / broadcast fallback cross-applying one vehicle's command to another.
-        const FString PawnName = Pawn->GetName();
+        const FString PawnName = PawnIdName(Pawn);
         for (const TPair<FString, FRemoteControlCommand>& Entry : NamedControlCommands)
         {
             if (!Entry.Key.IsEmpty() && Entry.Value.bValid && PawnName.Contains(Entry.Key))
@@ -267,7 +284,7 @@ void AUDPControlReceiver::AutopilotTick()
     // Debug: inject a setpoint for the cached target (PIE tuning without ROS)
     if (bUseDebugSetpoint && IsValid(CachedTargetPawn))
     {
-        FUavSetpoint& SP = Setpoints.FindOrAdd(CachedTargetPawn->GetName());
+        FUavSetpoint& SP = Setpoints.FindOrAdd(PawnIdName(CachedTargetPawn));
         SP.HeadingDeg = DebugTargetHeadingDeg;
         SP.AltitudeM  = DebugTargetAltitudeM;
         SP.Throttle   = DebugTargetThrottle;
@@ -293,7 +310,7 @@ void AUDPControlReceiver::AutopilotTick()
         APawn* Match = nullptr;
         for (AActor* A : Pawns)
             if (APawn* P = Cast<APawn>(A))
-                if (P->GetName() == Key) { Match = P; break; }
+                if (PawnIdName(P) == Key) { Match = P; break; }
 
         // 2) Substring fallback (tolerates spawn suffixes, e.g. "M_F16" -> "M_F16_C_0"),
         //    but ONLY when exactly one pawn contains the key. If several match
@@ -305,7 +322,7 @@ void AUDPControlReceiver::AutopilotTick()
             int32 NumMatches = 0;
             for (AActor* A : Pawns)
                 if (APawn* P = Cast<APawn>(A))
-                    if (P->GetName().Contains(Key)) { Candidate = P; ++NumMatches; }
+                    if (PawnIdName(P).Contains(Key)) { Candidate = P; ++NumMatches; }
 
             if (NumMatches == 1)
             {
@@ -796,7 +813,7 @@ TSharedPtr<FJsonObject> AUDPControlReceiver::BuildPawnState(APawn* Pawn)
     double ThrottleCommand = 0.0;
 
     const TSharedPtr<FJsonObject> PawnJson = MakeShared<FJsonObject>();
-    PawnJson->SetStringField(TEXT("aircraft_name"), Pawn->GetName());
+    PawnJson->SetStringField(TEXT("aircraft_name"), PawnIdName(Pawn));
     PawnJson->SetNumberField(TEXT("x"), Location.X);
     PawnJson->SetNumberField(TEXT("y"), Location.Y);
     PawnJson->SetNumberField(TEXT("z"), Location.Z);

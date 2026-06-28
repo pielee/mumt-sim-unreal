@@ -1,11 +1,11 @@
 # ROS 2 Bridge & Package (`ros2/`)
 
 > Scope: the ROS 2 side of MUMT_Sim — what is actually implemented, what is only scaffolding, and how
-> it connects to Unreal over UDP. Confirmed from source: `bridge_node.py`, both `package.xml` /
-> `setup.py` / `CMakeLists.txt`, `mumt_autopilot.xml`, `bt_controller.yaml`, `bt_controller.launch.py`,
-> `AircraftSetpoint.msg`.
+> it connects to Unreal over UDP. Confirmed from source: `bridge_node.py`, `joystick_node.py`, both
+> `package.xml` / `setup.py` / `CMakeLists.txt`, `manned_joystick.launch.py`, `bt_controller.yaml`,
+> `bt_controller.launch.py`, `AircraftSetpoint.msg`.
 >
-> - Date: 2026-06-23 (git `7632f63`)
+> - Date: 2026-06-28 (mumt_ros_ws HEAD `ad75eb0`)
 > - Related: [README_UDP_Comms.md](README_UDP_Comms.md) (the UDP link), [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ---
@@ -14,14 +14,15 @@
 
 | Component | Status | Notes |
 |---|---|---|
-| **`bridge_node.py`** (UDP↔ROS adapter) | ✅ **Implemented & runnable** | The only working executable. Relays commands→UE and state→ROS |
-| **`custom_msgs/AircraftSetpoint.msg`** | ✅ **Implemented** | Proper `ament_cmake` interface package |
-| **BT controller node** (`mumt_bt_controller`) | ❌ **Not implemented** | Only `mumt_autopilot.xml` + `bt_controller.yaml` + `bt_controller.launch.py` exist — **no node code** |
-| **`bt_controller.launch.py`** | ⚠️ **Broken** | Launches `executable="bt_controller"`, but `setup.py` registers only `bridge` → "executable not found" |
-| **Framework choice** | ⚠️ **Contradictory** | `package.xml` depends on `py_trees`, but the XML is **BehaviorTree.CPP** syntax (incompatible) |
+| **`bridge_node.py`** (UDP↔ROS adapter) | ✅ **Implemented & runnable** | Relays commands→UE, setpoints→UE, and state→ROS |
+| **`joystick_node.py`** (`mumt_joystick`) | ✅ **Implemented** | Joy → `/mumt/aircraft_commands` (manned control — see [README_Joystick_Manned.md](README_Joystick_Manned.md)) |
+| **`custom_msgs/AircraftSetpoint.msg`** | ✅ **Implemented** | Proper `ament_cmake` interface package (now carries `aircraft_name` + `target_speed_mps`) |
+| **`manned_joystick.launch.py`** | ✅ **Implemented** | One-shot stack: `joy_node` + `mumt_joystick` + `bridge` |
+| **BT controller node** (`mumt_bt_controller`) | ❌ **Not implemented here** | Autonomy now lives in the separate `py_bt_ros` repo; the stale `mumt_autopilot.xml` + `bt_controller.yaml` + `bt_controller.launch.py` artifacts remain but are unused |
 
-**Bottom line:** today the ROS side is a thin UDP↔ROS relay. The "autopilot brain" (the behavior tree) is fully
-designed on paper (a detailed XML tree + a rich parameter file) but has **zero executable code**, so it cannot run.
+**Bottom line:** the ROS side is a thin UDP↔ROS relay plus the manned joystick node. The BT "autopilot brain" was
+moved out into the standalone `py_bt_ros` workspace, which talks to UE through these same bridge topics (it
+publishes `/aircraft/setpoint` and reads `/mumt/aircraft_states`). The old in-package BT artifacts are dead.
 
 ---
 
@@ -41,13 +42,13 @@ project on 2026-06-24 for clean separation). The whole system is **3 independent
 │       │   └── package.xml
 │       └── mumt_ros_bridge/     (ament_python)
 │           ├── mumt_ros_bridge/{bridge_node.py, joystick_node.py, __init__.py}
-│           ├── behavior_trees/mumt_autopilot.xml   ← BT design (no impl)
+│           ├── behavior_trees/mumt_autopilot.xml   ← stale BT design (unused)
 │           ├── config/{joystick.yaml, bt_controller.yaml}
 │           ├── launch/{manned_joystick.launch.py, bt_controller.launch.py}
 │           ├── setup.py    entry_points: bridge, joystick
 │           └── package.xml  depends: rclpy, std_msgs, sensor_msgs, custom_msgs, joy, py_trees
-└── py_bt_ros/                   ← behavior tree (Python/py_trees, OWN git repo, not colcon)
-                                    connects via ROS topics (modules/ros_bridge.py)
+└── py_bt_ros/                   ← behavior tree (Python, OWN git repo, not colcon)
+                                    connects via ROS topics (publishes /aircraft/setpoint)
 ```
 
 Boundaries: **UDP** (MUMT_Sim ↔ mumt_ros_bridge) and **ROS topics** (mumt_ros_bridge ↔ py_bt_ros).
@@ -77,17 +78,17 @@ Node class `MumtBridgeNode`, node name **`mumt_bridge`**, console_script **`brid
 | ROS topic | Type | Direction | UDP action |
 |---|---|---|---|
 | `/mumt/aircraft_commands` | `std_msgs/String` (JSON inside) | SUB | validate JSON → `sendto(unreal_ip, 5005)` (passthrough) |
-| `/aircraft/setpoint` | `custom_msgs/AircraftSetpoint` | SUB | `json.dumps({aircraft_name, heading_deg, altitude_m, throttle_norm(clamped 0..1), launch_missile})` → `sendto(..., 5010)` |
+| `/aircraft/setpoint` | `custom_msgs/AircraftSetpoint` | SUB | `json.dumps({aircraft_name, heading_deg, altitude_m, throttle_norm(clamped 0..1), target_speed_mps, launch_missile})` → `sendto(..., 5010)` |
 | `/mumt/aircraft_states` | `std_msgs/String` (JSON) | PUB | 50 Hz timer (`create_timer(0.02)`) → `recvfrom(65535)` on 5006 → validate JSON → publish |
 
 ### Behavior details
 - **Three UDP sockets**: `_cmd_sock` (→5005), `_sp_sock` (→5010), `_recv_sock` (bound `0.0.0.0:5006`, `SO_REUSEADDR`, non-blocking).
-- **`_recv_state`** (50 Hz): drains the recv socket in a loop (`while True … except BlockingIOError: break`), validates each datagram as JSON, republishes as a `String`. Invalid JSON → warn + skip.
+- **`_recv_state`** (50 Hz): drains the recv socket in a loop (`while True … except BlockingIOError: break`), so it forwards every queued datagram per tick and does not cap state throughput; validates each datagram as JSON, republishes as a `String`. Invalid JSON → warn + skip.
 - **`_on_command`**: validates the incoming String is JSON, then forwards the **raw bytes** to UE (no transform — the ROS String already carries the JSON the UE side expects).
-- **`_on_setpoint`**: serializes the typed message to a JSON object (`aircraft_name`, `heading_deg`, `altitude_m`, `throttle_norm` clamped to [0,1], `launch_missile`) and sends it to 5010. The name carries through so UE routes the setpoint to the addressed UAV.
+- **`_on_setpoint`**: serializes the typed message to a JSON object (`aircraft_name`, `heading_deg`, `altitude_m`, `throttle_norm` clamped to [0,1], `target_speed_mps`, `launch_missile`) and sends it to 5010. The name carries through so UE routes the setpoint to the addressed UAV; `target_speed_mps` drives the UE-side autothrottle (≤0 disables it, falling back to open-loop `throttle_norm`).
 
 ### What it does NOT do
-- No namespacing of the bridge **topics** — `/aircraft/setpoint` is one shared global topic. Multi-UAV addressing is done **in the message** via `aircraft_name`, not via per-UAV topics. (Each BT runs under its own `--ns` and tags its own name.)
+- No namespacing of the bridge **topics** — `/aircraft/setpoint` and `/mumt/aircraft_commands` are shared global topics. Multi-UAV addressing is done **in the message** via `aircraft_name`, not via per-UAV topics. This is what lets the manned joystick (M_F16) and the BT-driven UAVs (F16_UAV) coexist on the same topics at once — UE routes each command/setpoint only to the pawn whose instance name contains the `aircraft_name`. (Each BT runs under its own `--ns` and tags its own name.)
 - No QoS tuning (depth-10 default), no rate limiting on commands, no command echo/ack.
 - `launch_missile` is forwarded as a JSON bool (UE reads it into `FUavSetpoint`).
 
@@ -99,75 +100,49 @@ A standard `ament_cmake` + `rosidl` interface package generating one message:
 
 ```
 # AircraftSetpoint.msg
+string  aircraft_name      # which UAV this setpoint addresses (token match in UE)
 float32 heading_deg
 float32 altitude_m
-float32 throttle_norm
+float32 throttle_norm       # open-loop throttle, used when autothrottle is off
+float32 target_speed_mps    # autothrottle target; <=0 disables it
 bool    launch_missile
 ```
 
 `CMakeLists.txt` → `rosidl_generate_interfaces(custom_msgs "msg/AircraftSetpoint.msg")`.
-**Note:** the message has **no `reset` / `seq`** fields even though the UDP wire format carries them — the bridge
-fills those in itself. To control reset from ROS, these fields would need adding here.
+**Note:** `aircraft_name` carries the addressing in-band (no per-UAV topic). `target_speed_mps` was added for the
+UE-side speed-hold autothrottle. The message still has **no `reset` / `seq`** fields — to control reset from ROS,
+they would need adding here.
 
 ---
 
-## 4. The BT controller (DESIGNED, NOT IMPLEMENTED)
+## 4. Stale in-package BT artifacts (NOT USED)
 
-Three artifacts describe an autopilot "brain" that is meant to read state, decide commands, and publish them — but
-**the node that would consume them does not exist**.
+Three artifacts (`behavior_trees/mumt_autopilot.xml`, `config/bt_controller.yaml`,
+`launch/bt_controller.launch.py`) describe an in-package autopilot "brain", but **no node consumes them** —
+`setup.py` registers only `bridge` and `joystick`, so `bt_controller` does not exist and
+`ros2 launch mumt_ros_bridge bt_controller.launch.py` fails with "executable not found."
 
-### 4.1 `behavior_trees/mumt_autopilot.xml` — the tree
-**BehaviorTree.CPP** syntax (`<root main_tree_to_execute>`, `<BehaviorTree ID>`):
-```
-MUMT_Autopilot (Sequence)
-├── HasAircraftState          guard: has state been received?
-├── SelectControlledAircraft  filter aircraft by name pattern ("UAV"), up to max
-├── Selector (FlightModeSelector)
-│   ├── RecoverIfBadAttitude  if roll/pitch out of bounds → recovery; SUCCESS short-circuits
-│   └── ParallelFlightControl normal / formation flight controller
-└── PublishCommands           serialize commands → command_topic
-```
-None of these custom node tags (`HasAircraftState`, `SelectControlledAircraft`, `RecoverIfBadAttitude`,
-`ParallelFlightControl`, `PublishCommands`) have a registered implementation in C++ or Python anywhere in the repo.
-There are **no blackboard ports** declared, and no generic `MoveTo`-style navigation nodes.
-
-### 4.2 `config/bt_controller.yaml` — parameters for node `mumt_bt_controller`
-A rich, fully-specified controller config (read by nothing today). It defines the intended closed loop and gains:
-- **I/O**: `state_topic=/mumt/aircraft_states`, `command_topic=/mumt/aircraft_commands`, `controlled_name_pattern=UAV`, `max_controlled_aircraft=3`, `tick_rate_hz=20`, `invert_pitch_cmd=true`.
-- **Speed-scheduled throttle/pitch**: `low_speed_mps=140`, `high_speed_mps=185`; accel/cruise/slow throttle `1.0/0.75/0.0`; accel/cruise/slow target pitch `12/2/10°`.
-- **Attitude P-control**: `pitch_gain=0.10`, `roll_gain=0.03`, `pitch_limit=0.8`, `roll_limit=0.5`, `pitch_deadband_deg=1.5`.
-- **Recovery**: trigger at `bad_roll_deg=70`, `bad_pitch_down_deg=-20`; `recovery_target_pitch_deg=8`, `recovery_throttle=0.8`.
-- **Formation ("parallel") flight**: leader name, reference speed 165 m/s, speed/heading/pitch gains + damping, per-tick slew limits, deadbands.
-- **Timing hysteresis**: `pitch_hold_ticks=6`, `pitch_cooldown_ticks=8`.
-
-> This YAML is the most concrete spec of the intended autonomy. Note it overlaps in purpose with the UE-side
-> `FBVRGymAutopilot` PID — there are effectively two autopilot designs (one live in UE C++, one paper-only in ROS).
-
-### 4.3 `launch/bt_controller.launch.py` — broken launch
-Declares `params_file` (→ `bt_controller.yaml`) and `xml_file` (→ `mumt_autopilot.xml`) launch args and starts:
-```python
-Node(package="mumt_ros_bridge", executable="bt_controller", name="mumt_bt_controller", ...)
-```
-But `setup.py` only registers `bridge` as a console_script. **`bt_controller` does not exist**, so
-`ros2 launch mumt_ros_bridge bt_controller.launch.py` fails with "executable not found." The bridge itself is in no
-launch file.
+These are dead since autonomy moved to the standalone **`py_bt_ros`** repo. The XML uses BehaviorTree.CPP syntax
+(custom tags with no registered impl); the YAML sketches an older command-topic controller design (P-control gains,
+speed schedule, attitude recovery, formation "parallel" gains) that overlaps the live UE-side `FBVRGymAutopilot`
+PID. Treat both as historical reference only.
 
 ---
 
-## 5. Intended closed loop vs current reality
+## 5. The closed loop (current reality)
 
 ```
-INTENDED (when the BT node exists):
-  UE ──5006──► bridge ──PUB /mumt/aircraft_states ──► [BT controller] ──PUB /mumt/aircraft_commands ──► bridge ──5005──► UE
-                                                         (reads yaml gains, runs the XML tree)
+Manned (joystick):
+  joy_node ─► mumt_joystick ─PUB /mumt/aircraft_commands─► bridge ─5005─► UE   (M_F16)
 
-TODAY (BT node missing):
-  UE ──5006──► bridge ──PUB /mumt/aircraft_states ──► (no subscriber that closes the loop)
-  commands must come from elsewhere:
-     • control_sender.py  (direct UDP 5005, bypasses ROS entirely), or
-     • a manual `ros2 topic pub /mumt/aircraft_commands std_msgs/String '{...json...}'`
-        ──► bridge ──5005──► UE
+Autonomous (py_bt_ros behavior tree):
+  UE ─5006─► bridge ─PUB /mumt/aircraft_states─► [py_bt_ros BT] ─PUB /aircraft/setpoint─► bridge ─5010─► UE
+                                                   (per-UAV setpoint; UE runs the autopilot/autothrottle)   (F16_UAV)
 ```
+
+The loop is now closed by the BT in `py_bt_ros`, which publishes `AircraftSetpoint` (heading/altitude/target speed)
+rather than raw stick commands — UE's per-UAV autopilot turns those setpoints into control surface deflections.
+Both paths share the same global bridge topics and are kept apart by `aircraft_name`.
 
 So the bridge works in both directions, but the autonomy that was supposed to sit on top of it is absent.
 
@@ -179,56 +154,53 @@ So the bridge works in both directions, but the autonomy that was supposed to si
 conda deactivate                                  # ★ conda(lerobot) active breaks colcon/ros2
 cd ~/dev/mumt_ros_ws                              # the separate ROS workspace
 source /opt/ros/humble/setup.bash
-colcon build --packages-select custom_msgs mumt_ros_bridge --symlink-install
+colcon build --packages-select custom_msgs mumt_ros_bridge --symlink-install   # custom_msgs first
 source install/setup.bash
 
-# Run the bridge (works):
-ros2 run mumt_ros_bridge bridge
+# Preferred: bring up the whole manned stack (joy_node + mumt_joystick + bridge):
+ros2 launch mumt_ros_bridge manned_joystick.launch.py
+#   ↳ DO NOT also run the bridge separately — it would bind 0.0.0.0:5006 twice (conflict).
+#   ↳ pass start_bridge:=false if the bridge is already running elsewhere.
 #   bridge logs: state UDP <- 0.0.0.0:5006 | command UDP -> 127.0.0.1:5005 | setpoint UDP -> 127.0.0.1:5010
+
+# (Bridge alone, only if not using the launch file above):
+ros2 run mumt_ros_bridge bridge
 
 # Send a command through ROS (works):
 ros2 topic pub --once /mumt/aircraft_commands std_msgs/String \
-  '{data: "{\"commands\":[{\"aircraft_name\":\"F16_UAV_0\",\"roll\":0,\"pitch\":-0.1,\"yaw\":0,\"throttle\":1.0}]}"}'
+  '{data: "{\"commands\":[{\"aircraft_name\":\"F16_UAV\",\"roll\":0,\"pitch\":-0.1,\"yaw\":0,\"throttle\":1.0}]}"}'
 
-# Send a setpoint (works):
+# Send a setpoint (works — note aircraft_name + target_speed_mps; custom_msgs must be sourced):
 ros2 topic pub --once /aircraft/setpoint custom_msgs/AircraftSetpoint \
-  '{heading_deg: 90.0, altitude_m: 3000.0, throttle_norm: 0.8, launch_missile: false}'
+  '{aircraft_name: "F16_UAV", heading_deg: 90.0, altitude_m: 3000.0, throttle_norm: 0.8, target_speed_mps: 220.0, launch_missile: false}'
 
 # Watch state coming back:
 ros2 topic echo /mumt/aircraft_states
 
-# Launch the BT controller (FAILS — executable 'bt_controller' not registered):
-# ros2 launch mumt_ros_bridge bt_controller.launch.py
+# Autonomy: the behavior tree runs from the separate py_bt_ros repo (publishes /aircraft/setpoint).
+# The in-package bt_controller.launch.py is stale and not used.
 ```
 
 ---
 
-## 7. Gaps & what it takes to make the BT real
+## 7. Remaining gaps
 
-1. **Pick one framework.**
-   - (a) Keep **BehaviorTree.CPP**: write a C++ ament package, register node classes (`HasAircraftState`,
-     `SelectControlledAircraft`, `RecoverIfBadAttitude`, `ParallelFlightControl`, `PublishCommands`), and add a
-     `bt_controller` executable. OR
-   - (b) Rewrite the tree in **py_trees** (which `package.xml` already depends on) and load it from Python.
-   - Today the two are mixed (py_trees dep + BehaviorTree.CPP XML) and neither is wired.
-2. **Register the executable** — add `bt_controller = mumt_ros_bridge.<module>:main` to `setup.py` `console_scripts`
-   so the launch file resolves.
-3. **Implement the loop**: subscribe `state_topic`, run the tree at `tick_rate_hz`, publish a JSON command batch on
-   `command_topic` matching the UDP schema (`{commands:[{aircraft_name,roll,pitch,yaw,throttle}]}`).
-4. **Decide where autonomy lives** — reconcile the ROS BT design with the existing UE `FBVRGymAutopilot` PID
-   (don't run two fighting controllers on one aircraft).
-5. **Namespace toward the target** — move from global topics to per-vehicle `/{ns}/cmd` / `/{ns}/state`
-   (P0 in [ARCHITECTURE.md](ARCHITECTURE.md)); add `reset`/`seq` to `AircraftSetpoint.msg` if ROS-side reset is needed.
+1. **Clean up the dead artifacts** — the in-package `mumt_autopilot.xml` / `bt_controller.yaml` /
+   `bt_controller.launch.py` no longer reflect any runnable path (autonomy is in `py_bt_ros`); remove or archive them.
+2. **Namespace toward the target** — both directions still use shared global topics; addressing is in-band via
+   `aircraft_name`. Moving to per-vehicle `/{ns}/...` topics is a P0 in [ARCHITECTURE.md](ARCHITECTURE.md).
+3. **Add `reset` / `seq` to `AircraftSetpoint.msg`** if ROS-side reset/sequencing is ever needed (currently absent).
+4. **One controller per aircraft** — UE's `FBVRGymAutopilot` is the live inner loop; the bridge must never relay
+   both a BT setpoint and stick commands to the same UAV at once.
 
 ---
 
 ## 8. Relationship to the target architecture
 
-The bridge is the central "ROS-Unreal" block's transport, already working for both directions. The two "Mission
-Autonomy" blocks (friendly/enemy BT) in the target diagram correspond to the **unimplemented BT controller** here —
-the `bt_controller.yaml` even sketches a friendly-style formation follower (`parallel_*`) and an attitude-recovery
-safety layer. Making the BT runnable and namespacing the topics are the two steps that turn this scaffolding into
-the target's Mission-Autonomy ↔ ROS-Unreal loop.
+The bridge is the central "ROS-Unreal" block's transport, working in both directions. The "Mission Autonomy"
+blocks (friendly/enemy BT) in the target diagram are realized by the **`py_bt_ros`** behavior tree, which closes the
+loop over these topics (`/mumt/aircraft_states` in, `/aircraft/setpoint` out). The remaining step toward the target
+is namespacing the topics per vehicle; the in-package BT artifacts here are vestigial.
 
 ---
 
@@ -237,9 +209,9 @@ the target's Mission-Autonomy ↔ ROS-Unreal loop.
 | Item | Path |
 |---|---|
 | Bridge node (implemented) | `mumt_ros_ws/src/mumt_ros_bridge/mumt_ros_bridge/bridge_node.py` |
+| Joystick node (implemented) | `mumt_ros_ws/src/mumt_ros_bridge/mumt_ros_bridge/joystick_node.py` |
+| Manned launch (joy + joystick + bridge) | `mumt_ros_ws/src/mumt_ros_bridge/launch/manned_joystick.launch.py` |
 | Package manifest / entry point | `mumt_ros_ws/src/mumt_ros_bridge/package.xml`, `setup.py` |
-| Behavior tree (design only) | `mumt_ros_ws/src/mumt_ros_bridge/behavior_trees/mumt_autopilot.xml` |
-| BT params (unused) | `mumt_ros_ws/src/mumt_ros_bridge/config/bt_controller.yaml` |
-| Launch (broken) | `mumt_ros_ws/src/mumt_ros_bridge/launch/bt_controller.launch.py` |
+| Stale BT artifacts (unused) | `behavior_trees/mumt_autopilot.xml`, `config/bt_controller.yaml`, `launch/bt_controller.launch.py` |
 | Messages package | `mumt_ros_ws/src/custom_msgs/msg/AircraftSetpoint.msg`, `CMakeLists.txt`, `package.xml` |
 | Unreal UDP counterpart | `Source/MUMT_Sim/Private/UDPControlReceiver.cpp` |

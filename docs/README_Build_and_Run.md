@@ -4,26 +4,29 @@
 > Python control scripts. Grounded in the actual project config (`.uproject`, `*.Build.cs`, `*.Target.cs`,
 > `.gitignore`, `DefaultEngine.ini`).
 >
-> - Date: 2026-06-23 (git `7632f63`) · Platform validated: Linux (Vulkan SM6)
-> - See also: [ARCHITECTURE.md](ARCHITECTURE.md), [README_UDP_Comms.md](README_UDP_Comms.md), [README_ROS_Bridge.md](README_ROS_Bridge.md)
+> - Date: 2026-06-28 (git `25c5459`) · Platform validated: Linux (Vulkan SM6)
+> - See also: [ARCHITECTURE.md](ARCHITECTURE.md), [README_UDP_Comms.md](README_UDP_Comms.md), [README_ROS_Bridge.md](README_ROS_Bridge.md), [README_Joystick_Manned.md](README_Joystick_Manned.md)
 
 ---
 
 ## 0. What you're running
 
 ```
-┌────────────────────────┐     UDP 5005 / 5010 (cmd in)      ┌──────────────────────────┐
-│  ROS 2 (bridge_node)   │ ───────────────────────────────► │  Unreal Editor (PIE)      │
-│  or Scripts/*.py       │ ◄─────────────────────────────── │  RL_30 (Cesium world)     │
-└────────────────────────┘        UDP 5006 (state out)       │   AUDPControlReceiver     │
-                                                             │   F16_UAV / M_F16 + JSBSim│
-                                                             └──────────────────────────┘
+┌──────────────────────┐   ┌────────────────────────┐  UDP 5005/5010 (cmd in)  ┌──────────────────────────┐
+│ py_bt_ros (formation │   │  ROS 2 (mumt_bridge)   │ ───────────────────────► │  Unreal Editor (PIE)      │
+│ BT)  /aircraft/      │──►│  + joystick + joy_node │ ◄─────────────────────── │  RL_30 / RL_2 (Cesium)    │
+│ setpoint             │   │                        │   UDP 5006 (state out)    │   AUDPControlReceiver     │
+│ joystick → /mumt/    │──►│                        │                          │   F16_UAV / M_F16 + JSBSim│
+│ aircraft_commands    │   └────────────────────────┘                          └──────────────────────────┘
+└──────────────────────┘
 ```
 
-Three things get built/run independently:
-1. **The UE project** (`MUMT_Sim.uproject`) — the simulator.
-2. **The ROS 2 workspace** (`ros2/`) — optional bridge for ROS↔UDP.
-3. **Python scripts** (`Scripts/control_sender.py`) — optional standalone controller (no ROS).
+Three repos get built/run independently (boundaries are **UDP** UE↔bridge and **ROS 2 topics** bridge↔BT/joystick):
+1. **The UE project** (`MUMT_Sim.uproject`, `~/dev/MUMT_Sim`) — the simulator.
+2. **The ROS 2 workspace** (`~/dev/mumt_ros_ws`, a sibling, NOT inside the UE project) — the UDP↔ROS bridge + joystick node.
+3. **The behaviour-tree autonomy** (`~/dev/py_bt_ros`) — the formation BT that publishes per-UAV setpoints.
+
+> Legacy `Scripts/control_sender.py` still exists for a no-ROS smoke test, but the normal stack is the three repos above.
 
 ---
 
@@ -36,13 +39,16 @@ Three things get built/run independently:
 | **GeoReferencing plugin** | Epic **built-in** engine plugin — no install, just enabled (the JSBSim plugin depends on it). |
 | **JSBSim plugin** | Ships in the repo (`Plugins/JSBSimFlightDynamicsModel/`, source + prebuilt `libJSBSim.a`). No separate install. |
 | **C++ toolchain** | Linux: the UE cross-toolchain / clang. Windows: VS 2022 with the workloads in `.vsconfig`. |
-| **ROS 2** | A recent distro (Humble/Iron/Jazzy). Needed only for the ROS bridge. `rclpy`, `std_msgs`; `py_trees` is declared but the BT isn't implemented. |
-| **Python 3** | For `Scripts/control_sender.py` (stdlib only: `socket`, `json`). |
+| **ROS 2** | Humble (validated). Needed for the bridge, joystick, and the formation BT. `rclpy`, `std_msgs`, `sensor_msgs` (`joy`), and the in-repo `custom_msgs` (`AircraftSetpoint`). |
+| **Joystick** | Logitech **F710** gamepad for manned control of `M_F16` (see [README_Joystick_Manned.md](README_Joystick_Manned.md)). |
+| **py_bt_ros** | The behaviour-tree autonomy repo at `~/dev/py_bt_ros` (formation BT). Runs against the ROS workspace's sourced env. |
+| **Python 3** | For `~/dev/py_bt_ros/main.py` and the legacy `Scripts/control_sender.py` (stdlib only: `socket`, `json`). |
 | **Cesium ion token** | One is committed inside `Content/CesiumSettings/CesiumIonServers/CesiumIonSaaS.uasset`. Replace with your own for your own tilesets (and to rotate the exposed secret). |
 
 ### What's gitignored (regenerated on build — don't expect them in a clone)
-`Binaries/`, `Intermediate/`, `Saved/`, `DerivedDataCache/`, `*.sln`, **`Plugins/CesiumForUnreal/`**,
-`Plugins/JSBSimFlightDynamicsModel/{Binaries,Intermediate}/`, and `ros2/*/{build,install,log}/`.
+`Binaries/`, `Intermediate/`, `Saved/`, `DerivedDataCache/`, `*.sln`, **`Plugins/CesiumForUnreal/`**, and
+`Plugins/JSBSimFlightDynamicsModel/{Binaries,Intermediate}/`. The ROS workspace `~/dev/mumt_ros_ws/{build,install,log}/`
+is regenerated by `colcon build` (see §4).
 
 ---
 
@@ -78,24 +84,40 @@ shaders for the Cesium world — give it time.
 > Windows: open `MUMT_Sim.uproject` (right-click → Generate VS project files), build the **MUMT_SimEditor / Development**
 > config in VS 2022, then launch.
 
+### 2.3 Rebuild after a C++ source change (Linux)
+The autopilot / receiver live in `Source/MUMT_Sim/` (`BVRGymAutopilot.cpp`, `UDPControlReceiver.cpp`, …). After editing
+them, **close the Editor first** (the running editor holds the loaded module), then rebuild the editor target:
+```bash
+<UE_ROOT>/Engine/Build/BatchFiles/Linux/Build.sh \
+    MUMT_SimEditor Linux Development -project="$PWD/MUMT_Sim.uproject"
+```
+Reopen the project afterwards. (ROS-side changes are Python and need no UE rebuild — see §4; only a `custom_msgs/*.msg`
+change requires a `colcon build`.)
+
 ---
 
 ## 3. Level & actor setup (do this once)
 
-Open the main map **`Content/RL_30.umap`** (the Cesium world). For the simulation + external control to work the level
-must contain these actors:
+Two playable Cesium maps ship in `Content/`:
 
-| Actor | Status in RL_30 | Purpose |
+| Map | Aircraft | Notes |
 |---|---|---|
-| **Cesium georeference + Cesium3DTileset (World Terrain)** | present | the Earth tiles; needs a valid ion token |
+| **`Content/RL_30.umap`** | `F16_UAV` + `M_F16` | one UAV + one manned leader; default `NavParams`. Good single-UAV / formation map. |
+| **`Content/RL_2.umap`** | `F16_UAV` + `F16_UAV2` + `M_F16` | two UAVs + leader; carries a `NavParams` `HeadActSpaceMin` override on the receiver. |
+
+For the simulation + external control to work the level must contain these actors:
+
+| Actor | Status | Purpose |
+|---|---|---|
+| **Cesium georeference + Cesium3DTileset (World Terrain)** | present in both | the Earth tiles; needs a valid ion token |
 | **Epic `AGeoReferencingSystem`** | **present (confirmed)** | **required by JSBSim** — converts ECEF↔UE; without it the aircraft logs an error and won't fly |
 | **`AUDPControlReceiver`** | **verify / add if missing** | the UDP entry point (ports 5005/5010 in, 5006 out). If absent, drop one into the level |
-| **F16_UAV / M_F16 pawn** | present (F16_UAV) | the aircraft (see [README_F16_Actor.md](README_F16_Actor.md)) |
+| **F16_UAV / M_F16 pawns** | present | the aircraft (see [README_F16_Actor.md](README_F16_Actor.md)); each pawn responds only to commands/setpoints whose `aircraft_name` matches its instance name |
 
 Important config note (`DefaultEngine.ini` is stale):
 - `GameDefaultMap=/Engine/Maps/Templates/OpenWorld` and `GlobalDefaultGameMode=/Script/AirSim.AirSimGameMode`
-  are **wrong** (AirSim is disabled in `.uproject`). Use **World Settings → GameMode = `BP_JSBSimGameMode`** on RL_30,
-  and set RL_30 as the Editor Startup / Game Default Map. (Fixing `DefaultEngine.ini` is recommended — see
+  are **wrong** (AirSim is disabled in `.uproject`). Use **World Settings → GameMode = `BP_JSBSimGameMode`** on the map,
+  and set RL_30 (or RL_2) as the Editor Startup / Game Default Map. (Fixing `DefaultEngine.ini` is recommended — see
   [ARCHITECTURE.md](ARCHITECTURE.md) §4 debt list.)
 
 The `AUDPControlReceiver`'s ports/targeting are editable in its Details panel (defaults: `ListenPort=5005`,
@@ -103,11 +125,11 @@ The `AUDPControlReceiver`'s ports/targeting are editable in its Details panel (d
 
 ---
 
-## 4. Build the ROS 2 workspace (optional)
+## 4. Build the ROS 2 workspace
 
 The ROS 2 side is a **separate sibling workspace** `~/dev/mumt_ros_ws/` (NOT inside the UE project), with two
 packages under `src/`: `custom_msgs` and `mumt_ros_bridge`. Build **`custom_msgs` first** (it generates
-`AircraftSetpoint`), then `mumt_ros_bridge`.
+`AircraftSetpoint`, needed by the bridge and the BT), then `mumt_ros_bridge`.
 
 ```bash
 conda deactivate                       # ★ conda(lerobot) active breaks colcon/ros2
@@ -116,56 +138,67 @@ source /opt/ros/humble/setup.bash
 colcon build --packages-select custom_msgs mumt_ros_bridge --symlink-install
 source install/setup.bash
 ```
-Run the bridge (the only working executable):
+The package provides two executables: `bridge` (UDP↔ROS) and `joystick` (Joy→commands). The normal way to start them
+is the **one-shot launch** (§5 Step B), which brings up `joy_node` + `joystick` + `bridge` together:
 ```bash
-ros2 run mumt_ros_bridge bridge
+ros2 launch mumt_ros_bridge manned_joystick.launch.py
 # logs: state UDP <- 0.0.0.0:5006 | command UDP -> 127.0.0.1:5005 | setpoint UDP -> 127.0.0.1:5010
 ```
-> ⚠️ `ros2 launch mumt_ros_bridge bt_controller.launch.py` **fails** — it references an executable `bt_controller`
-> that doesn't exist (the BT controller is unimplemented). See [README_ROS_Bridge.md](README_ROS_Bridge.md).
+> ⚠️ `manned_joystick.launch.py` already starts the bridge (`start_bridge:=true`). Do **not** also `ros2 run
+> mumt_ros_bridge bridge` — two bridges both bind `0.0.0.0:5006` and conflict. Pass `start_bridge:=false` only if you
+> are deliberately running the bridge elsewhere. See [README_ROS_Bridge.md](README_ROS_Bridge.md).
 
 ---
 
 ## 5. Run the whole stack
 
-**Order:** start Unreal first (it binds the receive ports), then a command source.
+**Order:** Unreal first (it binds the receive ports), then the bridge+joystick launch, then the formation BT.
 
 ### Step A — start the simulator
-Press **Play (PIE)** in the Editor on RL_30. The `AUDPControlReceiver` binds 5005/5010 and starts streaming state to
-`127.0.0.1:5006` at 20 Hz.
+Press **Play (PIE)** in the Editor on RL_30 (or RL_2). The `AUDPControlReceiver` binds 5005/5010 and starts streaming
+state to `127.0.0.1:5006`.
 
-### Step B — pick ONE command source
-> ⚠️ Do **not** run the ROS bridge and `control_sender.py` at the same time — both bind `0.0.0.0:5006` and will fight
-> over the state stream.
-
-**Option 1 — manual flight (no external process):** possess `M_F16` and fly with the keyboard (see
-`Config/DefaultInput.ini`: pitch PgUp/PgDn, roll Q/E, rudder A/D, throttle W/S, spawn UAV = P).
-
-**Option 2 — standalone Python autopilot:**
+### Step B — start the bridge + joystick (one shot)
 ```bash
-python3 Scripts/control_sender.py
-# receives state on 5006, sends {"commands":[...]} for UAV pawns to 5005
+cd ~/dev/mumt_ros_ws
+source install/setup.bash
+ros2 launch mumt_ros_bridge manned_joystick.launch.py
 ```
+This single launch starts **`joy_node` + `mumt_joystick` + `mumt_bridge`** together. The joystick (F710) flies the
+manned `M_F16` via `/mumt/aircraft_commands` → 5005, and the bridge relays state (5006) and setpoints (5010).
+> ⚠️ Do **not** also `ros2 run mumt_ros_bridge bridge` (or `Scripts/control_sender.py`) — they re-bind `0.0.0.0:5006`
+> and fight over the state stream.
 
-**Option 3 — ROS path:**
+### Step C — start the formation behaviour tree (one per UAV)
 ```bash
-ros2 run mumt_ros_bridge bridge          # terminal 1
+cd ~/dev/py_bt_ros
+source ~/dev/mumt_ros_ws/install/setup.bash      # so custom_msgs/AircraftSetpoint resolves
+python3 main.py --config scenarios/mumt/configs/mumt.yaml
+```
+The BT (`scenarios/mumt`) gathers state, waits for the leader to take off, takes the UAV off, then holds formation —
+publishing `/aircraft/setpoint` (`AircraftSetpoint`) at **`bt_tick_rate = 10` Hz** (`configs/mumt.yaml`).
+> ⚠️ **Run the BT only once.** There is one setpoint publisher per UAV; launching a second BT for the same aircraft
+> produces conflicting setpoints and autopilot oscillation. (For a second UAV use a distinct routing name, e.g.
+> `--ns /F16_UAV2`.)
 
-# low-level control:
+### Quick manual checks (instead of / alongside the BT)
+```bash
+# low-level control (name-addressed):
 ros2 topic pub --once /mumt/aircraft_commands std_msgs/String \
-  '{data: "{\"commands\":[{\"aircraft_name\":\"F16_UAV_0\",\"roll\":0,\"pitch\":-0.1,\"yaw\":0,\"throttle\":1.0}]}"}'
+  '{data: "{\"commands\":[{\"aircraft_name\":\"F16_UAV\",\"roll\":0,\"pitch\":-0.1,\"yaw\":0,\"throttle\":1.0}]}"}'
 
-# OR high-level autopilot setpoint (drives the in-engine BVRGym PID):
+# high-level autopilot setpoint (drives the in-engine BVRGym PID + autothrottle):
 ros2 topic pub --once /aircraft/setpoint custom_msgs/AircraftSetpoint \
-  '{heading_deg: 90.0, altitude_m: 3000.0, throttle_norm: 0.8, launch_missile: false}'
+  '{aircraft_name: "F16_UAV", heading_deg: 90.0, altitude_m: 3000.0, throttle_norm: 0.8, target_speed_mps: 220.0, launch_missile: false}'
 
 ros2 topic echo /mumt/aircraft_states     # watch state come back
 ```
 
-### Step C — verify it's working
-- The UAV reacts to commands / holds the setpoint heading & altitude (autopilot logs `[AP-STATE]`/`[AP-MODE]` to the UE Output Log).
-- `control_sender.py` prints `received N aircraft` and `sent: {...}` once per second.
-- `ros2 topic echo /mumt/aircraft_states` shows the `aircraft_state_batch` JSON.
+### Step D — verify it's working
+- The UAV holds the setpoint heading/altitude and (when `target_speed_mps > 0`) the target speed via autothrottle;
+  the receiver logs an `[AP]` line per tick to the UE Output Log.
+- `ros2 topic echo /mumt/aircraft_states` shows the `aircraft_state_batch` JSON; `ros2 topic hz /aircraft/setpoint`
+  reads ~10 Hz, `/mumt/aircraft_commands` ~50 Hz.
 
 ---
 
@@ -173,10 +206,10 @@ ros2 topic echo /mumt/aircraft_states     # watch state come back
 
 | Goal | Channel | Reaches the FDM via |
 |---|---|---|
-| Manual keyboard flight | UE Enhanced Input | pawn BP → `JSBSim.Commands` |
-| Remote low-level (roll/pitch/yaw/throttle) | UDP 5005 JSON | reflection → pawn `UDP_*` vars → BP → `JSBSim.Commands` |
-| Remote high-level (heading/alt/throttle) | UDP 5010 binary | `FBVRGymAutopilot` PID → `JSBSim.Commands` directly ([README_Autopilot.md](README_Autopilot.md)) |
-| State out | UDP 5006 JSON | `AUDPControlReceiver::SendStateToPython` (20 Hz) |
+| Manned joystick flight (M_F16) | F710 → `/mumt/aircraft_commands` → UDP 5005 | name-matched command → pawn `UDP_*` vars → BP → `JSBSim.Commands` |
+| Remote low-level (roll/pitch/yaw/throttle) | UDP 5005 JSON | name-matched command → pawn `UDP_*` vars → BP → `JSBSim.Commands` |
+| Autonomous formation (heading/alt/throttle/speed) | BT → `/aircraft/setpoint` → UDP 5010 JSON | per-UAV `FAircraftAutopilot` PID + autothrottle → `JSBSim.Commands` ([README_Autopilot.md](README_Autopilot.md)) |
+| State out | UDP 5006 JSON | `AUDPControlReceiver` state batch (effective ≈60 Hz distinct) |
 
 ---
 
@@ -187,11 +220,12 @@ ros2 topic echo /mumt/aircraft_states     # watch state come back
 | Project won't open / missing Cesium classes | `Plugins/CesiumForUnreal/` not installed (it's gitignored) — install the UE 5.4 Cesium release |
 | Log: *"Impossible to use a UJSBSimMovementComponent without a GeoReferencingSystem"* | No Epic `AGeoReferencingSystem` in the level — add one (RL_30 already has it; check custom maps) |
 | Aircraft loads but doesn't fly / `Trim Failed` | Aircraft model has 0 gear units, or bad initial conditions — check the pawn's `AircraftModel` and the JSBSim data under the plugin's `Resources/JSBSim` |
-| No response to external commands | `AUDPControlReceiver` not in the level, wrong ports, or pawn name doesn't match `ControlledPawnNamePatterns` (needs "F16_UAV"/"UAV") |
+| No response to external commands | `AUDPControlReceiver` not in the level, wrong ports, or the `aircraft_name` in the command/setpoint doesn't match a pawn instance name (e.g. `F16_UAV`, `M_F16`) |
 | Cesium terrain not loading | ion token invalid/expired in `CesiumIonSaaS` — set your own token |
-| `ros2 launch ... bt_controller.launch.py` errors "executable not found" | Expected — `bt_controller` is unimplemented; use `ros2 run mumt_ros_bridge bridge` |
-| State stream flickers / commands ignored | Both `bridge` and `control_sender.py` bound to 5006 — run only one |
-| Wrong default map/game mode on launch | Stale `DefaultEngine.ini` — set RL_30 + `BP_JSBSimGameMode` in World Settings |
+| Launch errors "address already in use" on 5006 | A second bridge is running — `manned_joystick.launch.py` already starts one; don't also `ros2 run ... bridge` (pass `start_bridge:=false` if you must) |
+| UAV oscillates / setpoints fight | The formation BT was started twice for one UAV — run exactly one BT per aircraft |
+| `custom_msgs/AircraftSetpoint` not found when running the BT | Forgot to `source ~/dev/mumt_ros_ws/install/setup.bash` before `python3 main.py` (or `custom_msgs` wasn't colcon-built) |
+| Wrong default map/game mode on launch | Stale `DefaultEngine.ini` — set RL_30/RL_2 + `BP_JSBSimGameMode` in World Settings |
 
 ---
 
@@ -201,7 +235,7 @@ ros2 topic echo /mumt/aircraft_states     # watch state come back
 |---|---|---|---|
 | 5005 | in → UE | JSON command | UE `ListenSocket` |
 | 5010 | in → UE | JSON per-UAV setpoint `{aircraft_name,...}` | UE `SetpointSocket` |
-| 5006 | out ← UE | JSON state batch | UE sends here; ROS bridge / `control_sender.py` bind `0.0.0.0:5006` |
+| 5006 | out ← UE | JSON state batch | UE sends here; the `mumt_bridge` binds `0.0.0.0:5006` (only one binder at a time) |
 
 Full message formats: [README_UDP_Comms.md](README_UDP_Comms.md).
 
@@ -216,5 +250,6 @@ Full message formats: [README_UDP_Comms.md](README_UDP_Comms.md).
 | The F-16 actor (pawn) | [README_F16_Actor.md](README_F16_Actor.md) |
 | UDP communication | [README_UDP_Comms.md](README_UDP_Comms.md) |
 | ROS 2 bridge & package | [README_ROS_Bridge.md](README_ROS_Bridge.md) |
+| Joystick / manned control | [README_Joystick_Manned.md](README_Joystick_Manned.md) |
 | BVRGym autopilot (control law) | [README_Autopilot.md](README_Autopilot.md) |
 | **Build & run (this doc)** | README_Build_and_Run.md |

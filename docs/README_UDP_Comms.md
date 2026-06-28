@@ -5,7 +5,7 @@
 > All facts confirmed from source: `UDPControlReceiver.cpp/.h`, `bridge_node.py`, `control_sender.py`,
 > `AircraftSetpoint.msg`.
 >
-> - Date: 2026-06-23 (git `7632f63`)
+> - Date: 2026-06-28 (git `25c5459`)
 > - Related: [ARCHITECTURE.md](ARCHITECTURE.md), [README_F16_Actor.md](README_F16_Actor.md)
 
 ---
@@ -17,8 +17,8 @@ two for inbound commands (different abstraction levels) and one for outbound sta
 
 | Port | Direction | Payload | UE socket | Peer that uses it |
 |---|---|---|---|---|
-| **5005** | external → UE | **JSON** low-level control `{roll,pitch,yaw,throttle}` | `ListenSocket` | `control_sender.py`, ROS bridge (`/mumt/aircraft_commands`) |
-| **5010** | external → UE | **JSON** high-level setpoint `{aircraft_name,heading/alt/throttle}` (per-UAV) | `SetpointSocket` | ROS bridge (`/aircraft/setpoint`) |
+| **5005** | external → UE | **JSON** low-level control `{commands:[{aircraft_name,roll,pitch,yaw,throttle}]}` | `ListenSocket` | `control_sender.py`, ROS bridge (`/mumt/aircraft_commands`) |
+| **5010** | external → UE | **JSON** high-level setpoint `{aircraft_name,heading/alt/throttle/target_speed}` (per-UAV) | `SetpointSocket` | ROS bridge (`/aircraft/setpoint`) |
 | **5006** | UE → external | **JSON** state batch (pos/attitude/speed/weapons) | `SendSocket` | ROS bridge, `control_sender.py` |
 
 All endpoints default to `127.0.0.1`. The two command channels exist because there are two control
@@ -37,8 +37,8 @@ abstraction levels: **raw surface commands (5005)** vs **navigation setpoint tha
   └────────────────────────────┘                         │   SetpointSocket ← :5010 (non-blocking)   │
                                                           │                                            │
   ┌────────────────────────────┐   5005 JSON cmd  ─────►  │   Tick:  drain 5005 + 5010, apply cmds     │
-  │  ROS bridge_node.py        │   5010 binary sp ────►  │   Timer 60 Hz: BVRGym PID → setpoint pawn  │
-  │  (mumt_bridge)             │                         │   Timer 20 Hz: build+send state → 5006     │
+  │  ROS bridge_node.py        │   5010 JSON sp  ─────►  │   Timer 60 Hz: BVRGym PID → setpoint pawn  │
+  │  (mumt_bridge)             │                         │   Timer ~20 Hz: build+send state → 5006    │
   │   recv 5006 ◄──────────────┼─────────  5006 JSON ───  └──────────────────────────────────────────┘
   │   /mumt/aircraft_commands  │
   │   /aircraft/setpoint       │   ROS topics on the other side (see ARCHITECTURE.md §2c)
@@ -71,14 +71,14 @@ SendSocket     = FUdpSocketBuilder("UDP_State_Sender")
 ### Threading / rate model
 | Driver | Rate | What it does |
 |---|---|---|
-| `Tick` (actor) | every frame | `ReceiveUDPData()` drains 5005; `ReceiveSetpointData()` drains 5010; then applies JSON commands to controlled pawns |
-| `AutopilotTimerHandle` | **60 Hz** | `AutopilotTick()` → runs `FBVRGymAutopilot` PID → applies to the **primary** controlled pawn (only after first setpoint, or if `bUseDebugSetpoint`) |
-| `StateSendTimerHandle` | **20 Hz** (`StateSendInterval=0.05`) | `SendStateToPython()` → builds + sends the state batch to 5006 |
+| `Tick` (actor) | every frame | `ReceiveUDPData()` drains 5005; `ReceiveSetpointData()` drains 5010; then applies name-matched JSON commands to controlled pawns |
+| `AutopilotTimerHandle` | **60 Hz** | `AutopilotTick()` → for **each** aircraft with a setpoint runs its own `FAircraftAutopilot` PID → applies to that pawn (each name created lazily on its first setpoint, or `bUseDebugSetpoint`) |
+| `StateSendTimerHandle` | `StateSendInterval` (**default `0.05` = 20 Hz**) | `SendStateToPython()` → builds + sends the state batch to 5006. It is a game-time timer; on a faster level (`RL_2` overrides ≈`0.005`) the raw rate runs well above the ~60 Hz sim update, so it oversamples and re-sends each frame (see §12) |
 
 Sockets are non-blocking and **fully drained** each Tick (`while HasPendingData`).
 
 ### Pawn targeting (by name substring)
-- `ControlledPawnNamePatterns = {"F16_UAV","UAV"}`, capped at `MaxControlledUavs = 2` — who receives commands.
+- `ControlledPawnNamePatterns = {"F16_UAV","UAV","M_F16"}`, capped at `MaxControlledUavs = 4` — who can receive 5005 commands. Including `M_F16` lets the joystick-driven manned aircraft be commanded over the same channel as the UAVs.
 - `ObservedPawnNamePatterns = {"F16","UAV"}` — who is reported in the state batch (so the player `M_F16` is also reported).
 - Fallback single target `TargetPawnName = "F16_UAV"`.
 
@@ -127,12 +127,13 @@ setpoint **addressed to one aircraft by name** (so N UAVs share this single sock
 
 ```json
 {
-  "aircraft_name":  "F16_UAV2",   // REQUIRED — routes to the matching pawn; empty/absent → packet ignored
-  "heading_deg":    90.0,
-  "altitude_m":     3000.0,
-  "throttle_norm":  0.9,           // clamped to [0,1]
-  "launch_missile": false,
-  "reset":          false          // OPTIONAL — if true, drop this UAV's controller (fresh PID next tick)
+  "aircraft_name":    "F16_UAV2",  // REQUIRED — routes to the matching pawn; empty/absent → packet ignored
+  "heading_deg":      90.0,
+  "altitude_m":       3000.0,      // UE world Z (m); shares the frame the state batch reports as "z"
+  "throttle_norm":    0.9,         // clamped to [0,1]; used open-loop only when target_speed_mps <= 0
+  "target_speed_mps": 240.0,       // >0 → in-engine autothrottle holds this airspeed (overrides throttle_norm)
+  "launch_missile":   false,
+  "reset":            false        // OPTIONAL — if true, drop this UAV's controller (fresh PID next tick)
 }
 ```
 
@@ -150,9 +151,12 @@ Behavior:
 `F16_UAV2`), then a **substring** fallback that is used **only when exactly one pawn contains the key**
 (tolerates spawn suffixes like `"M_F16"` → `"M_F16_C_0"`; an ambiguous key is skipped + logged). It then looks up that aircraft's own
 controller in `TMap<FString, FAircraftAutopilot> Autopilots` (`FindOrAdd`, so **each UAV keeps separate PID /
-hysteresis state**). `ApplyAutopilotToPawn` then runs `FBVRGymAutopilot` (cascade PID: heading→bank→aileron,
+hysteresis state**). `ApplyAutopilotToPawn` then runs `FAircraftAutopilot` (cascade PID: heading→bank→aileron,
 altitude→pitch→elevator), grabs the `UJSBSimMovementComponent` via `FindComponentByClass`, and writes
 **directly**: `JSBSim->Commands.Aileron/Elevator/Rudder` and `EngineCommands[0].Throttle`. No Blueprint variables.
+Altitude feedback is `GetActorLocation().Z / 100` (UE-Z, the same value reported as state `z`), not JSBSim ASL.
+Throttle is the **autothrottle** output when `target_speed_mps > 0` (speed-hold PI on `CurrentSpeed − target`);
+otherwise it falls back to the open-loop `throttle_norm` from the setpoint (see [README_Autopilot.md](README_Autopilot.md)).
 
 > ⚠️ Per-pawn ownership still applies: if one pawn is both driven by a 5010 setpoint AND a 5005 JSON command,
 > the two paths fight over its flight commands. Give each pawn a single controller (e.g. autopilot for UAVs,
@@ -162,8 +166,8 @@ altitude→pitch→elevator), grabs the `UJSBSimMovementComponent` via `FindComp
 
 ## 5. Channel 5006 — JSON state batch (UE → external)
 
-**Sender:** `SendStateToPython` (20 Hz). For every pawn matching `ObservedPawnNamePatterns`, `BuildPawnState`
-emits one object; all are wrapped in a batch:
+**Sender:** `SendStateToPython` (timer at `StateSendInterval`, 20 Hz by default). For every pawn matching
+`ObservedPawnNamePatterns`, `BuildPawnState` emits one object; all are wrapped in a batch:
 
 ```json
 {
@@ -172,7 +176,7 @@ emits one object; all are wrapped in a batch:
   "aircraft": [
     {
       "aircraft_name": "F16_UAV_0",
-      "x": 12345.6, "y": -789.0, "z": 30000.0,        // Unreal actor location, cm
+      "x": 12345.6, "y": -789.0, "z": 30000.0,        // Unreal actor location, cm: x=East, y=South, z=Up
       "speed_mps": 257.2,                              // AircraftState.TotalVelocityKts * 0.514444
       "pitch": 2.1, "roll": -0.4, "yaw": 178.9,        // AircraftState.LocalEulerAngles, deg
       "throttle": 0.8,                                 // EngineCommands[0].Throttle
@@ -198,12 +202,13 @@ A pure UDP↔ROS adapter. ROS params (defaults): `unreal_ip=127.0.0.1`, `control
 | ROS topic | Type | UDP action |
 |---|---|---|
 | SUB `/mumt/aircraft_commands` | `std_msgs/String` (JSON inside) | validate JSON, then `sendto(unreal_ip, 5005)` — passthrough |
-| SUB `/aircraft/setpoint` | `custom_msgs/AircraftSetpoint` | `json.dumps({aircraft_name, heading_deg, altitude_m, throttle_norm(clamped), launch_missile})` → `sendto(..., 5010)` |
-| PUB `/mumt/aircraft_states` | `std_msgs/String` (JSON) | `recvfrom(65535)` on `0.0.0.0:5006` via a 50 Hz timer (`create_timer(0.02)`), validate JSON, publish |
+| SUB `/aircraft/setpoint` | `custom_msgs/AircraftSetpoint` | `json.dumps({aircraft_name, heading_deg, altitude_m, throttle_norm(clamped), target_speed_mps, launch_missile})` → `sendto(..., 5010)` |
+| PUB `/mumt/aircraft_states` | `std_msgs/String` (JSON) | drain `recvfrom(65535)` on `0.0.0.0:5006` via a 50 Hz timer (`create_timer(0.02)`, drains all queued datagrams per tick), validate JSON, publish each datagram |
 
 Bridge-specific notes:
 - The setpoint is forwarded as **JSON**, so the variable-length `aircraft_name` rides along and UE can route it
-  to the right UAV. (Previously this was a fixed 17-byte binary packet with no name field — single-UAV only.)
+  to the right UAV. (Previously this was a fixed-size binary packet with no name field — single-UAV only.)
+- `target_speed_mps` is forwarded so the in-engine autothrottle can hold a commanded airspeed.
 - `launch_missile` is forwarded as a JSON bool (UE reads it into `FUavSetpoint`).
 
 ---
@@ -234,10 +239,11 @@ Ranges follow the pawn/FDM convention (surface cmds normalized; throttle 0..1). 
 
 ### B. 5010 inbound JSON (setpoint, per-UAV)
 ```
-{aircraft_name:str, heading_deg:f, altitude_m:f, throttle_norm:f(0..1), launch_missile:bool, reset?:bool}
-{setpoints:[{aircraft_name, heading_deg, altitude_m, throttle_norm, launch_missile}, ...]}   // batch form
+{aircraft_name:str, heading_deg:f, altitude_m:f, throttle_norm:f(0..1), target_speed_mps:f, launch_missile:bool, reset?:bool}
+{setpoints:[{aircraft_name, heading_deg, altitude_m, throttle_norm, target_speed_mps, launch_missile}, ...]}   // batch form
 ```
 `aircraft_name` is required and routes the setpoint to the pawn whose `GetName()` matches (exact, then substring).
+`target_speed_mps > 0` engages the autothrottle (overrides `throttle_norm`); `<= 0` keeps open-loop throttle.
 
 ### C. `custom_msgs/AircraftSetpoint.msg` (ROS side of the setpoint)
 ```
@@ -245,6 +251,7 @@ string  aircraft_name
 float32 heading_deg
 float32 altitude_m
 float32 throttle_norm
+float32 target_speed_mps
 bool    launch_missile
 ```
 `aircraft_name` is the per-UAV address — each BT (one per UAV) sets it so the shared `/aircraft/setpoint` topic
@@ -264,8 +271,8 @@ from the UDP command schema (`roll/pitch/yaw`) — there is no single shared com
 ## 9. Gaps / pitfalls (honest notes)
 
 1. **Two consumers bind 5006** — run only one of `bridge_node.py` / `control_sender.py` at a time.
-2. **launch_missile ignored by UE** — present in msg + wire, never read on byte 13.
-3. **No ROS-driven reset/seq** — `AircraftSetpoint.msg` lacks them; bridge forces reset=0.
+2. **launch_missile parsed but not acted on** — UE reads it into `FUavSetpoint.LaunchMissile`, but no fire logic consumes it yet.
+3. **No ROS-driven reset** — `AircraftSetpoint.msg` lacks a `reset` field; it exists only as an optional UDP-only JSON field.
 4. **Field-name mismatch** — 5005 uses roll/pitch/yaw; control.json uses aileron/elevator/rudder.
 5. **Two command paths can conflict** on the same pawn (5005 via `UDP_*` vs 5010 via direct autopilot).
 6. **All hardcoded to 127.0.0.1** — UE ports are editable UPROPERTYs, bridge ports are ROS params (un-overridden), sender ports are constants.
@@ -294,3 +301,29 @@ Unreal side.
 | Setpoint ROS message | `mumt_ros_ws/src/custom_msgs/msg/AircraftSetpoint.msg` |
 | Standalone autonomous sender | `Scripts/control_sender.py` |
 | JSBSim default snapshot (not UDP) | `Config/JSBSim/control.json` |
+
+---
+
+## 12. Communication quality (measured 2026-06-28)
+
+Measured with the joystick + BT stack live (one UAV + the manned `M_F16`):
+
+| Channel | Topic / port | Rate | Notes |
+|---|---|---|---|
+| Commands | `/mumt/aircraft_commands` → 5005 | **50 Hz** | joystick `publish_rate_hz=50`, ~20 ms gap, 0 drops |
+| Setpoint | `/aircraft/setpoint` → 5010 | **10 Hz** | BT `bt_tick_rate=10`, ~100 ms gap, 0 drops |
+| State | 5006 → `/mumt/aircraft_states` | raw **~180–200 Hz**, effective distinct **≈60 Hz** | `StateSendInterval` oversamples (faster than the ~60 Hz sim frame), so each distinct frame is re-sent ~3×; 0 drops |
+
+- Per-message size ≈ **0.82 KB**, throughput ≈ **50 KB/s** on the state channel.
+- Round-trip latency (setpoint throttle → state echo): **~48 ms** average (20–80 ms range).
+- UDP `Recv-Q` drains to 0 — no kernel backlog / drops.
+
+CLI to reproduce:
+```bash
+ros2 topic hz /mumt/aircraft_commands
+ros2 topic hz /aircraft/setpoint
+ros2 topic hz /mumt/aircraft_states          # raw rate (includes duplicate frames)
+
+# effective DISTINCT state rate (dedup consecutive duplicates, then ÷ window seconds):
+timeout 10 ros2 topic echo /mumt/aircraft_states | grep '^data:' | uniq | wc -l   # ÷10
+```
