@@ -16,7 +16,7 @@ void UWeaponComponent::SetGunFiring(bool bFiring)
         return;
     }
     bGunFiring = bNewState;
-    OnGunFiringChanged(bGunFiring);
+    OnGunFiringChanged.Broadcast(bGunFiring);
 }
 
 bool UWeaponComponent::FireMissile()
@@ -34,7 +34,7 @@ bool UWeaponComponent::FireMissile()
         Target->ApplyDamage(MissileDamage, GetOwner());
     }
     // 명중 여부와 무관하게 연출은 발사 (허공 발사 = 미사일만 소모)
-    OnMissileFired();
+    OnMissileFired.Broadcast();
     return true;
 }
 

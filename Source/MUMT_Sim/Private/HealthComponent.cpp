@@ -47,13 +47,13 @@ void UHealthComponent::EnterFalling()
         }
     }
 
-    OnStartFalling();
+    OnStartFalling.Broadcast();
 }
 
 void UHealthComponent::EnterCrashed()
 {
     LifeState = EAircraftLifeState::Crashed;
-    OnCrashed();
+    OnCrashed.Broadcast();
 }
 
 void UHealthComponent::TickComponent(float DeltaTime, ELevelTick TickType,

@@ -6,6 +6,10 @@
 
 class UJSBSimMovementComponent;
 
+// 소유자 폰 BP가 바인딩하는 상태 전이 이벤트 (컴포넌트 디테일 패널의 이벤트 섹션 / Assign 노드).
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnStartFalling);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnCrashed);
+
 UENUM(BlueprintType)
 enum class ETeam : uint8
 {
@@ -51,11 +55,11 @@ public:
     UFUNCTION(BlueprintPure, Category = "MUMT|Health")
     bool IsAlive() const { return LifeState == EAircraftLifeState::Alive; }
 
-    UFUNCTION(BlueprintImplementableEvent, Category = "MUMT|Health")
-    void OnStartFalling();
+    UPROPERTY(BlueprintAssignable, Category = "MUMT|Health")
+    FOnStartFalling OnStartFalling;
 
-    UFUNCTION(BlueprintImplementableEvent, Category = "MUMT|Health")
-    void OnCrashed();
+    UPROPERTY(BlueprintAssignable, Category = "MUMT|Health")
+    FOnCrashed OnCrashed;
 
 protected:
     virtual void BeginPlay() override;

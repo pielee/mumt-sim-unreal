@@ -6,6 +6,10 @@
 
 class UHealthComponent;
 
+// 소유자 폰 BP가 바인딩하는 연출 이벤트 (컴포넌트 디테일 패널의 이벤트 섹션 / Assign 노드).
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnGunFiringChanged, bool, bFiring);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnMissileFired);
+
 UCLASS(ClassGroup=(MUMT), meta=(BlueprintSpawnableComponent))
 class MUMT_SIM_API UWeaponComponent : public UActorComponent
 {
@@ -66,12 +70,12 @@ public:
     UFUNCTION(BlueprintPure, Category = "MUMT|Weapon")
     FVector GetOwnerWorldVelocity() const { return OwnerWorldVelocity; }
 
-    // --- BP 연출 훅 ---
-    UFUNCTION(BlueprintImplementableEvent, Category = "MUMT|Weapon")
-    void OnGunFiringChanged(bool bFiring);
+    // --- BP 연출 훅 (소유자 폰 BP에서 바인딩) ---
+    UPROPERTY(BlueprintAssignable, Category = "MUMT|Weapon")
+    FOnGunFiringChanged OnGunFiringChanged;
 
-    UFUNCTION(BlueprintImplementableEvent, Category = "MUMT|Weapon")
-    void OnMissileFired();
+    UPROPERTY(BlueprintAssignable, Category = "MUMT|Weapon")
+    FOnMissileFired OnMissileFired;
 
 protected:
     virtual void TickComponent(float DeltaTime, ELevelTick TickType,
