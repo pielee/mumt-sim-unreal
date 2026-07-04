@@ -52,6 +52,16 @@ void UWeaponComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 {
     Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
+    // 기체 월드 속도 (위치 미분) — 발사 여부와 무관하게 항상 갱신.
+    // JSBSim이 폰 트랜스폼을 직접 세팅해 GetVelocity()가 0이므로 여기서 계산한다.
+    const FVector Now = GetOwner()->GetActorLocation();
+    if (bHasPrevLocation && DeltaTime > KINDA_SMALL_NUMBER)
+    {
+        OwnerWorldVelocity = (Now - PrevOwnerLocation) / DeltaTime;
+    }
+    PrevOwnerLocation = Now;
+    bHasPrevLocation = true;
+
     if (!bGunFiring)
     {
         return;

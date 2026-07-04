@@ -60,6 +60,12 @@ public:
     UFUNCTION(BlueprintCallable, Category = "MUMT|Weapon")
     void ConsumeMissileFireId(int64 FireId);
 
+    /** 기체 월드 속도 (cm/s). JSBSim 플러그인이 폰 트랜스폼을 직접 세팅해
+        GetVelocity()가 0을 반환하므로, 위치 미분으로 계산한 속도를 제공한다.
+        BP가 트레이서/로켓 스폰 시 InheritedVelocity로 전달하는 용도. */
+    UFUNCTION(BlueprintPure, Category = "MUMT|Weapon")
+    FVector GetOwnerWorldVelocity() const { return OwnerWorldVelocity; }
+
     // --- BP 연출 훅 ---
     UFUNCTION(BlueprintImplementableEvent, Category = "MUMT|Weapon")
     void OnGunFiringChanged(bool bFiring);
@@ -78,4 +84,8 @@ private:
 
     float AmmoSpentAccumulator = 0.f;
     int64 LastConsumedFireId = -1;
+
+    FVector PrevOwnerLocation = FVector::ZeroVector;
+    FVector OwnerWorldVelocity = FVector::ZeroVector;   // cm/s
+    bool bHasPrevLocation = false;
 };
