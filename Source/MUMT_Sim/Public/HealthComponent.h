@@ -43,6 +43,16 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "MUMT|Health")
     float CrashAGLThresholdFt = 10.f;
 
+    // 기체 머리 위 HP 디버그 텍스트 (PIE 화면 표시, uasset 불필요)
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "MUMT|Health|Debug")
+    bool bShowHPDebug = true;
+
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "MUMT|Health|Debug")
+    float DebugTextHeightCm = 400.f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "MUMT|Health|Debug")
+    float DebugTextScale = 1.5f;
+
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "MUMT|Health")
     float CurrentHP = 0.f;
 

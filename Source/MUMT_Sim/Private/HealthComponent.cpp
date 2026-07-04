@@ -1,4 +1,5 @@
 #include "HealthComponent.h"
+#include "DrawDebugHelpers.h"
 #include "JSBSimMovementComponent.h"
 
 UHealthComponent::UHealthComponent()
@@ -60,6 +61,28 @@ void UHealthComponent::TickComponent(float DeltaTime, ELevelTick TickType,
                                      FActorComponentTickFunction* ThisTickFunction)
 {
     Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+
+    // 기체 머리 위 HP 표시 — 매 틱 1프레임짜리 텍스트를 다시 그려 따라다니게 함.
+    if (bShowHPDebug)
+    {
+        FColor Color = FColor::Green;
+        FString Suffix;
+        if (LifeState == EAircraftLifeState::Falling)
+        {
+            Color = FColor::Orange;  Suffix = TEXT("  FALLING");
+        }
+        else if (LifeState == EAircraftLifeState::Crashed)
+        {
+            Color = FColor::Red;     Suffix = TEXT("  CRASHED");
+        }
+        else if (CurrentHP <= MaxHP * 0.5f)
+        {
+            Color = FColor::Yellow;  // 피격 누적 경고
+        }
+        const FString Label = FString::Printf(TEXT("HP %.0f / %.0f%s"), CurrentHP, MaxHP, *Suffix);
+        DrawDebugString(GetWorld(), FVector(0.f, 0.f, DebugTextHeightCm), Label,
+                        GetOwner(), Color, /*Duration=*/0.f, /*bDrawShadow=*/true, DebugTextScale);
+    }
 
     if (LifeState != EAircraftLifeState::Falling || !JSBSim)
     {
