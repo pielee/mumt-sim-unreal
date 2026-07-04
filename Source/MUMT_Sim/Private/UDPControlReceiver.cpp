@@ -6,6 +6,7 @@
 #include "Engine/World.h"
 #include "FDMTypes.h"
 #include "GameFramework/Pawn.h"
+#include "HealthComponent.h"
 #include "IPAddress.h"
 #include "JSBSimMovementComponent.h"
 #include "Kismet/GameplayStatics.h"
@@ -348,6 +349,17 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     UJSBSimMovementComponent* JSBSim = FindJSBSimMovementComponent(Pawn);
     if (!JSBSim) return;
 
+    // Dead/falling aircraft keep the hardover surfaces from UHealthComponent —
+    // don't fight the crash. Drop the stale controller so any respawn starts fresh.
+    if (const UHealthComponent* Health = Pawn->FindComponentByClass<UHealthComponent>())
+    {
+        if (!Health->IsAlive())
+        {
+            Autopilots.Remove(Key);
+            return;
+        }
+    }
+
     // This UAV's own controller — separate PID/hysteresis state, created on first use.
     FAircraftAutopilot& Autopilot = Autopilots.FindOrAdd(Key);
     // Sync live-tuned gains WITHOUT wiping runtime state (Derivator/Integrator) —
@@ -635,6 +647,16 @@ bool AUDPControlReceiver::ApplyControlCommandToPawn(APawn* Pawn, const FRemoteCo
     if (!IsValid(Pawn))
     {
         return false;
+    }
+
+    // Dead/falling aircraft ignore manned commands too (see ApplyAutopilotToPawn).
+    if (const UHealthComponent* Health = Pawn->FindComponentByClass<UHealthComponent>())
+    {
+        if (!Health->IsAlive())
+        {
+            Autopilots.Remove(PawnIdName(Pawn));
+            return false;
+        }
     }
 
     // Keep setting the Blueprint variables (for any BP that reads them / for HUD display).
