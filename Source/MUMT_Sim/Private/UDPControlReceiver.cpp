@@ -350,8 +350,9 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
 
     // This UAV's own controller — separate PID/hysteresis state, created on first use.
     FAircraftAutopilot& Autopilot = Autopilots.FindOrAdd(Key);
-    // Sync live-tuned gains WITHOUT wiping runtime state (esp. the autothrottle
-    // integrator — copying the whole struct would zero it every tick).
+    // Sync live-tuned gains WITHOUT wiping runtime state (Derivator/Integrator) —
+    // the BVRGym PID persists across ticks, so copying the whole struct would
+    // break the derivative term (and wipe the autothrottle trim integrator).
     Autopilot.RollPID.SetGains(RollPIDConfig);
     Autopilot.RollSecPID.SetGains(RollSecPIDConfig);
     Autopilot.PitchPID.SetGains(PitchPIDConfig);
@@ -375,8 +376,8 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     const FAutopilotOutput Out = Autopilot.GetControlInput(
         DiffHead, DiffAlt, PhiDeg, ThetaDeg, SpeedMps, Setpoint.TargetSpeedMps);
 
-    // Throttle: autothrottle output when speed-hold active (>=0), else the
-    // open-loop throttle from the setpoint (backward compatible).
+    // Throttle: autothrottle (speed-hold) output when active (>=0), else the
+    // open-loop throttle from the setpoint.
     const float ThrottleOut = (Out.Throttle >= 0.f) ? Out.Throttle : Setpoint.Throttle;
 
     JSBSim->Commands.Aileron  = Out.Aileron;
