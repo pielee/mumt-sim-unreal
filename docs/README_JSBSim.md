@@ -3,7 +3,7 @@
 > Scope: `Plugins/JSBSimFlightDynamicsModel` — the plugin that runs the JSBSim flight dynamics model in UE5.4.
 > Two parts: **(1) the JSBSim library's own structure**, and **(2) how that structure is integrated into Unreal**.
 >
-> - Date: 2026-06-23 (git `7632f63`)
+> - Date: 2026-06-28 (git `25c5459`)
 > - Parent doc: [ARCHITECTURE.md](ARCHITECTURE.md) (whole project)
 
 ---
@@ -121,8 +121,11 @@ OnRegister / BeginPlay
    └─ InitializeJSBSim()      new FGFDMExec → grab model pointers
    │                          → Inertial->SetGroundCallback(new UEGroundCallback(this))  ★registers ground link
    │                          → SetRootDir/AircraftPath/EnginePath/SystemsPath (Resources/JSBSim)
-   └─ LoadAircraft()          Exec->LoadModel("f16")  ← parse XML, build engines/tanks/gears
+   └─ LoadAircraft()          Exec->LoadModel(AircraftModel)  ← parse XML, build engines/tanks/gears
    │                          → rebuild UE arrays (EngineCommands/Tanks/Gears)
+   │                          ※ AircraftModel is a per-actor EditAnywhere UPROPERTY (default ""); every
+   │                            aircraft here (manned M_F16 + every F16_UAV) sets it to "f16", so all
+   │                            share one flight envelope / max speed
    └─ PrepareJSBSim()         Actor's UE Transform → geodetic → set JSBSim initial conditions (IC)
                               (lat/lon/alt/Psi+90/Theta/Phi, speed, wind, flaps, gear)
                               → RunIC() → start engines → DoTrim() (solve equilibrium via FGTrim)
@@ -135,7 +138,9 @@ This is the heart of the Unreal integration:
 ```
 1. Fixed 120Hz pacing  compute simloops + accumulate remainder → JSBSim steps at 1/120s regardless of FPS
                        Exec->Setdt(1/120)          (cpp:351-358)
-                       ※ NOTE: full determinism also requires running the game at a fixed tick
+                       ※ NOTE: full determinism also requires running the game at a fixed tick.
+                         In practice the sim runs near realtime but can drop below realtime under heavy
+                         load (e.g. many aircraft / terrain streaming).
 
 2. CopyToJSBSim()      UE Commands → JSBSim properties  (cpp:684)
                        FCS->SetDaCmd(Aileron), SetDeCmd(Elevator), SetDrCmd(-Rudder),
@@ -148,6 +153,9 @@ This is the heart of the Unreal integration:
 5. CopyFromJSBSim()  JSBSim properties → UE AircraftState  (cpp:744)
                      surface deg, CAS/Ground/Total kts, VelocityNED, Alt ASL/AGL,
                      ECEFLocation, lat/lon, Euler (Psi/Theta/Phi), rates
+                     ※ TotalVelocityKts = Auxiliary->GetVt() (JSBSim true airspeed). UDPControlReceiver
+                       reads this and computes SpeedMps = TotalVelocityKts * KnotToMetersPerSecond
+                       (0.514444) → the airspeed fed to the autothrottle / speed-hold PI.
 
 6. Coordinate transform + move the actor  (cpp:377-407)   ← ★the real heart of integration
 ```

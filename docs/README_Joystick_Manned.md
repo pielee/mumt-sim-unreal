@@ -5,13 +5,14 @@
 > Design choices (confirmed with the user): reuse the existing global `/mumt/aircraft_commands` topic;
 > axis mapping fully parameterized; the keyboard is fully replaced.
 >
-> Hardware: the same controller used for the F1TENTH car — an **Xbox-compatible gamepad**. This runs on a
+> Hardware: a **Logitech F710** gamepad (the same controller used for the F1TENTH car) — runs in its
+> **Xbox-compatible** (XInput) mode. This runs on a
 > normal **desktop PC** (not a Jetson), so the manual xpad install from
 > https://github.com/woawo1213/jetpack6-joy is **not needed** — that was only for the Jetson AGX Orin / Jetpack 6
 > F1TENTH box. On a desktop the pad is recognized by the stock Linux gamepad driver out of the box; you only
 > need the ROS `joy` package for `joy_node`.
 >
-> - Date: 2026-06-24
+> - Date: 2026-06-28
 > - Related: [README_UDP_Comms.md](README_UDP_Comms.md), [README_ROS_Bridge.md](README_ROS_Bridge.md), [README_F16_Actor.md](README_F16_Actor.md)
 
 ---
@@ -19,9 +20,9 @@
 ## 1. End-to-end chain
 
 ```
-Xbox-compatible gamepad         /dev/input/js0   (stock desktop Linux driver — plug & play)
+Logitech F710 (Xbox mode)       /dev/input/js0   (stock desktop Linux driver — plug & play)
   → joy_node (pkg: joy)           sensor_msgs/Joy on /joy
-  → mumt_joystick (this pkg)      maps axes → {roll,pitch,yaw,throttle}, publishes JSON
+  → mumt_joystick (this pkg)      maps axes → {roll,pitch,yaw,throttle}, publishes JSON @ 50 Hz
   → /mumt/aircraft_commands       std_msgs/String  {"commands":[{"aircraft_name":"M_F16",...}]}
   → bridge (this pkg)             forwards JSON → UDP 5005   (unchanged)
   → AUDPControlReceiver           sets UDP_Roll/Pitch/Yaw/Throttle on M_F16 (reflection)

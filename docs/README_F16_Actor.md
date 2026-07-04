@@ -6,7 +6,7 @@
 > export `f16_copy.T3D`, and the C++ that drives the pawn — logic-level details are inferred from
 > naming where the graph itself is binary.
 >
-> - Date: 2026-06-23 (git `7632f63`)
+> - Date: 2026-06-28 (git `25c5459`)
 > - Related: [ARCHITECTURE.md](ARCHITECTURE.md) (whole project), [README_JSBSim.md](README_JSBSim.md) (flight model plugin)
 
 ---
@@ -85,7 +85,7 @@ Other gameplay variables present on `M_F16` (referenced by the receiver's UPROPE
 
 ## 3. How the F-16 is driven — three control paths
 
-There are **three independent ways** commands reach the JSBSim component, two of which target the pawn:
+There are **three independent ways** commands reach the JSBSim component, all addressed to a specific pawn:
 
 ```
 (A) KEYBOARD  (player, M_F16)
@@ -95,9 +95,12 @@ There are **three independent ways** commands reach the JSBSim component, two of
       SwitchCamera, ToggleDebugInfo, shoot_bullet (LMB), shoot_rocket (RMB)
         └─► JSBSimMovementComponent.Commands / EngineCommands
 
-(B) UDP JSON  (remote, F16_UAV)   — INDIRECT, via Blueprint variables
+(B) UDP JSON  (remote, NAME-ADDRESSED)   — INDIRECT, via Blueprint variables
     AUDPControlReceiver::ReceiveUDPData (port 5005)
-      → ParseJsonCommand  {roll,pitch,yaw,throttle} or {commands:[{...,aircraft_name?}]}
+      → ParseJsonCommand  {commands:[{aircraft_name,roll,pitch,yaw,throttle}]}
+        keyed into TMap<name,FRemoteControlCommand> NamedControlCommands
+      → each tick: for every controlled pawn, apply the command whose aircraft_name
+        is contained in the pawn's instance name (PawnName.Contains(key))
       → ApplyControlCommandToPawn(pawn)
           SetBlueprintNumber(pawn,"UDP_Roll"/"UDP_Pitch"/"UDP_Yaw"/"UDP_Throttle")
         └─► pawn BP graph reads UDP_* ──► JSBSimMovementComponent.Commands
@@ -105,39 +108,41 @@ There are **three independent ways** commands reach the JSBSim component, two of
 (C) AUTOPILOT / SETPOINT  (remote, PER-UAV)   — DIRECT, bypasses Blueprint variables
     AUDPControlReceiver::ReceiveSetpointData (port 5010, JSON {aircraft_name,...})
       → store in TMap<name,FUavSetpoint> Setpoints  (latest-wins per aircraft)
-      → AutopilotTick (60 Hz) loops setpoints, matches pawn by name, per-UAV FBVRGymAutopilot
-        (cascade PID: heading→bank→aileron, alt→pitch→elevator)
+      → AutopilotTick (60 Hz) loops setpoints, matches pawn by name, per-UAV FAircraftAutopilot
+        (cascade PID: heading→bank→aileron, alt→pitch→elevator, speed→autothrottle)
       → ApplyAutopilotToPawn(pawn, name, setpoint)
           FindComponentByClass<UJSBSimMovementComponent>()
         └─► JSBSim->Commands.Aileron/Elevator/Rudder, EngineCommands[0].Throttle  (direct)
 ```
 
-Which pawn each path hits:
-- The receiver finds pawns **by name substring**: `ControlledPawnNamePatterns = {"F16_UAV","UAV"}`, capped at `MaxControlledUavs = 2`.
-- Path (B) applies per-pawn commands: `aircraft_name`-keyed first, else by index, else the broadcast command.
-- Path (C) applies only to the **primary** cached target pawn (first matching `F16_UAV`), and only **after the first setpoint packet arrives**.
+Which pawn each path hits — **everything is name-addressed by the pawn instance name** (`Pawn->GetName()`, e.g. `F16_UAV_C_2`, `M_F16_C_1`):
+- The receiver finds candidate pawns **by name substring**: `ControlledPawnNamePatterns = {"F16_UAV","UAV","M_F16"}`, capped at `MaxControlledUavs = 4`. Note `M_F16` is now controllable too (joystick → manned).
+- Path (B) applies **only name-matched commands** — a pawn responds solely to a command whose `aircraft_name` is contained in its instance name. There is **no positional-index or broadcast fallback**, so independent senders (joystick → manned `M_F16`, controller/BT → `F16_UAV`) can share the topic without cross-applying one vehicle's command to another.
+- Path (C) drives **every UAV that has a setpoint**, each with its own `FAircraftAutopilot` (separate PID/hysteresis state, created lazily on first setpoint). A setpoint is matched to a pawn by **exact name first**, then a **unique substring** match (ambiguous matches are skipped and logged). The setpoint carries `{aircraft_name, heading_deg, altitude_m, throttle_norm, target_speed_mps, launch_missile}`; the autopilot outputs aileron/elevator and a throttle that is the **autothrottle** speed-hold output when `target_speed_mps > 0`, otherwise the open-loop `throttle_norm`.
 
-> **Important asymmetry:** Path (B) needs the pawn to have `UDP_*` variables AND a BP graph that forwards them. Path (C) needs nothing but a `UJSBSimMovementComponent` — it reaches into the component directly. The player's `M_F16` is normally flown by keyboard (A); UAVs are flown remotely by (B) or (C).
+> **Coordinate frame:** the world is `x = East, y = South, z = Up`, in cm (the JSBSim plugin's ESU tangent frame). Altitude both reported in state (`z`) and used by the autopilot is `GetActorLocation().Z / 100` (UE-Z metres), **not** JSBSim ASL — so `altitude_m` setpoints and `z/100` share one frame.
+
+> **Important asymmetry:** Path (B) needs the pawn to have `UDP_*` variables AND a BP graph that forwards them. Path (C) needs nothing but a `UJSBSimMovementComponent` — it reaches into the component directly. The player's `M_F16` is flown by keyboard (A) or by a joystick whose commands come in over (B) addressed to `M_F16`; UAVs are flown remotely by (B) or (C).
 
 ---
 
 ## 4. State output (the F-16 → outside world)
 
-`AUDPControlReceiver::SendStateToPython` runs on a timer (`StateSendInterval = 0.05s`, 20 Hz) and, for every pawn matching `ObservedPawnNamePatterns = {"F16","UAV"}`, builds one JSON object via `BuildPawnState`:
+`AUDPControlReceiver::SendStateToPython` runs on a timer (`StateSendInterval = 0.05s`, default 20 Hz; some levels override it lower) and, for every pawn matching `ObservedPawnNamePatterns = {"F16","UAV"}`, builds one JSON object via `BuildPawnState`:
 
 ```json
 { "message_type": "aircraft_state_batch", "count": N,
   "aircraft": [
-    { "aircraft_name": "<pawn name>",
-      "x": <UE cm>, "y": <UE cm>, "z": <UE cm>,
-      "speed_mps": <TotalVelocityKts * 0.514444>,
+    { "aircraft_name": "<Pawn->GetName(), e.g. F16_UAV_C_2 / M_F16_C_1>",
+      "x": <UE cm, East>, "y": <UE cm, South>, "z": <UE cm, Up>,
+      "speed_mps": <TotalVelocityKts * KnotToMetersPerSecond>,
       "pitch": <deg>, "roll": <deg>, "yaw": <deg>,     // from JSBSim AircraftState.LocalEulerAngles
       "throttle": <EngineCommands[0].Throttle>,
       "team": <Team var | null>,
       "weapons": { "bullet_ammo": <BulletAmmo | null>, "rocket_ammo": <RocketAmmo | null> } } ] }
 ```
 
-Sent over UDP to `PythonIP:PythonStatePort = 127.0.0.1:5006`. Position is the **Unreal actor transform** (cm); attitude/speed come from the **JSBSim component**.
+Sent over UDP to `PythonIP:PythonStatePort = 127.0.0.1:5006`. Position is the **Unreal actor transform** (cm); attitude/speed come from the **JSBSim component**. The `aircraft_name` is the pawn instance name — it is the **routing key** that name-addressed commands (5005) and setpoints (5010) are matched against, so consumers should echo back the exact name they see here. The state-frame timer runs in game time and currently oversamples the ~60 Hz sim frame (raw send ≈180–200 Hz, ~3 duplicate frames each; effective distinct rate ≈60 Hz).
 
 ---
 

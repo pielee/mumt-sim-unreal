@@ -1,8 +1,11 @@
 // BVRGymAutopilot.cpp
+// Surface control = faithful port of BVRGym jsb_gym/utils/autopilot.py
+// (AircraftPIDAutopilot) + control.py (PID). Speed-hold (autothrottle) is added
+// on top — BVRGym left throttle as a "todo: velocity control" (fixed 0.49).
 #include "BVRGymAutopilot.h"
 #include "Math/UnrealMathUtility.h"
 
-// ─── FPID ─────────────────────────────────────────────────────────────────
+// ─── FPID (control.py PID) ──────────────────────────────────────────────────
 
 float FPID::Update(float CurrentValue)
 {
@@ -25,20 +28,21 @@ void FPID::SetGains(const FPID& Cfg)
 {
     Kp = Cfg.Kp; Ki = Cfg.Ki; Kd = Cfg.Kd;
     IntegMin = Cfg.IntegMin; IntegMax = Cfg.IntegMax;
-    Derivator = 0.f;   // matches prior per-tick reset (roll/pitch D unchanged)
-    // Integrator intentionally preserved → autothrottle trim accumulates.
+    // Runtime state (Derivator, Integrator) intentionally preserved → the PID
+    // persists across ticks (BVRGym). Keeps D = Kd*(error - prev_error) and the
+    // autothrottle's trim integrator intact.
 }
 
 // ─── FAircraftAutopilot ────────────────────────────────────────────────────
 
 FAircraftAutopilot::FAircraftAutopilot()
 {
-    // Defaults from f16_config.py
+    // Surface gains from f16_config.py (aircraft_PID_Gains).
     RollPID    = {0.01f, 0.f, 0.9f, -0.2f,  0.2f};
     RollSecPID = {0.2f,  0.f, 0.2f, -1.0f,  1.0f};
     PitchPID   = {0.3f,  0.f, 1.0f, -1.0f,  1.0f};
-    // Speed-hold (autothrottle): PI on airspeed error. Integrator provides the
-    // steady-state trim throttle (Ki*IntegMax ≈ 1). Output clamped to [0,1].
+    // Speed-hold (autothrottle): PI on airspeed error. The integrator provides the
+    // steady-state trim throttle (Ki*IntegMax = 0.004*250 = 1.0). Output [0,1].
     ThrottlePID = {0.02f, 0.004f, 0.f, 0.f, 250.f};
 
     AltActSpace   = NavParams.AltActSpaceMin;
@@ -46,6 +50,8 @@ FAircraftAutopilot::FAircraftAutopilot()
     ThetaActSpace = NavParams.ThetaActSpaceMin;
 }
 
+// Surface control = direct port of AircraftPIDAutopilot.get_control_input.
+// Throttle = added speed-hold (SetThrottlePID).
 FAutopilotOutput FAircraftAutopilot::GetControlInput(
     float DiffHeadDeg,
     float DiffAltM,
@@ -57,69 +63,66 @@ FAutopilotOutput FAircraftAutopilot::GetControlInput(
     const float AbsHead = FMath::Abs(DiffHeadDeg);
     const float AbsAlt  = FMath::Abs(DiffAltM);
 
-    static int32 ApLogCnt = 0;
-    const bool bLog = (++ApLogCnt % 10 == 0);
-
     if (AbsHead >= HeadActSpace && AbsAlt <= AltActSpace)
     {
         // ── Hard-turn mode ────────────────────────────────────────────────
+        // Larger altitude action space while turning.
         AltActSpace = NavParams.AltActSpaceMax;
 
-        const float BankRef = (DiffHeadDeg >= 0.f ? 1.f : -1.f) * NavParams.RollMax;
-        SetRollPID(BankRef, false, CurrentPhiDeg);
+        // Bank hard toward the heading.
+        const float RollRotDir = (DiffHeadDeg >= 0.f) ? 1.f : -1.f;
+        SetRollPID(RollRotDir * NavParams.RollMax, /*bUseSecondary=*/false, CurrentPhiDeg);
 
-        SetPitchPID(FMath::RadiansToDegrees(FMath::Atan2(DiffAltM, NavParams.TanRef)),
-                    CurrentThetaDeg);
+        // DIRECT elevator pull through the turn (ease off near the roll limit).
+        if (NavParams.RollMax - FMath::Abs(CurrentPhiDeg) < 30.f)
+            ElevatorCmd = -0.3f;
+        else
+            ElevatorCmd = -0.9f;
 
-        HeadActSpace = NavParams.HeadActSpaceMin;
-
-        if (bLog) UE_LOG(LogTemp, Warning,
-            TEXT("[AP-MODE] HARDTURN  DiffHead=%.1f DiffAlt=%.0f Phi=%.1f | Ail=%.3f Elv=%.3f"),
-            DiffHeadDeg, DiffAltM, CurrentPhiDeg, AileronCmd, ElevatorCmd);
+        // Stay-in-turn threshold = Head_act_space_min. Clamp <= Max so a level's
+        // NavParams override with Min > Max can't invert the hysteresis (which
+        // would flicker hard-turn off every tick → aircraft never turns).
+        HeadActSpace = FMath::Min(NavParams.HeadActSpaceMin, NavParams.HeadActSpaceMax);
     }
     else
     {
         // ── Precision mode ────────────────────────────────────────────────
         AltActSpace = NavParams.AltActSpaceMin;
 
-        float ThetaRef = FMath::RadiansToDegrees(
-            FMath::Atan2(DiffAltM, NavParams.TanRef));
-        ThetaRef = FMath::Clamp(ThetaRef,
-            NavParams.DiveThetaMax, NavParams.ClimbThetaMax);
+        float ThetaRef = FMath::RadiansToDegrees(FMath::Atan2(DiffAltM, NavParams.TanRef));
+        ThetaRef = FMath::Clamp(ThetaRef, NavParams.DiveThetaMax, NavParams.ClimbThetaMax);
 
         if (AbsAlt > 1500.f)
         {
+            // Big altitude error → climb/dive wings-level.
             ThetaActSpace = NavParams.ThetaActSpaceMax;
             SetRollPID(0.f, false, CurrentPhiDeg);
-            if (bLog) UE_LOG(LogTemp, Warning,
-                TEXT("[AP-MODE] PREC-CLIMB  ThetaRef=%.1f Theta=%.1f DiffAlt=%.0f | Ail=%.3f Elv=%.3f"),
-                ThetaRef, CurrentThetaDeg, DiffAltM, AileronCmd, ElevatorCmd);
         }
         else if (AbsAlt < 1500.f && FMath::Abs(CurrentThetaDeg) > ThetaActSpace)
         {
+            // Settle pitch back toward level before correcting heading.
             ThetaActSpace = NavParams.ThetaActSpaceMin;
             SetRollPID(0.f, false, CurrentPhiDeg);
-            if (bLog) UE_LOG(LogTemp, Warning,
-                TEXT("[AP-MODE] PREC-SETTLE ThetaRef=%.1f Theta=%.1f DiffAlt=%.0f | Ail=%.3f Elv=%.3f"),
-                ThetaRef, CurrentThetaDeg, DiffAltM, AileronCmd, ElevatorCmd);
         }
         else
         {
+            // Fine heading hold: roll toward the target heading
+            // (proportional ×3, or the secondary PID for small errors).
             ThetaActSpace = NavParams.ThetaActSpaceMax;
-            SetRollPID(0.f, false, CurrentPhiDeg);
-            if (bLog) UE_LOG(LogTemp, Warning,
-                TEXT("[AP-MODE] PREC-LEVEL  ThetaRef=%.1f Theta=%.1f DiffAlt=%.0f | Ail=%.3f Elv=%.3f"),
-                ThetaRef, CurrentThetaDeg, DiffAltM, AileronCmd, ElevatorCmd);
+            if (AbsHead < 10.f)
+                SetRollPID(DiffHeadDeg,        /*bUseSecondary=*/true,  CurrentPhiDeg);
+            else
+                SetRollPID(DiffHeadDeg * 3.f,  /*bUseSecondary=*/false, CurrentPhiDeg);
         }
 
         SetPitchPID(ThetaRef, CurrentThetaDeg);
         HeadActSpace = NavParams.HeadActSpaceMax;
     }
 
-    // Speed-hold runs regardless of turn/precision mode (energy management).
+    // Speed-hold runs regardless of turn/precision mode (energy management add-on).
     SetThrottlePID(CurrentSpeedMps, TargetSpeedMps);
 
-    return {AileronCmd, ElevatorCmd, 0.f, ThrottleCmd};
+    return { AileronCmd, ElevatorCmd, 0.f, ThrottleCmd };
 }
 
 void FAircraftAutopilot::SetRollPID(float RollRef, bool bUseSecondary,
@@ -145,8 +148,8 @@ void FAircraftAutopilot::SetThrottlePID(float CurrentSpeedMps, float TargetSpeed
         ThrottleCmd = -1.f;   // speed-hold disabled → caller uses external throttle
         return;
     }
-    // FPID error = 0 - CurrentValue, so pass (V - V_target) → error = (V_target - V):
-    // slower than target → positive error → throttle up.
+    // FPID error = 0 - CurrentValue, so passing (V - V_target) gives
+    // error = (V_target - V): slower than target → positive error → throttle up.
     ThrottleCmd = FMath::Clamp(ThrottlePID.Update(CurrentSpeedMps - TargetSpeedMps),
                                0.f, 1.f);
 }
