@@ -6,6 +6,7 @@
 #include "Engine/World.h"
 #include "FDMTypes.h"
 #include "GameFramework/Pawn.h"
+#include "HealthComponent.h"
 #include "IPAddress.h"
 #include "JSBSimMovementComponent.h"
 #include "Kismet/GameplayStatics.h"
@@ -15,6 +16,7 @@
 #include "Sockets.h"
 #include "TimerManager.h"
 #include "UObject/UnrealType.h"
+#include "WeaponComponent.h"
 
 namespace
 {
@@ -35,6 +37,17 @@ namespace
         }
 #endif
         return P ? P->GetName() : FString();
+    }
+
+    // ETeam → 5006 broadcast string ("manned" / "friendly_uav" / "enemy").
+    FString TeamToString(ETeam Team)
+    {
+        switch (Team)
+        {
+        case ETeam::Manned:      return TEXT("manned");
+        case ETeam::FriendlyUAV: return TEXT("friendly_uav");
+        default:                 return TEXT("enemy");
+        }
     }
 }
 
@@ -257,6 +270,8 @@ void AUDPControlReceiver::ReceiveSetpointData()
             if (O->TryGetNumberField(TEXT("throttle_norm"),   V)) SP.Throttle       = FMath::Clamp((float)V, 0.f, 1.f);
             if (O->TryGetNumberField(TEXT("target_speed_mps"),V)) SP.TargetSpeedMps = (float)V;
             O->TryGetBoolField(TEXT("launch_missile"), SP.LaunchMissile);
+            O->TryGetBoolField(TEXT("gun_firing"), SP.bGunFiring);
+            if (O->TryGetNumberField(TEXT("missile_fire_id"), V)) SP.MissileFireId = (int64)V;
 
             Setpoints.Add(Name, SP);   // latest-wins per aircraft
         };
@@ -348,6 +363,17 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     UJSBSimMovementComponent* JSBSim = FindJSBSimMovementComponent(Pawn);
     if (!JSBSim) return;
 
+    // Dead/falling aircraft keep the hardover surfaces from UHealthComponent —
+    // don't fight the crash. Drop the stale controller so any respawn starts fresh.
+    if (const UHealthComponent* Health = Pawn->FindComponentByClass<UHealthComponent>())
+    {
+        if (!Health->IsAlive())
+        {
+            Autopilots.Remove(Key);
+            return;
+        }
+    }
+
     // This UAV's own controller — separate PID/hysteresis state, created on first use.
     FAircraftAutopilot& Autopilot = Autopilots.FindOrAdd(Key);
     // Sync live-tuned gains WITHOUT wiping runtime state (Derivator/Integrator) —
@@ -385,6 +411,16 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     JSBSim->Commands.Rudder   = Out.Rudder;
     if (JSBSim->EngineCommands.Num() > 0)
         JSBSim->EngineCommands[0].Throttle = ThrottleOut;
+
+    // Weapon triggers ride along with the setpoint (Phase 3). Missile edge
+    // detection lives in UWeaponComponent; only forward ids > 0 so the msg
+    // default (0 = never fired) can't be mistaken for a first shot.
+    if (UWeaponComponent* Weapon = Pawn->FindComponentByClass<UWeaponComponent>())
+    {
+        Weapon->SetGunFiring(Setpoint.bGunFiring);
+        if (Setpoint.MissileFireId > 0)
+            Weapon->ConsumeMissileFireId(Setpoint.MissileFireId);
+    }
 
     // Last-applied (HUD/debug)
     AutopilotAileron  = Out.Aileron;
@@ -457,6 +493,13 @@ bool AUDPControlReceiver::ParseJsonCommand(const FString& Message)
         OutCommand.Pitch = JsonObject->GetNumberField(TEXT("pitch"));
         OutCommand.Yaw = JsonObject->GetNumberField(TEXT("yaw"));
         OutCommand.Throttle = JsonObject->GetNumberField(TEXT("throttle"));
+        // Optional weapon triggers (Phase 3) — old senders simply omit them.
+        JsonObject->TryGetBoolField(TEXT("gun_firing"), OutCommand.bGunFiring);
+        double FireId = 0.0;
+        if (JsonObject->TryGetNumberField(TEXT("missile_fire_id"), FireId))
+        {
+            OutCommand.MissileFireId = static_cast<int64>(FireId);
+        }
         OutCommand.bValid = true;
     };
 
@@ -637,6 +680,16 @@ bool AUDPControlReceiver::ApplyControlCommandToPawn(APawn* Pawn, const FRemoteCo
         return false;
     }
 
+    // Dead/falling aircraft ignore manned commands too (see ApplyAutopilotToPawn).
+    if (const UHealthComponent* Health = Pawn->FindComponentByClass<UHealthComponent>())
+    {
+        if (!Health->IsAlive())
+        {
+            Autopilots.Remove(PawnIdName(Pawn));
+            return false;
+        }
+    }
+
     // Keep setting the Blueprint variables (for any BP that reads them / for HUD display).
     const bool bRollOk = SetBlueprintNumber(Pawn, TEXT("UDP_Roll"), Command.Roll);
     const bool bPitchOk = SetBlueprintNumber(Pawn, TEXT("UDP_Pitch"), Command.Pitch);
@@ -653,6 +706,16 @@ bool AUDPControlReceiver::ApplyControlCommandToPawn(APawn* Pawn, const FRemoteCo
         if (JSBSim->EngineCommands.Num() > 0)
         {
             JSBSim->EngineCommands[0].Throttle = Command.Throttle;
+        }
+    }
+
+    // Weapon triggers (Phase 3) — same semantics as the autopilot path.
+    if (UWeaponComponent* Weapon = Pawn->FindComponentByClass<UWeaponComponent>())
+    {
+        Weapon->SetGunFiring(Command.bGunFiring);
+        if (Command.MissileFireId > 0)
+        {
+            Weapon->ConsumeMissileFireId(Command.MissileFireId);
         }
     }
 
@@ -838,6 +901,21 @@ TSharedPtr<FJsonObject> AUDPControlReceiver::BuildPawnState(APawn* Pawn)
     PawnJson->SetNumberField(TEXT("throttle"), ThrottleCommand);
 
     AddOptionalStringField(PawnJson, TEXT("team"), Pawn, TeamVarName);
+
+    // Combat state (Phase 3) — omitted when the pawn has no combat components,
+    // matching the optional-field convention above. When UHealthComponent exists
+    // its ETeam overrides the legacy Blueprint "Team" string set just above.
+    if (const UHealthComponent* Health = Pawn->FindComponentByClass<UHealthComponent>())
+    {
+        PawnJson->SetNumberField(TEXT("hp"), Health->CurrentHP);
+        PawnJson->SetNumberField(TEXT("max_hp"), Health->MaxHP);
+        PawnJson->SetStringField(TEXT("team"), TeamToString(Health->Team));
+        PawnJson->SetBoolField(TEXT("destroyed"), !Health->IsAlive());
+    }
+    if (const UWeaponComponent* Weapon = Pawn->FindComponentByClass<UWeaponComponent>())
+    {
+        PawnJson->SetNumberField(TEXT("missile_count"), Weapon->MissileCount);
+    }
 
     const TSharedPtr<FJsonObject> WeaponsJson = MakeShared<FJsonObject>();
     AddOptionalIntField(WeaponsJson, TEXT("bullet_ammo"), Pawn, BulletAmmoVarName);

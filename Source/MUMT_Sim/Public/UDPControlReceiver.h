@@ -19,6 +19,9 @@ struct FRemoteControlCommand
     double Yaw = 0.0;
     double Throttle = 0.0;
     bool bValid = false;
+    // Weapon triggers (Phase 3) — optional fields, keep defaults for old senders.
+    bool  bGunFiring = false;
+    int64 MissileFireId = 0;   // 0 = never fired (msg default); fire on change of id > 0
 };
 
 // High-level autopilot setpoint for one UAV (heading/altitude/speed-or-throttle).
@@ -28,7 +31,10 @@ struct FUavSetpoint
     float AltitudeM      = 0.f;
     float Throttle       = 0.8f;  // used only when TargetSpeedMps <= 0 (open-loop)
     float TargetSpeedMps = 0.f;   // >0 → autothrottle holds this airspeed
-    bool  LaunchMissile  = false;
+    bool  LaunchMissile  = false; // deprecated — use MissileFireId
+    // Weapon triggers (Phase 3) — optional fields, keep defaults for old senders.
+    bool  bGunFiring     = false; // level-triggered: fire while true
+    int64 MissileFireId  = 0;     // edge-triggered: one shot per new id (0 = never fired)
 };
 
 UCLASS()
