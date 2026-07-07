@@ -11,6 +11,9 @@
 
 class APawn;
 class UJSBSimMovementComponent;
+// Per-UAV stick-controller + autothrottle state; defined in the .cpp so
+// Controller_CY.h (which redefines PI via BT_Geometry) stays out of this header.
+struct FUavControl;
 
 struct FRemoteControlCommand
 {
@@ -35,6 +38,12 @@ struct FUavSetpoint
     // Weapon triggers (Phase 3) — optional fields, keep defaults for old senders.
     bool  bGunFiring     = false; // level-triggered: fire while true
     int64 MissileFireId  = 0;     // edge-triggered: one shot per new id (0 = never fired)
+    // Waypoint control (StickController). Target point in UE world coords (cm),
+    // same frame as BuildPawnState x/y/z. UE converts to N/E/Up meters for GetStick.
+    bool  bUseWaypoint   = false; // true → fly to Target* via stick controller
+    float TargetX        = 0.f;   // UE world X (East, cm)
+    float TargetY        = 0.f;   // UE world Y (South, cm)
+    float TargetZ        = 0.f;   // UE world Z (Up, cm)
 };
 
 UCLASS()
@@ -103,8 +112,8 @@ private:
     // Autopilot state (game-thread only) — PER-UAV, keyed by aircraft name.
     // Multiple UAVs (each driven by its own BT) get their own setpoint slot and
     // their own PID controller instance (so their control state never mixes).
-    TMap<FString, FUavSetpoint>       Setpoints;    // aircraft name -> latest setpoint
-    TMap<FString, FAircraftAutopilot> Autopilots;   // aircraft name -> dedicated controller
+    TMap<FString, FUavSetpoint>            Setpoints;    // aircraft name -> latest setpoint
+    TMap<FString, TSharedPtr<FUavControl>> UavControls;  // aircraft name -> stick controller + autothrottle
     FTimerHandle AutopilotTimerHandle;
     FTimerHandle StateSendTimerHandle;
 
@@ -139,40 +148,41 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|UDP")
     int32 SetpointListenPort = 5010;
 
-    // Enable to override UDP with the debug values below (PIE tuning)
+    // Enable to fly the cached target toward a point ahead of its nose, driving the
+    // same waypoint/stick path as a real setpoint (PIE tuning without ROS).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Debug")
     bool bUseDebugSetpoint = false;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Debug",
               meta = (EditCondition = "bUseDebugSetpoint"))
-    float DebugTargetHeadingDeg = 0.f;
+    float DebugForwardM = 3000.f;      // look-at point this far ahead of the nose
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Debug",
               meta = (EditCondition = "bUseDebugSetpoint"))
-    float DebugTargetAltitudeM = 3000.f;
+    float DebugUpM = 1000.f;           // ...and this far above current altitude
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Debug",
               meta = (EditCondition = "bUseDebugSetpoint"))
-    float DebugTargetThrottle = 0.8f;
-
-    // PID gains — edit live in PIE via Details panel
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Gains")
-    FPID RollPIDConfig    = {0.01f, 0.f, 0.9f, -0.2f,  0.2f};
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Gains")
-    FPID RollSecPIDConfig = {0.2f,  0.f, 0.2f, -1.0f,  1.0f};
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Gains")
-    FPID PitchPIDConfig   = {0.3f,  0.f, 1.0f, -1.0f,  1.0f};
+    float DebugTargetSpeedMps = 220.f; // autothrottle target for the debug flight
 
     // Autothrottle (speed-hold). Output is throttle [0,1]; integrator carries the
     // trim throttle, so Ki*IntegMax should be ≈ 1. Active only when a setpoint
-    // provides target_speed_mps > 0.
+    // provides target_speed_mps > 0. (Surface control is now StickController;
+    // BVRGym's surface PIDs/NavParams were removed.)
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Gains")
     FPID ThrottlePIDConfig = {0.02f, 0.004f, 0.f, 0.f, 250.f};
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Nav")
-    FAutopilotNavParams NavParams;
+    // StickController output → JSBSim surface sign/scale. Verify in PIE and flip a
+    // sign here (no recompile) if a surface is inverted. BVRGym left rudder at 0;
+    // StickController drives an active rudder, so its sign is unverified in-sim.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Stick")
+    float StickAileronScale  = 1.f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Stick")
+    float StickElevatorScale = 1.f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Stick")
+    float StickRudderScale   = 1.f;
 
     // Read-only state display
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Autopilot|State")

@@ -17,6 +17,19 @@
 #include "TimerManager.h"
 #include "UObject/UnrealType.h"
 #include "WeaponComponent.h"
+// LAST include: Controller_CY.h pulls BT_Geometry/Math.h which #undef+redefines PI.
+// Keeping it last (and this file out of the unity blob while edited) confines that
+// to this translation unit; nothing below uses the UE PI macro.
+#include "Controller_CY.h"
+
+// Per-UAV surface + speed state. StickController holds internal filters (MF[]/
+// ErrorSum) and the throttle PI holds its trim integrator — both must persist
+// per aircraft across the 60 Hz ticks, so one instance is kept per name.
+struct FUavControl
+{
+    StickController Stick;   // aim-at-waypoint surfaces (roll/pitch/rudder)
+    FPID            Throttle;// speed-hold autothrottle (was BVRGym's ThrottlePID)
+};
 
 namespace
 {
@@ -261,7 +274,7 @@ void AUDPControlReceiver::ReceiveSetpointData()
 
             bool bReset = false;
             if (O->TryGetBoolField(TEXT("reset"), bReset) && bReset)
-                Autopilots.Remove(Name);   // next tick rebuilds a fresh controller
+                UavControls.Remove(Name);   // next tick rebuilds a fresh controller
 
             FUavSetpoint SP;
             double V;
@@ -272,6 +285,10 @@ void AUDPControlReceiver::ReceiveSetpointData()
             O->TryGetBoolField(TEXT("launch_missile"), SP.LaunchMissile);
             O->TryGetBoolField(TEXT("gun_firing"), SP.bGunFiring);
             if (O->TryGetNumberField(TEXT("missile_fire_id"), V)) SP.MissileFireId = (int64)V;
+            O->TryGetBoolField(TEXT("use_waypoint"), SP.bUseWaypoint);
+            if (O->TryGetNumberField(TEXT("target_x"), V)) SP.TargetX = (float)V;
+            if (O->TryGetNumberField(TEXT("target_y"), V)) SP.TargetY = (float)V;
+            if (O->TryGetNumberField(TEXT("target_z"), V)) SP.TargetZ = (float)V;
 
             Setpoints.Add(Name, SP);   // latest-wins per aircraft
         };
@@ -296,13 +313,19 @@ void AUDPControlReceiver::ReceiveSetpointData()
 
 void AUDPControlReceiver::AutopilotTick()
 {
-    // Debug: inject a setpoint for the cached target (PIE tuning without ROS)
+    // Debug: fly the cached target toward a point ahead of its nose (PIE tuning
+    // without ROS) — drives the same waypoint/stick path as a real setpoint.
     if (bUseDebugSetpoint && IsValid(CachedTargetPawn))
     {
-        FUavSetpoint& SP = Setpoints.FindOrAdd(PawnIdName(CachedTargetPawn));
-        SP.HeadingDeg = DebugTargetHeadingDeg;
-        SP.AltitudeM  = DebugTargetAltitudeM;
-        SP.Throttle   = DebugTargetThrottle;
+        FUavSetpoint& SP  = Setpoints.FindOrAdd(PawnIdName(CachedTargetPawn));
+        const FVector Loc = CachedTargetPawn->GetActorLocation();
+        const FVector Fwd = CachedTargetPawn->GetActorForwardVector();
+        const FVector VP  = Loc + Fwd * (DebugForwardM * 100.f) + FVector(0.f, 0.f, DebugUpM * 100.f);
+        SP.bUseWaypoint   = true;
+        SP.TargetX        = (float)VP.X;
+        SP.TargetY        = (float)VP.Y;
+        SP.TargetZ        = (float)VP.Z;
+        SP.TargetSpeedMps = DebugTargetSpeedMps;
     }
 
     if (Setpoints.Num() == 0) return;
@@ -369,46 +392,62 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     {
         if (!Health->IsAlive())
         {
-            Autopilots.Remove(Key);
+            UavControls.Remove(Key);
             return;
         }
     }
 
-    // This UAV's own controller — separate PID/hysteresis state, created on first use.
-    FAircraftAutopilot& Autopilot = Autopilots.FindOrAdd(Key);
-    // Sync live-tuned gains WITHOUT wiping runtime state (Derivator/Integrator) —
-    // the BVRGym PID persists across ticks, so copying the whole struct would
-    // break the derivative term (and wipe the autothrottle trim integrator).
-    Autopilot.RollPID.SetGains(RollPIDConfig);
-    Autopilot.RollSecPID.SetGains(RollSecPIDConfig);
-    Autopilot.PitchPID.SetGains(PitchPIDConfig);
-    Autopilot.ThrottlePID.SetGains(ThrottlePIDConfig);
-    Autopilot.NavParams   = NavParams;
+    // Per-UAV stick controller + autothrottle, created on first use — their internal
+    // filter/integrator state must persist across ticks (see FUavControl).
+    TSharedPtr<FUavControl>& Ctl = UavControls.FindOrAdd(Key);
+    if (!Ctl.IsValid()) Ctl = MakeShared<FUavControl>();
 
     const FAircraftState& S = JSBSim->AircraftState;
-    const float PhiDeg   = (float)S.LocalEulerAngles.Roll;
-    const float ThetaDeg = (float)S.LocalEulerAngles.Pitch;
-    const float PsiDeg   = (float)S.LocalEulerAngles.Yaw;
-    // Altitude feedback uses UE world Z (Location.Z, cm→m) — the SAME value
-    // BuildPawnState publishes as "z" and the BT computes setpoints against.
-    // Using JSBSim ASL here instead made the controller sit at (setpoint + origin
-    // altitude offset), so the BT (reading UE Z) never saw the target reached.
-    const float AltM     = (float)Pawn->GetActorLocation().Z / 100.0f;
+    const FVector Loc = Pawn->GetActorLocation();
+
+    // Position: UE world (cm, X=East, Y=South, Z=Up) → Controller_CY (m, North,East,Up).
+    // North = -Y/100, East = X/100, Up = Z/100. VP uses the IDENTICAL transform.
+    const Vector3 MyLoc(-Loc.Y / 100.0, Loc.X / 100.0, Loc.Z / 100.0);
+
+    // Attitude: JSBSim aero Euler (LocalEulerAngles) in DEGREES → radians.
+    // (Roll=phi, Pitch=theta, Yaw=psi with 0=North; NO UE -90 offset — that offset
+    // lives only on the visual actor rotator, not on the published LocalEulerAngles.)
+    const Vector3 MyRot(
+        (double)S.LocalEulerAngles.Roll  * DEG2RAD,
+        (double)S.LocalEulerAngles.Pitch * DEG2RAD,
+        (double)S.LocalEulerAngles.Yaw   * DEG2RAD);
+
+    const float AltM     = (float)Loc.Z / 100.0f;
     const float SpeedMps = (float)(S.TotalVelocityKts * KnotToMetersPerSecond);
 
-    const float DiffHead = FAircraftAutopilot::DeltaHeading(Setpoint.HeadingDeg, PsiDeg);
-    const float DiffAlt  = Setpoint.AltitudeM - AltM;
+    // Surfaces: aim the nose at the waypoint (StickController) when in waypoint mode.
+    // Otherwise leave the surfaces untouched (no BVRGym fallback anymore).
+    float Ail = 0.f, Elv = 0.f, Rud = 0.f;
+    if (Setpoint.bUseWaypoint)
+    {
+        const Vector3 VP(-Setpoint.TargetY / 100.0, Setpoint.TargetX / 100.0, Setpoint.TargetZ / 100.0);
+        const StickValue SV = Ctl->Stick.GetStick(MyLoc, MyRot, VP);
+        Ail = SV.RollCMD   * StickAileronScale;
+        Elv = SV.PitchCMD  * StickElevatorScale;
+        Rud = SV.RudderCMD * StickRudderScale;
+    }
+    // Always write the surfaces: with no waypoint this NEUTRALIZES them (0) rather
+    // than freezing the last bank/pitch — a mode change while banked must not spiral.
+    // (Dead/falling aircraft already returned above, so their hardover is preserved.)
+    JSBSim->Commands.Aileron  = Ail;
+    JSBSim->Commands.Elevator = Elv;
+    JSBSim->Commands.Rudder   = Rud;
 
-    const FAutopilotOutput Out = Autopilot.GetControlInput(
-        DiffHead, DiffAlt, PhiDeg, ThetaDeg, SpeedMps, Setpoint.TargetSpeedMps);
-
-    // Throttle: autothrottle (speed-hold) output when active (>=0), else the
-    // open-loop throttle from the setpoint.
-    const float ThrottleOut = (Out.Throttle >= 0.f) ? Out.Throttle : Setpoint.Throttle;
-
-    JSBSim->Commands.Aileron  = Out.Aileron;
-    JSBSim->Commands.Elevator = Out.Elevator;
-    JSBSim->Commands.Rudder   = Out.Rudder;
+    // Autothrottle (speed-hold PI) — independent of surfaces. FPID error = 0-x, so
+    // Update(V - Vtgt) gives error = (Vtgt - V): too slow → positive → throttle up.
+    // The FPID instance persists per UAV so its trim integrator carries the steady
+    // state throttle. Gains synced each tick without wiping runtime state.
+    float ThrottleOut = Setpoint.Throttle;
+    if (Setpoint.TargetSpeedMps > 0.f)
+    {
+        Ctl->Throttle.SetGains(ThrottlePIDConfig);
+        ThrottleOut = FMath::Clamp(Ctl->Throttle.Update(SpeedMps - Setpoint.TargetSpeedMps), 0.f, 1.f);
+    }
     if (JSBSim->EngineCommands.Num() > 0)
         JSBSim->EngineCommands[0].Throttle = ThrottleOut;
 
@@ -423,16 +462,18 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     }
 
     // Last-applied (HUD/debug)
-    AutopilotAileron  = Out.Aileron;
-    AutopilotElevator = Out.Elevator;
+    AutopilotAileron  = Ail;
+    AutopilotElevator = Elv;
 
     static int32 LogCounter = 0;
     if (++LogCounter % 60 == 0)
     {
         UE_LOG(LogTemp, Warning,
-            TEXT("[AP] %s -> Hdg=%.0f Alt=%.0f Vtgt=%.0f | Psi=%.0f Alt=%.0f V=%.0f | Ail=%.2f Elv=%.2f Thr=%.2f"),
-            *Key, Setpoint.HeadingDeg, Setpoint.AltitudeM, Setpoint.TargetSpeedMps,
-            PsiDeg, AltM, SpeedMps, Out.Aileron, Out.Elevator, ThrottleOut);
+            TEXT("[Stick] %s wp=%d VP=(%.0f,%.0f,%.0f) | Psi=%.0f Alt=%.0f V=%.0f/%.0f | Ail=%.2f Elv=%.2f Rud=%.2f Thr=%.2f"),
+            *Key, Setpoint.bUseWaypoint ? 1 : 0,
+            Setpoint.TargetX, Setpoint.TargetY, Setpoint.TargetZ,
+            (float)S.LocalEulerAngles.Yaw, AltM, SpeedMps, Setpoint.TargetSpeedMps,
+            Ail, Elv, Rud, ThrottleOut);
     }
 }
 
@@ -685,7 +726,7 @@ bool AUDPControlReceiver::ApplyControlCommandToPawn(APawn* Pawn, const FRemoteCo
     {
         if (!Health->IsAlive())
         {
-            Autopilots.Remove(PawnIdName(Pawn));
+            UavControls.Remove(PawnIdName(Pawn));
             return false;
         }
     }
