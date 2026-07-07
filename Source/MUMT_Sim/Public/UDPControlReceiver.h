@@ -172,6 +172,13 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Gains")
     FPID ThrottlePIDConfig = {0.02f, 0.004f, 0.f, 0.f, 250.f};
 
+    // Station-keeping mode (default): continuous-proportional roll, bidirectional
+    // pitch, rudder 0 — closed-loop-stable for formation/waypoint hold. OFF = the
+    // original aim-mode GetStick (oscillates around a held point; for engagement).
+    // Live-toggleable in PIE for A/B comparison.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Stick")
+    bool bStationKeepingMode = true;
+
     // StickController output → JSBSim surface sign/scale. Verify in PIE and flip a
     // sign here (no recompile) if a surface is inverted. BVRGym left rudder at 0;
     // StickController drives an active rudder, so its sign is unverified in-sim.

@@ -201,3 +201,77 @@ StickValue StickController::GetStick(Vector3 MyLocation_FNED, Vector3 MyRotation
 	//Result.RudderCMD = RudderCMD;
 	return Result;
 }
+
+// ─── 정점유지(station-keeping) 모드 ──────────────────────────────────────────
+// 기하 계산은 GetStick과 동일, 조종 법칙만 편대/웨이포인트용으로 교체.
+// 설계 근거·법칙은 헤더 주석 참조. 원본 GetStick은 무수정 보존.
+StickValue StickController::GetStickStation(Vector3 MyLocation_FNED, Vector3 MyRotation_FNED, Vector3 VP)
+{
+	Vector3 Mylocation(MyLocation_FNED.X, MyLocation_FNED.Y, MyLocation_FNED.Z);
+	Vector3 TargetLocation(VP.X, VP.Y, VP.Z);
+
+	EulerAngle EA;
+	EA.Roll = MyRotation_FNED.X;
+	EA.Pitch = MyRotation_FNED.Y;
+	EA.Yaw = MyRotation_FNED.Z;
+	Quaternion QU = EA.toQuaternion();
+
+	Vector3 ForwardVector;
+	ForwardVector.X = 1 - 2 * (QU.X * QU.X + QU.Y * QU.Y);
+	ForwardVector.Y = 2 * (QU.X * QU.Z + QU.W * QU.Y);
+	ForwardVector.Z = -2 * (QU.Y * QU.Z - QU.W * QU.X);
+
+	Vector3 UpVector;
+	UpVector.X = -2 * (QU.Y * QU.Z + QU.W * QU.X);
+	UpVector.Y = -2 * (QU.X * QU.Y - QU.W * QU.Z);
+	UpVector.Z = 1 - 2 * (QU.X * QU.X + QU.Z * QU.Z);
+
+	Vector3 RightVector;
+	RightVector.X = 2 * (QU.X * QU.Z - QU.W * QU.Y);
+	RightVector.Y = 1 - 2 * (QU.Y * QU.Y + QU.Z * QU.Z);
+	RightVector.Z = -2 * (QU.X * QU.Y + QU.W * QU.Z);
+
+	Vector3 ForwardVectorPoint = ForwardVector * 1000 + Mylocation;
+	Vector3 ForwardVectorPoint2VP = TargetLocation - ForwardVectorPoint;
+	Vector3 Proj_V = (ForwardVectorPoint2VP.dot(ForwardVector)) * ForwardVector;
+	Vector3 Proj_TV = (TargetLocation - Proj_V) - ForwardVectorPoint;
+
+	float UpVector2Proj_TV_Angle = std::acos(UpVector.dot(Proj_TV / Proj_TV.length()));
+	float LOS = std::acos(ForwardVector.dot((TargetLocation - Mylocation)) / (TargetLocation - Mylocation).length()) * RADTODEG;
+
+	if (std::isnan(UpVector2Proj_TV_Angle))
+	{
+		UpVector2Proj_TV_Angle = 0;
+	}
+	if (std::isnan(LOS))
+	{
+		LOS = 0;
+	}
+
+	float Proj_TV_Length = Proj_TV.length();
+	if (Proj_TV_Length <= 0)
+	{
+		Proj_TV_Length = 0.0001;
+	}
+
+	float UTAngle = (RightVector.dot(Proj_TV / Proj_TV_Length) >= 0)
+	              ? UpVector2Proj_TV_Angle : -UpVector2Proj_TV_Angle;
+
+	// Roll: 연속 비례 — 부호 반전/×3 부스트 없음, LOS 3° 이내 선형 감쇠
+	float RollCMD = clamp(std::sin(UTAngle), -1, 1);
+	RollCMD = RollCMD * std::abs(RollCMD);
+	RollCMD = RollCMD * clamp(LOS / 3.0f, 0, 1);
+
+	// Pitch: 양방향 비례 — (표적 앙각 − 자세 피치), 6°에서 풀 데플렉션
+	Vector3 Rel = TargetLocation - Mylocation;
+	float HorizDist = std::sqrt(Rel.X * Rel.X + Rel.Y * Rel.Y);
+	float ElevDeg = std::atan2(Rel.Z, HorizDist) * RADTODEG;
+	float PitchDeg = MyRotation_FNED.Y * RADTODEG;
+	float PitchCMD = -clamp((ElevDeg - PitchDeg) / 6.0f, -1, 1);
+
+	StickValue Result;
+	Result.RollCMD = clamp(RollCMD, -1, 1);
+	Result.PitchCMD = clamp(PitchCMD, -1, 1);
+	Result.RudderCMD = 0.0f;   // 정점유지: 러더 미사용 (에일러론 협조선회)
+	return Result;
+}
