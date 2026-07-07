@@ -748,7 +748,20 @@ bool AUDPControlReceiver::ApplyControlCommandToPawn(APawn* Pawn, const FRemoteCo
         JSBSim->Commands.Rudder   = Command.Yaw;
         if (JSBSim->EngineCommands.Num() > 0)
         {
-            JSBSim->EngineCommands[0].Throttle = Command.Throttle;
+            // Manned speed governor: below the limit full power is available
+            // (takeoff/climb feel intact); above it, throttle authority tapers
+            // ~10%/(m/s) so top speed settles at the limit. Keeps the leader
+            // slower than the UAV cap (measured f16 Vmax 335) so the wingman
+            // always has closure margin. 0 = governor off.
+            double ThrottleCmd = Command.Throttle;
+            if (MannedSpeedLimitMps > 0.f)
+            {
+                const double SpeedMps = JSBSim->AircraftState.TotalVelocityKts * KnotToMetersPerSecond;
+                const double Over = SpeedMps - (double)MannedSpeedLimitMps;
+                if (Over > 0.0)
+                    ThrottleCmd = FMath::Min(ThrottleCmd, FMath::Max(0.0, 1.0 - Over * 0.1));
+            }
+            JSBSim->EngineCommands[0].Throttle = ThrottleCmd;
         }
     }
 

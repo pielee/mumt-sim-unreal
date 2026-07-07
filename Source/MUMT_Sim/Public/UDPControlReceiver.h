@@ -172,6 +172,13 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Gains")
     FPID ThrottlePIDConfig = {0.02f, 0.004f, 0.f, 0.f, 250.f};
 
+    // Manned top-speed governor (m/s). Full power below the limit; throttle
+    // authority tapers above it (soft FBW-style speed protection). Default 300
+    // leaves the formation UAV (cap 335 = measured f16 Vmax) ~35 m/s closure
+    // margin so it can always catch the leader. 0 = off.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
+    float MannedSpeedLimitMps = 300.f;
+
     // Station-keeping mode (default): continuous-proportional roll, bidirectional
     // pitch, rudder 0 — closed-loop-stable for formation/waypoint hold. OFF = the
     // original aim-mode GetStick (oscillates around a held point; for engagement).
