@@ -1,42 +1,258 @@
-/*
-    BT_Geometry::EulerAngle — Controller_CY 이식용 오일러각 → 쿼터니언 변환.
-
-    ★ 규약 검증 완료 (2026-07-05, 수치 브루트포스 역공학):
-    Controller_CY.cpp의 Forward/Up/Right 추출 공식이 X=North, Y=East, Z=Up
-    프레임에서 표준 항공 자세(roll φ, pitch θ, yaw ψ — JSBSim 라디안 출력)와
-    정확히 일치하려면 다음 조합이 유일해다:
-
-        q = qY(+ψ) * qX(+θ) * qZ(+φ)      (반각 axis-angle의 Hamilton 곱)
-
-    무작위 자세 5종에서 세 축 벡터 모두 1e-9 이내 일치함을 확인했다.
-    (검증 스크립트: find_quat_convention 계열 — F/U/R 추출 공식 쌍으로 검증)
-*/
 #pragma once
 
-#include <cmath>
-#include "BT_Geometry/Quaternion.h"
+#include "Angle.h"
+//#include "String.h"
+#include "Math.h"
+#include <sstream>
 
 namespace BT_Geometry
 {
 
-struct EulerAngle
+class AxisAngle;
+class Quaternion;
+class Matrix3;
+
+/// <summary>
+/// Eular angle (yaw, pitch, roll) Ŭ����
+/// 
+/// ���� ������ ����Ѵ�. �ð�������� ȸ���ϰ� yaw, pich, roll ������ ȸ���Ѵ�.
+/// </summary>
+class EulerAngle
 {
-    float Roll  = 0.f;   // φ (rad)
-    float Pitch = 0.f;   // θ (rad)
-    float Yaw   = 0.f;   // ψ (rad)
+public:
 
-    Quaternion toQuaternion() const
-    {
-        const float hr = Roll  * 0.5f;
-        const float hp = Pitch * 0.5f;
-        const float hy = Yaw   * 0.5f;
+	EulerAngle(void);
+	EulerAngle(Angle yaw, Angle pitch, Angle roll);
+	explicit EulerAngle(AxisAngle const& v);
+	explicit EulerAngle(Matrix3 const& v);
+	explicit EulerAngle(Quaternion const& v);
+	~EulerAngle(void);
 
-        const Quaternion QYaw  (0.f,           std::sin(hy), 0.f,           std::cos(hy)); // qY(+ψ)
-        const Quaternion QPitch(std::sin(hp),  0.f,          0.f,           std::cos(hp)); // qX(+θ)
-        const Quaternion QRoll (0.f,           0.f,          std::sin(hr),  std::cos(hr)); // qZ(+φ)
+public:
+	void toQuaternion(Quaternion* dest) const;
+	Quaternion toQuaternion(void) const;
+	void toMatrix(Matrix3* dest) const;
+	Matrix3 toMatrix(void) const;
+	void toAxisAngle(AxisAngle* dest) const;
+	AxisAngle toAxisAngle(void) const;
 
-        return QYaw * QPitch * QRoll;
-    }
+public:		// Operations
+	//////////////////////////////////////////////
+	// eulerAngle/scalar operations
+	EulerAngle operator+(double rhv) const;
+    EulerAngle operator-(double rhv) const; 
+    EulerAngle operator*(double rhv) const;
+    EulerAngle operator/(double rhv) const;
+     
+    EulerAngle& operator+=(double rhv);
+    EulerAngle& operator-=(double rhv);
+    EulerAngle& operator*=(double rhv);
+    EulerAngle& operator/=(double rhv); 
+	//////////////////////////////////////////////
+
+	//////////////////////////////////////////////
+	// eulerAngle/eulerAngle operations
+	EulerAngle operator+(EulerAngle const& rhv) const; 
+    EulerAngle operator-(EulerAngle const& rhv) const;
+    EulerAngle operator*(EulerAngle const& rhv) const; 
+    EulerAngle operator/(EulerAngle const& rhv) const; 
+    EulerAngle operator-() const;
+
+    EulerAngle& operator+=(EulerAngle const& rhv); 
+    EulerAngle& operator-=(EulerAngle const& rhv); 
+    EulerAngle& operator*=(EulerAngle const& rhv); 
+    EulerAngle& operator/=(EulerAngle const& rhv); 
+	
+	EulerAngle& operator=(EulerAngle const& rhv);
+	//////////////////////////////////////////////
+
+	template<class E, class U>
+	friend std::basic_ostream<E, U>& operator<< (std::basic_ostream<E, U>& os, EulerAngle const& rhv)
+	{
+		os << L"(" << rhv.Yaw << L"," << rhv.Pitch <<  L"," << rhv.Roll << L")";
+		return os;
+	}
+
+public:		// Getters & Setters
+	int getHashCode() const
+	{
+		return (int)(Yaw * Pitch * Roll * 1000000);
+	}
+
+public:
+	static EulerAngle const& Zero(void);
+
+public:
+	Angle Yaw;
+	Angle Pitch;
+	Angle Roll;
+
+private:
+	static EulerAngle _Zero;
+
 };
 
-} // namespace BT_Geometry
+inline EulerAngle::EulerAngle(void) : Yaw(0.0), Pitch(0.0), Roll(0.0) {}
+inline EulerAngle::~EulerAngle(void) {}
+inline EulerAngle::EulerAngle(Angle yaw, Angle pitch, Angle roll) 
+: Yaw(yaw), Pitch(pitch), Roll(roll) {}
+
+//////////////////////////////////////////////
+
+//////////////////////////////////////////////
+// eulerAngle/scalar operations
+inline EulerAngle EulerAngle::operator+(double rhv) const
+{
+	return EulerAngle(this->Yaw + rhv, this->Pitch + rhv, this->Roll + rhv);
+}
+
+inline EulerAngle EulerAngle::operator-(double rhv) const
+{
+	return EulerAngle(this->Yaw - rhv, this->Pitch - rhv, this->Roll - rhv);
+}
+
+inline EulerAngle EulerAngle::operator*(double rhv) const
+{
+	return EulerAngle(this->Yaw * rhv, this->Pitch * rhv, this->Roll * rhv);
+}
+
+inline EulerAngle EulerAngle::operator/(double rhv) const
+{
+	return EulerAngle(this->Yaw / rhv, this->Pitch / rhv, this->Roll / rhv);
+}
+ 
+inline EulerAngle& EulerAngle::operator+=(double rhv)
+{
+	this->Yaw += rhv;
+	this->Pitch += rhv;
+	this->Roll += rhv;
+	return *this;
+}
+
+inline EulerAngle& EulerAngle::operator-=(double rhv)
+{
+	this->Yaw -= rhv;
+	this->Pitch -= rhv;
+	this->Roll -= rhv;
+	return *this;
+}
+
+inline EulerAngle& EulerAngle::operator*=(double rhv)
+{
+	this->Yaw *= rhv;
+	this->Pitch *= rhv;
+	this->Roll *= rhv;
+	return *this;
+}
+
+inline EulerAngle& EulerAngle::operator/=(double rhv)
+{
+	this->Yaw /= rhv;
+	this->Pitch /= rhv;
+	this->Roll /= rhv;
+	return *this;
+}
+inline EulerAngle operator*(double lhv, EulerAngle const& rhv)
+{ 
+	return EulerAngle(lhv * rhv.Yaw, lhv * rhv.Pitch, lhv * rhv.Roll);	
+}
+
+inline EulerAngle operator/(double lhv, EulerAngle const& rhv)
+{ 
+	return EulerAngle(lhv / rhv.Yaw, lhv / rhv.Pitch, lhv / rhv.Roll);	
+}
+
+inline EulerAngle operator+(double lhv, EulerAngle const& rhv)
+{ 
+	return EulerAngle(lhv + rhv.Yaw, lhv + rhv.Pitch, lhv + rhv.Roll);	
+}
+
+inline EulerAngle operator-(double lhv, EulerAngle const& rhv)
+{ 
+	return EulerAngle(lhv - rhv.Yaw, lhv - rhv.Pitch, lhv - rhv.Roll);	
+}
+//////////////////////////////////////////////
+
+//////////////////////////////////////////////
+// eulerAngle/eulerAngle operations
+inline EulerAngle EulerAngle::operator+(EulerAngle const& rhv) const
+{
+	return EulerAngle(this->Yaw + rhv.Yaw, this->Pitch + rhv.Pitch, this->Roll + rhv.Roll);
+}
+ 
+inline EulerAngle EulerAngle::operator-(EulerAngle const& rhv) const
+{
+	return EulerAngle(this->Yaw - rhv.Yaw, this->Pitch - rhv.Pitch, this->Roll - rhv.Roll);
+}
+
+inline EulerAngle EulerAngle::operator*(EulerAngle const& rhv) const
+{
+	return EulerAngle(this->Yaw * rhv.Yaw, this->Pitch * rhv.Pitch, this->Roll * rhv.Roll);
+}
+
+inline EulerAngle EulerAngle::operator/(EulerAngle const& rhv) const
+{
+	return EulerAngle(this->Yaw / rhv.Yaw, this->Pitch / rhv.Pitch, this->Roll / rhv.Roll);
+}
+
+inline EulerAngle EulerAngle::operator-() const
+{
+	return EulerAngle(-(this->Yaw), -(this->Pitch), -(this->Roll));
+}
+
+inline EulerAngle& EulerAngle::operator+=(EulerAngle const& rhv)
+{
+	this->Yaw += rhv.Yaw;
+	this->Pitch += rhv.Pitch;
+	this->Roll += rhv.Roll;
+	return *this;
+}
+
+inline EulerAngle& EulerAngle::operator-=(EulerAngle const& rhv)
+{
+	this->Yaw -= rhv.Yaw;
+	this->Pitch -= rhv.Pitch;
+	this->Roll -= rhv.Roll;
+	return *this;
+}
+ 
+inline EulerAngle& EulerAngle::operator*=(EulerAngle const& rhv)
+{
+	this->Yaw *= rhv.Yaw;
+	this->Pitch *= rhv.Pitch;
+	this->Roll *= rhv.Roll;
+	return *this;
+}
+
+inline EulerAngle& EulerAngle::operator/=(EulerAngle const& rhv)
+{
+	this->Yaw /= rhv.Yaw;
+	this->Pitch /= rhv.Pitch;
+	this->Roll /= rhv.Roll;
+	return *this;
+} 
+
+
+inline EulerAngle& EulerAngle::operator=(EulerAngle const& rhv)
+{
+	this->Yaw = rhv.Yaw;
+	this->Pitch = rhv.Pitch;
+	this->Roll = rhv.Roll;
+	return *this;
+}
+
+inline EulerAngle const& EulerAngle::Zero()
+{
+	return _Zero;
+}
+
+inline bool operator!=(EulerAngle const& a, EulerAngle const& b)
+{
+	return (!Equals(a.Yaw, b.Yaw) || !Equals(a.Pitch, b.Pitch) || !Equals(a.Roll, b.Roll));
+}
+
+inline bool operator==(EulerAngle const& a, EulerAngle const& b)
+{
+	return !operator!=(a,b);
+}
+}

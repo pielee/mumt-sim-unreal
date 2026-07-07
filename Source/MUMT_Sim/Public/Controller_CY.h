@@ -16,14 +16,14 @@
 
 		자세한건 코드보고 좀 읽어보시길
 
-	── MUMT_Sim 이식 노트 (2026-07-05) ─────────────────────────────────
-	원본 구조/로직 그대로 이식. 원본과 다른 점:
-	  - 의존 헤더(Vector3/EulerAngle/Quaternion)는 원본이 제공되지 않아
-	    BT_Geometry/ 아래에 동일 인터페이스로 재구성 (규약은 수치 역공학으로
-	    검증 — EulerAngle.h 주석 참조). Matrix3/CoordinateConverter는 이
-	    파일에서 미사용이라 include 제거.
-	  - RADTODEG 상수는 원본에선 외부 헤더 제공으로 추정 → 여기 정의.
-	  - _isnan(MSVC 전용) → std::isnan (Linux/clang 호환).
+	── MUMT_Sim 이식 노트 (2026-07-07) ─────────────────────────────────
+	원본 Geometry 라이브러리 전체가 BT_Geometry/ 아래에 그대로 들어옴.
+	원본과 다른 점 (컴파일 호환 최소치):
+	  - _isnan(MSVC 전용) → std::isnan (Linux/clang 호환, cpp)
+	  - Vector3.h의 #pragma warning에 _MSC_VER 가드
+	  - include 경로에 BT_Geometry/ 접두사
+	원본 toQuaternion 규약(qY(+ψ)·qX(+θ)·qZ(+φ))은 수치 역공학과 원본 소스
+	대조로 이중 검증됨. RADTODEG는 BT_Geometry/Math.h 제공.
 	좌표 규약: 위치 = (North, East, Up[고도 양수]) Cartesian(m),
 	           자세 = FNED 오일러 라디안 (JSBSim 출력 그대로).
 */
@@ -31,13 +31,14 @@
 
 #include "BT_Geometry/Vector3.h"
 #include "BT_Geometry/EulerAngle.h"
+#include "BT_Geometry/Matrix3.h"
 #include "BT_Geometry/Quaternion.h"
 #include <vector>
+#include "BT_Geometry/CoordinateConverter.h"
 
 using namespace BT_Geometry;
 
 const double DEG2RAD = 3.14159265358979323846 / 180.0;
-const double RADTODEG = 180.0 / 3.14159265358979323846;
 
 struct StickValue
 {
