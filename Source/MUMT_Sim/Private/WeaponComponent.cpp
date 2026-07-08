@@ -1,6 +1,5 @@
 #include "WeaponComponent.h"
 #include "HealthComponent.h"
-#include "MissileActor.h"
 #include "GameFramework/Pawn.h"
 #include "EngineUtils.h"
 
@@ -28,35 +27,36 @@ bool UWeaponComponent::FireMissile()
     }
     --MissileCount;
 
-    // WEZ 원추는 발사 허가·표적 지정 조건 — 명중 판정은 호밍 미사일 액터가
-    // 실제 비행(회전율 제한 추적)과 근접신관으로 수행. 표적이 회피하면 빗나간다.
-    // 원추 안 표적이 없으면 무유도 직진 (허공 발사 = 미사일만 소모, 기존 의미론).
+    // WEZ 원추 = 발사 허가·표적 지정 조건. 원추 안 최근접 적기를 이번 발사의
+    // 호밍 표적으로 저장하고 OnMissileFired를 발화한다. 실제 미사일 비행(호밍
+    // 애니메이션)은 BP_rocket이 담당 — BP는 GetLastMissileTarget()으로 이 표적을
+    // 받아 추적하고, 명중 시 ReportMissileHit(적기)로 C++에 통보한다(대미지는 C++).
+    // 원추 안 표적 없으면 무유도(BP가 직진 연출, 허공 발사 = 미사일만 소모).
     float Dist = 0.f;
-    APawn* TargetPawn = nullptr;
     if (UHealthComponent* Target = FindNearestTargetInCone(MissileRangeM, MissileConeHalfAngleDeg, Dist))
     {
-        TargetPawn = Cast<APawn>(Target->GetOwner());
+        LastMissileTarget = Cast<APawn>(Target->GetOwner());
     }
-
-    AActor* OwnerActor = GetOwner();
-    if (UWorld* World = GetWorld())
+    else
     {
-        const FVector Fwd = OwnerActor->GetActorForwardVector();
-        const FVector SpawnLoc = OwnerActor->GetActorLocation() + Fwd * 1500.f;  // 기체 전방 15m
-        FActorSpawnParameters Params;
-        Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-        UClass* Cls = MissileClass ? MissileClass.Get() : AMissileActor::StaticClass();
-        if (AMissileActor* Missile = World->SpawnActor<AMissileActor>(
-                Cls, SpawnLoc, Fwd.Rotation(), Params))
-        {
-            Missile->TargetPawn = TargetPawn;
-            Missile->Shooter    = OwnerActor;
-            Missile->Damage     = MissileDamage;
-        }
+        LastMissileTarget = nullptr;
     }
 
-    OnMissileFired.Broadcast();
+    OnMissileFired.Broadcast();   // BP: 로켓 스폰 + 속도상속 + (표적 있으면) 호밍
     return true;
+}
+
+void UWeaponComponent::ReportMissileHit(AActor* HitActor)
+{
+    // BP_rocket이 표적에 명중했을 때 호출 — 대미지 판정은 C++이 소유.
+    if (!HitActor)
+    {
+        return;
+    }
+    if (UHealthComponent* Health = HitActor->FindComponentByClass<UHealthComponent>())
+    {
+        Health->ApplyDamage(MissileDamage, GetOwner());
+    }
 }
 
 void UWeaponComponent::ConsumeMissileFireId(int64 FireId)
