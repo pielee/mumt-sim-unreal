@@ -45,8 +45,9 @@ bool UWeaponComponent::FireMissile()
         const FVector SpawnLoc = OwnerActor->GetActorLocation() + Fwd * 1500.f;  // 기체 전방 15m
         FActorSpawnParameters Params;
         Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+        UClass* Cls = MissileClass ? MissileClass.Get() : AMissileActor::StaticClass();
         if (AMissileActor* Missile = World->SpawnActor<AMissileActor>(
-                AMissileActor::StaticClass(), SpawnLoc, Fwd.Rotation(), Params))
+                Cls, SpawnLoc, Fwd.Rotation(), Params))
         {
             Missile->TargetPawn = TargetPawn;
             Missile->Shooter    = OwnerActor;

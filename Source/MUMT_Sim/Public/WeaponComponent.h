@@ -5,6 +5,7 @@
 #include "WeaponComponent.generated.h"
 
 class UHealthComponent;
+class AMissileActor;
 
 // 소유자 폰 BP가 바인딩하는 연출 이벤트 (컴포넌트 디테일 패널의 이벤트 섹션 / Assign 노드).
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnGunFiringChanged, bool, bFiring);
@@ -49,6 +50,12 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "MUMT|Missile")
     int32 MissileCount = 3;
+
+    // 스폰할 미사일 클래스. 비우면 C++ 기본 AMissileActor(sm_rocket 메시 + 디버그
+    // 궤적). 파티클/폭발/사운드를 붙이려면 AMissileActor를 상속한 BP를 만들어 지정 —
+    // 비행·유도·대미지는 C++이 그대로 처리하고 BP는 연출만 얹으면 된다.
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "MUMT|Missile")
+    TSubclassOf<AMissileActor> MissileClass;
 
     // --- 런타임 상태 ---
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "MUMT|Gun")
