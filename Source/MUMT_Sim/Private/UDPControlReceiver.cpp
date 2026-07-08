@@ -426,7 +426,9 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     if (Setpoint.bUseWaypoint)
     {
         const Vector3 VP(-Setpoint.TargetY / 100.0, Setpoint.TargetX / 100.0, Setpoint.TargetZ / 100.0);
-        const StickValue SV = Ctl->Stick.GetStick(MyLoc, MyRot, VP);
+        const StickValue SV = bStationKeepingMode
+            ? Ctl->Stick.GetStickStation(MyLoc, MyRot, VP)   // 정점유지(오실레이션 해결)
+            : Ctl->Stick.GetStick(MyLoc, MyRot, VP);         // 원본 조준(교전) 법칙
         Ail = SV.RollCMD   * StickAileronScale;
         Elv = SV.PitchCMD  * StickElevatorScale;
         Rud = SV.RudderCMD * StickRudderScale;

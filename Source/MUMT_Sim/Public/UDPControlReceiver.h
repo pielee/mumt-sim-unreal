@@ -179,6 +179,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
     float MannedSpeedLimitMps = 300.f;
 
+    // Station-keeping mode (default): continuous-proportional roll, bidirectional
+    // pitch, rudder 0 — the fix that killed the formation oscillation (holds the
+    // point instead of hunting around it). OFF = original aim-mode GetStick.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Stick")
+    bool bStationKeepingMode = true;
+
     // StickController output → JSBSim surface sign/scale. Verify in PIE and flip a
     // sign here (no recompile) if a surface is inverted. BVRGym left rudder at 0;
     // StickController drives an active rudder, so its sign is unverified in-sim.

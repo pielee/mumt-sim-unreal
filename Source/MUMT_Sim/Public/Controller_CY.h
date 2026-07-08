@@ -66,4 +66,23 @@ public:
 	*/
 	StickValue GetStick(Vector3 MyLocation_FNED, Vector3 MyRotation_FNED, Vector3 VP);
 
+	/*
+		정점유지(station-keeping) 모드 — 편대/웨이포인트용 (2026-07-07 추가)
+
+		원본 GetStick은 조준(교전)용으로, 정점 유지에 쓰면 진동이 발생함을
+		폐루프 시뮬레이션으로 확인함 (원인: ① LOS 3° 이내에서 롤 부호가
+		반전되는 감쇠 해크 → 림릿사이클, ② 러더가 LOS 1°에 풀 데플렉션
+		→ 요 진동+항력, ③ 피치가 당김 전용 → 하방 목표 무권한).
+
+		이 메서드는 같은 기하(F/U/R, UTAngle, LOS)에서 법칙만 교체:
+		  Roll   = sin(UT)·|sin(UT)| × clamp(LOS/3, 0, 1)   (연속 비례, 부호 정상)
+		  Pitch  = −clamp((표적앙각° − 자세피치°)/6, −1, 1)  (양방향)
+		  Rudder = 0                                          (에일러론 협조선회)
+		프로토타입 폐루프에서 슬롯 오차 26km(발산)→0~1m로 안정화 확인.
+		주의: 피치 기준이 경로각이 아닌 자세각(θ=γ+α)이라 받음각(α)만큼
+		고도가 낮게 정착할 수 있음(수십 m) — 슬롯 up 오프셋으로 보정 가능.
+		원본 GetStick은 무수정 보존 (교전 조준 이식 시 그대로 사용).
+	*/
+	StickValue GetStickStation(Vector3 MyLocation_FNED, Vector3 MyRotation_FNED, Vector3 VP);
+
 };
