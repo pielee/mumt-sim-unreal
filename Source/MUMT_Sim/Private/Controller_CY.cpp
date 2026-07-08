@@ -257,13 +257,30 @@ StickValue StickController::GetStickStation(Vector3 MyLocation_FNED, Vector3 MyR
 	float UTAngle = (RightVector.dot(Proj_TV / Proj_TV_Length) >= 0)
 	              ? UpVector2Proj_TV_Angle : -UpVector2Proj_TV_Angle;
 
-	// Roll: 연속 비례 — 부호 반전/×3 부스트 없음, LOS 3° 이내 선형 감쇠
-	float RollCMD = clamp(std::sin(UTAngle), -1, 1);
-	RollCMD = RollCMD * std::abs(RollCMD);
-	RollCMD = RollCMD * clamp(LOS / 3.0f, 0, 1);
+	Vector3 Rel = TargetLocation - Mylocation;
+
+	// Roll — 2법칙 블렌드:
+	//  · 미세추종(수평 방위오차 <10°): sin(UT)·|sin(UT)|·(LOS/3) — 편대 검증 거동 그대로
+	//  · 선회(>30°): 월드 수평 방위오차 비례 뱅크 명령 — 몸통기준 UT 법칙은 뱅크 시
+	//    cos²φ로 명령이 붕괴해 뱅크 ~43°에서 자기평형(선회반경 ~4km, 폐루프 실증).
+	//    월드 방위오차는 뱅크와 무관해 풀뱅크를 지속 → 전투 선회 가능.
+	float RollFine = clamp(std::sin(UTAngle), -1, 1);
+	RollFine = RollFine * std::abs(RollFine);
+	RollFine = RollFine * clamp(LOS / 3.0f, 0, 1);
+
+	float HdgErrDeg = (float)(std::remainder(
+		std::atan2(Rel.Y, Rel.X) - std::atan2(ForwardVector.Y, ForwardVector.X),
+		2.0 * 3.14159265358979323846) * RADTODEG);
+	float RollTurn = clamp(HdgErrDeg / 30.0f, -1, 1);      // 30° 오차에서 풀뱅크
+	float W = clamp((std::fabs(HdgErrDeg) - 10.0f) / 20.0f, 0, 1);
+	// 선회 적분기: 비례 법칙만으로는 지속 선회에 필요한 뱅크를 유지하려면
+	// 정상상태 방위오차(~20°대)가 남는다(P-droop) → 사격 기하 불가.
+	// 적분기가 지속 뱅크를 담당해 오차를 수도(數度)로 수렴시킨다.
+	// (60Hz 호출 가정 — MF 필터와 동일한 가정. 누설 0.995/tick ≈ τ 3.3s, 클램프 ±0.8)
+	StationRollI = clamp(StationRollI * 0.995f + HdgErrDeg * (0.02f / 60.0f), -0.8f, 0.8f);
+	float RollCMD = clamp((1.0f - W) * RollFine + W * RollTurn + StationRollI, -1, 1);
 
 	// Pitch: 양방향 비례 — (표적 앙각 − 자세 피치), 6°에서 풀 데플렉션
-	Vector3 Rel = TargetLocation - Mylocation;
 	float HorizDist = std::sqrt(Rel.X * Rel.X + Rel.Y * Rel.Y);
 	float ElevDeg = std::atan2(Rel.Z, HorizDist) * RADTODEG;
 	float PitchDeg = MyRotation_FNED.Y * RADTODEG;

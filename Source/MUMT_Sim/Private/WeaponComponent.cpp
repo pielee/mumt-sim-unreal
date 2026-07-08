@@ -1,5 +1,6 @@
 #include "WeaponComponent.h"
 #include "HealthComponent.h"
+#include "MissileActor.h"
 #include "GameFramework/Pawn.h"
 #include "EngineUtils.h"
 
@@ -27,13 +28,32 @@ bool UWeaponComponent::FireMissile()
     }
     --MissileCount;
 
-    // 발사 순간 1회 WEZ 판정: 넓은 원추, 가장 가까운 적기 1대
+    // WEZ 원추는 발사 허가·표적 지정 조건 — 명중 판정은 호밍 미사일 액터가
+    // 실제 비행(회전율 제한 추적)과 근접신관으로 수행. 표적이 회피하면 빗나간다.
+    // 원추 안 표적이 없으면 무유도 직진 (허공 발사 = 미사일만 소모, 기존 의미론).
     float Dist = 0.f;
+    APawn* TargetPawn = nullptr;
     if (UHealthComponent* Target = FindNearestTargetInCone(MissileRangeM, MissileConeHalfAngleDeg, Dist))
     {
-        Target->ApplyDamage(MissileDamage, GetOwner());
+        TargetPawn = Cast<APawn>(Target->GetOwner());
     }
-    // 명중 여부와 무관하게 연출은 발사 (허공 발사 = 미사일만 소모)
+
+    AActor* OwnerActor = GetOwner();
+    if (UWorld* World = GetWorld())
+    {
+        const FVector Fwd = OwnerActor->GetActorForwardVector();
+        const FVector SpawnLoc = OwnerActor->GetActorLocation() + Fwd * 1500.f;  // 기체 전방 15m
+        FActorSpawnParameters Params;
+        Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+        if (AMissileActor* Missile = World->SpawnActor<AMissileActor>(
+                AMissileActor::StaticClass(), SpawnLoc, Fwd.Rotation(), Params))
+        {
+            Missile->TargetPawn = TargetPawn;
+            Missile->Shooter    = OwnerActor;
+            Missile->Damage     = MissileDamage;
+        }
+    }
+
     OnMissileFired.Broadcast();
     return true;
 }
