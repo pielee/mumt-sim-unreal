@@ -30,8 +30,9 @@ struct FRemoteControlCommand
 // High-level autopilot setpoint for one UAV (heading/altitude/speed-or-throttle).
 struct FUavSetpoint
 {
-    float HeadingDeg     = 0.f;
-    float AltitudeM      = 0.f;
+    float HeadingDeg     = 0.f;   // 목표 헤딩(0=북) → 내루프 roll_ref
+    float AltitudeM      = 0.f;   // 목표 고도(UE-Z, m) → 내루프 theta_ref
+    float RollFfDeg      = 0.f;   // 뱅크 피드포워드(deg) — 편대 유도의 선회 지연 보상
     float Throttle       = 0.8f;  // used only when TargetSpeedMps <= 0 (open-loop)
     float TargetSpeedMps = 0.f;   // >0 → autothrottle holds this airspeed
     bool  LaunchMissile  = false; // deprecated — use MissileFireId

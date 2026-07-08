@@ -17,18 +17,13 @@
 #include "TimerManager.h"
 #include "UObject/UnrealType.h"
 #include "WeaponComponent.h"
-// LAST include: Controller_CY.h pulls BT_Geometry/Math.h which #undef+redefines PI.
-// Keeping it last (and this file out of the unity blob while edited) confines that
-// to this translation unit; nothing below uses the UE PI macro.
-#include "Controller_CY.h"
+#include "InnerLoopAutopilot.h"   // PID 내루프 (GetStick 조준 제어기 대체)
 
-// Per-UAV surface + speed state. StickController holds internal filters (MF[]/
-// ErrorSum) and the throttle PI holds its trim integrator — both must persist
-// per aircraft across the 60 Hz ticks, so one instance is kept per name.
+// Per-UAV control state. The inner-loop PIDs hold integrator/derivative state
+// that must persist per aircraft across the 60 Hz ticks, so one instance per name.
 struct FUavControl
 {
-    StickController Stick;   // aim-at-waypoint surfaces (roll/pitch/rudder)
-    FPID            Throttle;// speed-hold autothrottle (was BVRGym's ThrottlePID)
+    FInnerLoopAutopilot Inner;   // PID 내루프: heading/alt/speed/roll_ff → 조종면+스로틀
 };
 
 namespace
@@ -280,6 +275,7 @@ void AUDPControlReceiver::ReceiveSetpointData()
             double V;
             if (O->TryGetNumberField(TEXT("heading_deg"),     V)) SP.HeadingDeg     = (float)V;
             if (O->TryGetNumberField(TEXT("altitude_m"),      V)) SP.AltitudeM      = (float)V;
+            if (O->TryGetNumberField(TEXT("roll_ff_deg"),     V)) SP.RollFfDeg      = (float)V;
             if (O->TryGetNumberField(TEXT("throttle_norm"),   V)) SP.Throttle       = FMath::Clamp((float)V, 0.f, 1.f);
             if (O->TryGetNumberField(TEXT("target_speed_mps"),V)) SP.TargetSpeedMps = (float)V;
             O->TryGetBoolField(TEXT("launch_missile"), SP.LaunchMissile);
@@ -403,51 +399,31 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     if (!Ctl.IsValid()) Ctl = MakeShared<FUavControl>();
 
     const FAircraftState& S = JSBSim->AircraftState;
-    const FVector Loc = Pawn->GetActorLocation();
 
-    // Position: UE world (cm, X=East, Y=South, Z=Up) → Controller_CY (m, North,East,Up).
-    // North = -Y/100, East = X/100, Up = Z/100. VP uses the IDENTICAL transform.
-    const Vector3 MyLoc(-Loc.Y / 100.0, Loc.X / 100.0, Loc.Z / 100.0);
+    // 현재 상태: JSBSim aero 오일러(LocalEulerAngles, deg, ψ 0=북), UE-Z 고도.
+    const double PhiDeg   = S.LocalEulerAngles.Roll;
+    const double ThetaDeg = S.LocalEulerAngles.Pitch;
+    const double PsiDeg   = S.LocalEulerAngles.Yaw;
+    const float  AltM     = (float)(Pawn->GetActorLocation().Z / 100.0);
+    const float  SpeedMps = (float)(S.TotalVelocityKts * KnotToMetersPerSecond);
+    const double ClimbMps = S.AltitudeRateFtps * 0.3048;   // +위
+    const double PDps     = S.EulerRates.Z;                 // 롤 레이트 ≈ p (deg/s)
+    const double QDps     = S.EulerRates.Y;                 // 피치 레이트 ≈ q (deg/s)
 
-    // Attitude: JSBSim aero Euler (LocalEulerAngles) in DEGREES → radians.
-    // (Roll=phi, Pitch=theta, Yaw=psi with 0=North; NO UE -90 offset — that offset
-    // lives only on the visual actor rotator, not on the published LocalEulerAngles.)
-    const Vector3 MyRot(
-        (double)S.LocalEulerAngles.Roll  * DEG2RAD,
-        (double)S.LocalEulerAngles.Pitch * DEG2RAD,
-        (double)S.LocalEulerAngles.Yaw   * DEG2RAD);
+    // 조종면 부호 미세조정(PIE 튜닝) 반영.
+    Ctl->Inner.AilSign = StickAileronScale;
+    Ctl->Inner.ElvSign = StickElevatorScale;
 
-    const float AltM     = (float)Loc.Z / 100.0f;
-    const float SpeedMps = (float)(S.TotalVelocityKts * KnotToMetersPerSecond);
+    // PID 내루프: (heading, altitude, speed, roll_ff) → 조종면 + 스로틀.
+    const FInnerLoopOutput O = Ctl->Inner.Step(
+        Setpoint.HeadingDeg, Setpoint.AltitudeM, Setpoint.TargetSpeedMps, Setpoint.RollFfDeg,
+        PhiDeg, ThetaDeg, PsiDeg, (double)AltM, (double)SpeedMps, ClimbMps, PDps, QDps,
+        (double)Setpoint.Throttle, /*dt=*/1.0 / 60.0);
 
-    // Surfaces: aim the nose at the waypoint (StickController) when in waypoint mode.
-    // Otherwise leave the surfaces untouched (no BVRGym fallback anymore).
-    float Ail = 0.f, Elv = 0.f, Rud = 0.f;
-    if (Setpoint.bUseWaypoint)
-    {
-        const Vector3 VP(-Setpoint.TargetY / 100.0, Setpoint.TargetX / 100.0, Setpoint.TargetZ / 100.0);
-        const StickValue SV = Ctl->Stick.GetStick(MyLoc, MyRot, VP);   // Geometry 원본 제어기
-        Ail = SV.RollCMD   * StickAileronScale;
-        Elv = SV.PitchCMD  * StickElevatorScale;
-        Rud = SV.RudderCMD * StickRudderScale;
-    }
-    // Always write the surfaces: with no waypoint this NEUTRALIZES them (0) rather
-    // than freezing the last bank/pitch — a mode change while banked must not spiral.
-    // (Dead/falling aircraft already returned above, so their hardover is preserved.)
+    const float Ail = O.Aileron, Elv = O.Elevator, Rud = O.Rudder, ThrottleOut = O.Throttle;
     JSBSim->Commands.Aileron  = Ail;
     JSBSim->Commands.Elevator = Elv;
     JSBSim->Commands.Rudder   = Rud;
-
-    // Autothrottle (speed-hold PI) — independent of surfaces. FPID error = 0-x, so
-    // Update(V - Vtgt) gives error = (Vtgt - V): too slow → positive → throttle up.
-    // The FPID instance persists per UAV so its trim integrator carries the steady
-    // state throttle. Gains synced each tick without wiping runtime state.
-    float ThrottleOut = Setpoint.Throttle;
-    if (Setpoint.TargetSpeedMps > 0.f)
-    {
-        Ctl->Throttle.SetGains(ThrottlePIDConfig);
-        ThrottleOut = FMath::Clamp(Ctl->Throttle.Update(SpeedMps - Setpoint.TargetSpeedMps), 0.f, 1.f);
-    }
     if (JSBSim->EngineCommands.Num() > 0)
         JSBSim->EngineCommands[0].Throttle = ThrottleOut;
 
@@ -469,11 +445,10 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     if (++LogCounter % 60 == 0)
     {
         UE_LOG(LogTemp, Warning,
-            TEXT("[Stick] %s wp=%d VP=(%.0f,%.0f,%.0f) | Psi=%.0f Alt=%.0f V=%.0f/%.0f | Ail=%.2f Elv=%.2f Rud=%.2f Thr=%.2f"),
-            *Key, Setpoint.bUseWaypoint ? 1 : 0,
-            Setpoint.TargetX, Setpoint.TargetY, Setpoint.TargetZ,
-            (float)S.LocalEulerAngles.Yaw, AltM, SpeedMps, Setpoint.TargetSpeedMps,
-            Ail, Elv, Rud, ThrottleOut);
+            TEXT("[Inner] %s -> Hdg=%.0f Alt=%.0f V=%.0f Rff=%.1f | Psi=%.0f Phi=%.0f Alt=%.0f V=%.0f | Ail=%.2f Elv=%.2f Thr=%.2f"),
+            *Key, Setpoint.HeadingDeg, Setpoint.AltitudeM, Setpoint.TargetSpeedMps, Setpoint.RollFfDeg,
+            (float)PsiDeg, (float)PhiDeg, AltM, SpeedMps,
+            Ail, Elv, ThrottleOut);
     }
 }
 
