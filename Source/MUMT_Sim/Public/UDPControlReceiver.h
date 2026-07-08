@@ -179,6 +179,15 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
     float MannedSpeedLimitMps = 300.f;
 
+    // Manned control authority: scales the joystick surface commands (roll/pitch/
+    // yaw, [-1,1]) before they hit the flight model. 0.4 = full stick gives only
+    // 40% surface, so even a hard input is gentle enough for the formation UAV to
+    // follow. 1.0 = full authority (raw). Throttle is NOT scaled (governor handles
+    // top speed). Manned/joystick path only — UAV autopilot is unaffected.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target",
+              meta = (ClampMin = "0.05", ClampMax = "1.0"))
+    float MannedControlAuthority = 0.4f;
+
     // StickController output → JSBSim surface sign/scale. Verify in PIE and flip a
     // sign here (no recompile) if a surface is inverted. BVRGym left rudder at 0;
     // StickController drives an active rudder, so its sign is unverified in-sim.

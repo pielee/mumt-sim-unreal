@@ -741,9 +741,11 @@ bool AUDPControlReceiver::ApplyControlCommandToPawn(APawn* Pawn, const FRemoteCo
     // control works even when the pawn's Blueprint doesn't forward UDP_* into Commands.
     if (UJSBSimMovementComponent* JSBSim = FindJSBSimMovementComponent(Pawn))
     {
-        JSBSim->Commands.Aileron  = Command.Roll;
-        JSBSim->Commands.Elevator = Command.Pitch;
-        JSBSim->Commands.Rudder   = Command.Yaw;
+        // Scale surface authority so full stick stays gentle (formation-followable).
+        const double Auth = FMath::Clamp((double)MannedControlAuthority, 0.05, 1.0);
+        JSBSim->Commands.Aileron  = Command.Roll  * Auth;
+        JSBSim->Commands.Elevator = Command.Pitch * Auth;
+        JSBSim->Commands.Rudder   = Command.Yaw   * Auth;
         if (JSBSim->EngineCommands.Num() > 0)
         {
             // Manned speed governor: below the limit full power is available
