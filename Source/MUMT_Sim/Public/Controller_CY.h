@@ -53,6 +53,7 @@ class StickController
 	float MF[20];
 	int FilterIndex;
 	std::vector<float> ErrorSum;
+	float StationRollI = 0.0f;   // 정점유지 선회 적분기 (P-droop 제거용, GetStickStation 전용)
 
 public:
 	StickController();
