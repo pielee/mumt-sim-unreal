@@ -18,12 +18,18 @@
 #include "UObject/UnrealType.h"
 #include "WeaponComponent.h"
 #include "InnerLoopAutopilot.h"   // PID 내루프 (GetStick 조준 제어기 대체)
+#include "FormationGuidance.h"    // 인엔진 60Hz 유도 (편대 슬롯 / 추격) — Phase 4
 
 // Per-UAV control state. The inner-loop PIDs hold integrator/derivative state
 // that must persist per aircraft across the 60 Hz ticks, so one instance per name.
 struct FUavControl
 {
-    FInnerLoopAutopilot Inner;   // PID 내루프: heading/alt/speed/roll_ff → 조종면+스로틀
+    FInnerLoopAutopilot Inner;      // PID 내루프: heading/alt/speed/roll_ff → 조종면+스로틀
+    FFormationGuidance  Formation;  // 편대 유도 (리더 ω 필터 상태 보유)
+    FPursuitGuidance    Pursuit;    // 추격 유도 (무상태)
+    FGuidanceCmd        LastGuidCmd;          // 리더/표적 일시 소실 시 홀드용
+    double              LastGuidTime = -1.0;  // World seconds (마지막 유효 유도 계산 시각)
+    bool                bHasGuidCmd  = false;
 };
 
 namespace
@@ -56,6 +62,29 @@ namespace
         case ETeam::FriendlyUAV: return TEXT("friendly_uav");
         default:                 return TEXT("enemy");
         }
+    }
+
+    // Pawn 이름 매칭 (setpoint 라우팅과 동일 규칙): 정확 일치 우선, 아니면
+    // 부분 문자열이 정확히 1개일 때만 채택. OutNumSubstring은 모호성 경고용.
+    APawn* MatchPawnByKey(const TArray<AActor*>& Pawns, const FString& Key,
+                          int32* OutNumSubstring = nullptr)
+    {
+        if (OutNumSubstring) *OutNumSubstring = 0;
+        if (Key.IsEmpty()) return nullptr;
+
+        for (AActor* A : Pawns)
+            if (APawn* P = Cast<APawn>(A))
+                if (PawnIdName(P) == Key)
+                    return P;
+
+        APawn* Candidate = nullptr;
+        int32 Num = 0;
+        for (AActor* A : Pawns)
+            if (APawn* P = Cast<APawn>(A))
+                if (PawnIdName(P).Contains(Key)) { Candidate = P; ++Num; }
+
+        if (OutNumSubstring) *OutNumSubstring = Num;
+        return (Num == 1) ? Candidate : nullptr;
     }
 }
 
@@ -286,6 +315,24 @@ void AUDPControlReceiver::ReceiveSetpointData()
             if (O->TryGetNumberField(TEXT("target_y"), V)) SP.TargetY = (float)V;
             if (O->TryGetNumberField(TEXT("target_z"), V)) SP.TargetZ = (float)V;
 
+            // ── 유도 모드 (Phase 4). 미지정/""/direct → Direct (구 발신자 호환) ──
+            FString ModeStr;
+            if (O->TryGetStringField(TEXT("guidance_mode"), ModeStr))
+            {
+                if (ModeStr.Equals(TEXT("formation"), ESearchCase::IgnoreCase))
+                    SP.Mode = EGuidanceMode::Formation;
+                else if (ModeStr.Equals(TEXT("attack"), ESearchCase::IgnoreCase))
+                    SP.Mode = EGuidanceMode::Attack;
+            }
+            O->TryGetStringField(TEXT("leader_name"), SP.LeaderName);
+            O->TryGetStringField(TEXT("target_name"), SP.TargetName);
+            if (O->TryGetNumberField(TEXT("slot_front_m"),  V)) SP.SlotFrontM = (float)V;
+            if (O->TryGetNumberField(TEXT("slot_right_m"),  V)) SP.SlotRightM = (float)V;
+            if (O->TryGetNumberField(TEXT("slot_up_m"),     V)) SP.SlotUpM    = (float)V;
+            if (O->TryGetNumberField(TEXT("min_speed_mps"), V) && V > 0.0) SP.MinSpeedMps = (float)V;
+            if (O->TryGetNumberField(TEXT("max_speed_mps"), V) && V > 0.0) SP.MaxSpeedMps = (float)V;
+            if (O->TryGetNumberField(TEXT("min_alt_m"),     V)) SP.MinAltM = (float)V;
+
             Setpoints.Add(Name, SP);   // latest-wins per aircraft
         };
 
@@ -338,44 +385,24 @@ void AUDPControlReceiver::AutopilotTick()
         const FString& Key = Entry.Key;
         if (Key.IsEmpty()) continue;
 
-        // 1) Exact name match — preferred and collision-free. With names like
-        //    "F16_UAV" and "F16_UAV2" (one a prefix of the other), this resolves
-        //    each to the right pawn before any substring logic runs.
-        APawn* Match = nullptr;
-        for (AActor* A : Pawns)
-            if (APawn* P = Cast<APawn>(A))
-                if (PawnIdName(P) == Key) { Match = P; break; }
-
-        // 2) Substring fallback (tolerates spawn suffixes, e.g. "M_F16" -> "M_F16_C_0"),
-        //    but ONLY when exactly one pawn contains the key. If several match
-        //    (key "F16_UAV" would otherwise grab "F16_UAV2"), the name is ambiguous —
-        //    skip and warn rather than drive the wrong aircraft.
-        if (!Match)
+        // 정확 일치 우선 → 부분 문자열이 정확히 1개일 때만 채택 (MatchPawnByKey).
+        // 여러 pawn이 매칭되면 모호 — 잘못된 기체를 조종하느니 건너뛰고 경고.
+        int32 NumSubstring = 0;
+        APawn* Match = MatchPawnByKey(Pawns, Key, &NumSubstring);
+        if (!Match && NumSubstring > 1)
         {
-            APawn* Candidate = nullptr;
-            int32 NumMatches = 0;
-            for (AActor* A : Pawns)
-                if (APawn* P = Cast<APawn>(A))
-                    if (PawnIdName(P).Contains(Key)) { Candidate = P; ++NumMatches; }
-
-            if (NumMatches == 1)
-            {
-                Match = Candidate;
-            }
-            else if (NumMatches > 1)
-            {
-                UE_LOG(LogTemp, Warning,
-                    TEXT("[AP] setpoint name '%s' is ambiguous (%d pawns contain it) — ignored. "
-                         "Use the exact pawn name as the aircraft_name."), *Key, NumMatches);
-            }
+            UE_LOG(LogTemp, Warning,
+                TEXT("[AP] setpoint name '%s' is ambiguous (%d pawns contain it) — ignored. "
+                     "Use the exact pawn name as the aircraft_name."), *Key, NumSubstring);
         }
 
         if (Match)
-            ApplyAutopilotToPawn(Match, Key, Entry.Value);
+            ApplyAutopilotToPawn(Match, Key, Entry.Value, Pawns);
     }
 }
 
-void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, const FUavSetpoint& Setpoint)
+void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, const FUavSetpoint& Setpoint,
+                                               const TArray<AActor*>& Pawns)
 {
     if (!IsValid(Pawn)) return;
 
@@ -410,20 +437,108 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     const double PDps     = S.EulerRates.Z;                 // 롤 레이트 ≈ p (deg/s)
     const double QDps     = S.EulerRates.Y;                 // 피치 레이트 ≈ q (deg/s)
 
+    // ── 유도 명령 결정 (Phase 4) ─────────────────────────────────────────────
+    // Direct: setpoint의 heading/alt/speed/roll_ff 그대로 (기존 경로, 완전 호환).
+    // Formation/Attack: 리더/표적 pawn을 같은 월드에서 직독(지연 0)해 60Hz로 계산.
+    double HeadingCmd = Setpoint.HeadingDeg;
+    double AltCmd     = Setpoint.AltitudeM;
+    double SpeedCmd   = Setpoint.TargetSpeedMps;
+    double RollFf     = Setpoint.RollFfDeg;
+
+    if (Setpoint.Mode != EGuidanceMode::Direct)
+    {
+        // 편대/추격은 리더보다 선회 여유가 있어야 컷인 가능: f16 요-SAS(워시아웃 없음)가
+        // 정상선회를 방해해 실효 선회율이 이론보다 낮다(V1 실측 +9° 뱅크 필요) → 캡 70°.
+        Ctl->Inner.BankLimitDeg = 70.0;
+
+        // 자기 상태 (NED m / m/s): north=-Y/100, east=X/100. 속도는 참벡터(ft/s→m/s).
+        const FVector OwnLoc = Pawn->GetActorLocation();
+        const double OwnN  = -OwnLoc.Y * 0.01;
+        const double OwnE  =  OwnLoc.X * 0.01;
+        const double OwnVn = S.VelocityNEDfps.X * 0.3048;
+        const double OwnVe = S.VelocityNEDfps.Y * 0.3048;
+
+        const FString& RefName = (Setpoint.Mode == EGuidanceMode::Formation)
+            ? Setpoint.LeaderName : Setpoint.TargetName;
+        APawn* RefPawn = MatchPawnByKey(Pawns, RefName);
+        UJSBSimMovementComponent* RefJSB = RefPawn ? FindJSBSimMovementComponent(RefPawn) : nullptr;
+
+        bool bRefAlive = true;
+        if (RefPawn)
+            if (const UHealthComponent* RefHealth = RefPawn->FindComponentByClass<UHealthComponent>())
+                bRefAlive = RefHealth->IsAlive();
+
+        const double Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+
+        if (RefJSB && bRefAlive)
+        {
+            const FAircraftState& R = RefJSB->AircraftState;
+            const FVector RefLoc = RefPawn->GetActorLocation();
+            const double RefN   = -RefLoc.Y * 0.01;
+            const double RefE   =  RefLoc.X * 0.01;
+            const double RefAlt =  RefLoc.Z * 0.01;
+            const double RefVn    = R.VelocityNEDfps.X * 0.3048;
+            const double RefVe    = R.VelocityNEDfps.Y * 0.3048;
+            const double RefClimb = R.VelocityNEDfps.Z * 0.3048;  // 플러그인이 -vDown 저장 → +위
+
+            // 1초 이상 유도가 끊겼다 재개되면 ω 미분 상태가 낡음 → 리셋(범프리스)
+            if (Setpoint.Mode == EGuidanceMode::Formation && Now - Ctl->LastGuidTime > 1.0)
+                Ctl->Formation.Reset();
+
+            FGuidanceCmd Cmd;
+            if (Setpoint.Mode == EGuidanceMode::Formation)
+            {
+                Cmd = Ctl->Formation.Step(
+                    RefN, RefE, RefAlt, RefVn, RefVe, RefClimb,
+                    OwnN, OwnE, OwnVn, OwnVe,
+                    Setpoint.SlotFrontM, Setpoint.SlotRightM, Setpoint.SlotUpM,
+                    Setpoint.MinSpeedMps, Setpoint.MaxSpeedMps, Setpoint.MinAltM,
+                    /*dt=*/1.0 / 60.0);
+            }
+            else // Attack
+            {
+                Cmd = Ctl->Pursuit.Step(
+                    RefN, RefE, RefAlt, RefVn, RefVe,
+                    OwnN, OwnE,
+                    Setpoint.MinSpeedMps, Setpoint.MaxSpeedMps, Setpoint.MinAltM);
+            }
+            Ctl->LastGuidCmd  = Cmd;
+            Ctl->LastGuidTime = Now;
+            Ctl->bHasGuidCmd  = true;
+            HeadingCmd = Cmd.HeadingDeg; AltCmd = Cmd.AltM;
+            SpeedCmd   = Cmd.SpeedMps;   RollFf = Cmd.RollFfDeg;
+        }
+        else if (Ctl->bHasGuidCmd && Now - Ctl->LastGuidTime < 5.0)
+        {
+            // 리더/표적 일시 소실 → 마지막 유도 명령 홀드
+            HeadingCmd = Ctl->LastGuidCmd.HeadingDeg; AltCmd = Ctl->LastGuidCmd.AltM;
+            SpeedCmd   = Ctl->LastGuidCmd.SpeedMps;   RollFf = Ctl->LastGuidCmd.RollFfDeg;
+        }
+        else
+        {
+            // 5초 초과 소실 → 현재 헤딩·고도 수평 유지 (순항 200)
+            HeadingCmd = PsiDeg;
+            AltCmd     = (double)AltM;
+            SpeedCmd   = 200.0;
+            RollFf     = 0.0;
+        }
+    }
+
     // 조종면 부호 미세조정(PIE 튜닝) 반영.
     Ctl->Inner.AilSign = StickAileronScale;
     Ctl->Inner.ElvSign = StickElevatorScale;
 
     // PID 내루프: (heading, altitude, speed, roll_ff) → 조종면 + 스로틀.
     const FInnerLoopOutput O = Ctl->Inner.Step(
-        Setpoint.HeadingDeg, Setpoint.AltitudeM, Setpoint.TargetSpeedMps, Setpoint.RollFfDeg,
+        HeadingCmd, AltCmd, SpeedCmd, RollFf,
         PhiDeg, ThetaDeg, PsiDeg, (double)AltM, (double)SpeedMps, ClimbMps, PDps, QDps,
         (double)Setpoint.Throttle, /*dt=*/1.0 / 60.0);
 
     const float Ail = O.Aileron, Elv = O.Elevator, Rud = O.Rudder, ThrottleOut = O.Throttle;
-    JSBSim->Commands.Aileron  = Ail;
-    JSBSim->Commands.Elevator = Elv;
-    JSBSim->Commands.Rudder   = Rud;
+    JSBSim->Commands.Aileron    = Ail;
+    JSBSim->Commands.Elevator   = Elv;
+    JSBSim->Commands.Rudder     = Rud;
+    JSBSim->Commands.SpeedBrake = O.SpeedBrake;   // 과속 시 감속 보조 (리더 급감속 추종)
     if (JSBSim->EngineCommands.Num() > 0)
         JSBSim->EngineCommands[0].Throttle = ThrottleOut;
 
@@ -444,11 +559,18 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     static int32 LogCounter = 0;
     if (++LogCounter % 60 == 0)
     {
+        const TCHAR* ModeTag =
+            (Setpoint.Mode == EGuidanceMode::Formation) ? TEXT("FORM") :
+            (Setpoint.Mode == EGuidanceMode::Attack)    ? TEXT("ATK")  : TEXT("DIR");
         UE_LOG(LogTemp, Warning,
-            TEXT("[Inner] %s -> Hdg=%.0f Alt=%.0f V=%.0f Rff=%.1f | Psi=%.0f Phi=%.0f Alt=%.0f V=%.0f | Ail=%.2f Elv=%.2f Thr=%.2f"),
-            *Key, Setpoint.HeadingDeg, Setpoint.AltitudeM, Setpoint.TargetSpeedMps, Setpoint.RollFfDeg,
+            TEXT("[Inner] %s [%s] -> Hdg=%.0f Alt=%.0f V=%.0f Rff=%.1f | Psi=%.0f Phi=%.0f Alt=%.0f V=%.0f | Ail=%.2f Elv=%.2f Thr=%.2f"),
+            *Key, ModeTag, (float)HeadingCmd, (float)AltCmd, (float)SpeedCmd, (float)RollFf,
             (float)PsiDeg, (float)PhiDeg, AltM, SpeedMps,
             Ail, Elv, ThrottleOut);
+        if (Setpoint.Mode == EGuidanceMode::Formation)
+            UE_LOG(LogTemp, Warning, TEXT("[Guid] %s along=%+.0f cross=%+.0f omega=%+.2fdps"),
+                *Key, (float)Ctl->Formation.LastEAlongM, (float)Ctl->Formation.LastECrossM,
+                (float)(Ctl->Formation.OmegaFilt * 57.29577951));
     }
 }
 

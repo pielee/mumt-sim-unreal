@@ -27,6 +27,15 @@ struct FRemoteControlCommand
     int64 MissileFireId = 0;   // 0 = never fired (msg default); fire on change of id > 0
 };
 
+// 유도 모드: BT는 모드·대상만 지정하고 heading/alt/speed 숫자 계산은 UE가 60Hz로 수행.
+// Direct = 기존 방식(setpoint의 heading/alt/speed 그대로) — 구 시나리오 완전 호환.
+enum class EGuidanceMode : uint8
+{
+    Direct,      // ""/"direct"
+    Formation,   // leader_name pawn 직독 → 슬롯+ω×r+벡터필드+roll_ff (FFormationGuidance)
+    Attack,      // target_name pawn 직독 → pursuit heading/alt/speed (FPursuitGuidance)
+};
+
 // High-level autopilot setpoint for one UAV (heading/altitude/speed-or-throttle).
 struct FUavSetpoint
 {
@@ -35,6 +44,16 @@ struct FUavSetpoint
     float RollFfDeg      = 0.f;   // 뱅크 피드포워드(deg) — 편대 유도의 선회 지연 보상
     float Throttle       = 0.8f;  // used only when TargetSpeedMps <= 0 (open-loop)
     float TargetSpeedMps = 0.f;   // >0 → autothrottle holds this airspeed
+    // ── 유도 모드 (Phase 4: 인엔진 60Hz 유도) ──
+    EGuidanceMode Mode = EGuidanceMode::Direct;
+    FString LeaderName;           // formation: 리더 pawn 이름 (setpoint 키와 동일 매칭 규칙)
+    FString TargetName;           // attack: 표적 pawn 이름
+    float SlotFrontM  = -80.f;    // 슬롯 오프셋 — 리더 트랙 프레임 (+앞/+우/+상)
+    float SlotRightM  = 100.f;
+    float SlotUpM     = 0.f;
+    float MinSpeedMps = 70.f;     // 유도 속도 한계
+    float MaxSpeedMps = 335.f;
+    float MinAltM     = 0.f;      // 유도 고도 하한(UE-Z m). 0 = 가드 없음
     bool  LaunchMissile  = false; // deprecated — use MissileFireId
     // Weapon triggers (Phase 3) — optional fields, keep defaults for old senders.
     bool  bGunFiring     = false; // level-triggered: fire while true
@@ -73,7 +92,8 @@ private:
     void StopSetpointReceiver();
     void ReceiveSetpointData();   // called every Tick, drains SetpointSocket
     void AutopilotTick();         // called at 60 Hz via FTimerHandle
-    void ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, const FUavSetpoint& Setpoint);
+    void ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, const FUavSetpoint& Setpoint,
+                              const TArray<AActor*>& Pawns);   // Pawns: 리더/표적 직독용 현재 pawn 목록
 
     bool StartUDPSender();
     void StopUDPSender();

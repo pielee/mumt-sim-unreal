@@ -55,14 +55,17 @@ struct FInnerPID
     void Reset() { Integral = 0; PrevMeas = 0; PrevDeriv = 0; bHasPrev = false; }
 };
 
-struct FInnerLoopOutput { float Aileron; float Elevator; float Rudder; float Throttle; };
+struct FInnerLoopOutput { float Aileron; float Elevator; float Rudder; float Throttle; float SpeedBrake; };
 
 // inner_loop.py::InnerLoopAutopilot 포팅. 상태 영속(per-UAV 인스턴스) 필수.
 struct FInnerLoopAutopilot
 {
     // 게인 (inner_loop.py 기본값, JSBSim F-16 검증)
     double BankLimitDeg = 60.0;   // 뱅크 제한 (리더는 외부에서 40으로 낮춰 마진 확보)
-    double KpHdg2Roll   = 3.0;    // 헤딩오차 1° → roll_ref 3°
+    // 3.0 → 1.5 (결함 B): 3.0은 헤딩오차 20°만 돼도 rollRef를 뱅크한계로 계단 포화시켜
+    // 풀조종면+롤레이트 관성으로 84° 오버슛을 만들었다(영상 t150 검증). 1.5는 40°에서 도달.
+    double KpHdg2Roll   = 1.5;    // 헤딩오차 1° → roll_ref 1.5°
+    double RollSlewDps  = 40.0;   // rollRef 슬루 제한(°/s) — 레퍼런스 계단 급변 방지 [B]
     double TanRefM      = 1500.0; // atan2 유도 기준거리
     double ThetaMax     = 25.0, ThetaMin = -20.0;
 
@@ -70,6 +73,7 @@ struct FInnerLoopAutopilot
     double AilSign = 1.0, ElvSign = 1.0;
 
     FInnerPID Roll, Pitch, Speed;
+    double PrevRollRef = 1e9;     // 슬루 제한 상태 (1e9 = 미초기화 → 첫 스텝은 현재 φ에서 시작)
     bool bInit = false;
 
     void Init()
@@ -93,6 +97,13 @@ struct FInnerLoopAutopilot
         const double dPsi = MumtCtl::DeltaHeading(headingCmd, psiDeg);
         double rollRef = rollFfDeg + KpHdg2Roll * dPsi;
         rollRef = std::min(BankLimitDeg, std::max(-BankLimitDeg, rollRef));
+        // 슬루 제한 [B]: 레퍼런스가 계단으로 튀면 에일러론 포화→롤 관성→오버슛(84° 실측).
+        // 40°/s 램프면 레이트 항이 선형 영역에 머물러 ζ≈0.9 감쇠가 살아난다.
+        if (PrevRollRef > 1e8)
+            PrevRollRef = phiDeg;                        // 재engage 범프리스: 현재 뱅크에서 출발
+        const double slew = RollSlewDps * dt;
+        rollRef = std::min(PrevRollRef + slew, std::max(PrevRollRef - slew, rollRef));
+        PrevRollRef = rollRef;
         double aileron = Roll.Update(rollRef - phiDeg, phiDeg, dt) - 0.004 * pDps;
         aileron *= AilSign;
 
@@ -112,11 +123,17 @@ struct FInnerLoopAutopilot
             ? Speed.Update(speedCmd - tasMps, tasMps, dt)
             : throttleNorm;
 
+        // 과속 시 스피드브레이크 — 아이들 감속(F-16 클린 ≈ -1.5 m/s²)만으로는 리더
+        // 급감속(-5 m/s²)을 못 따라가 슬롯을 지나침(V1 실측 -80m). +8 m/s 초과부터 비례 전개.
+        const double overspeed = (speedCmd > 0.0) ? (tasMps - speedCmd) : 0.0;
+        const double speedbrake = std::min(1.0, std::max(0.0, (overspeed - 5.0) / 15.0));
+
         FInnerLoopOutput o;
-        o.Aileron  = (float)std::min(1.0, std::max(-1.0, aileron));
-        o.Elevator = (float)std::min(1.0, std::max(-1.0, elevator));
-        o.Rudder   = 0.f;                                                // bank-to-turn: 러더 미사용
-        o.Throttle = (float)std::min(1.0, std::max(0.0, throttle));
+        o.Aileron    = (float)std::min(1.0, std::max(-1.0, aileron));
+        o.Elevator   = (float)std::min(1.0, std::max(-1.0, elevator));
+        o.Rudder     = 0.f;                                              // bank-to-turn: 러더 미사용
+        o.Throttle   = (float)std::min(1.0, std::max(0.0, throttle));
+        o.SpeedBrake = (float)speedbrake;
         return o;
     }
 };
