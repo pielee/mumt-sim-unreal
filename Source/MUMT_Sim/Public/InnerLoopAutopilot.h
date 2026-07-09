@@ -62,9 +62,10 @@ struct FInnerLoopAutopilot
 {
     // 게인 (inner_loop.py 기본값, JSBSim F-16 검증)
     double BankLimitDeg = 60.0;   // 뱅크 제한 (리더는 외부에서 40으로 낮춰 마진 확보)
-    // 3.0 → 1.5 (결함 B): 3.0은 헤딩오차 20°만 돼도 rollRef를 뱅크한계로 계단 포화시켜
-    // 풀조종면+롤레이트 관성으로 84° 오버슛을 만들었다(영상 t150 검증). 1.5는 40°에서 도달.
-    double KpHdg2Roll   = 1.5;    // 헤딩오차 1° → roll_ref 1.5°
+    // 84° 오버슛(결함 B)의 원인은 게인이 아니라 rollRef 계단 급변이었다. 슬루 제한이
+    // 그걸 막으므로 게인은 되살린다: 1.5는 유도가 명령한 컷각(20°+)을 내루프가 못 따라가
+    // 횡오차 수렴을 3배 느리게 만들었다(인엔진 시험 2026-07-09: 컷 23° 명령 → 실측 4°).
+    double KpHdg2Roll   = 2.5;    // 헤딩오차 1° → roll_ref 2.5° (25°에서 뱅크한계 도달)
     double RollSlewDps  = 40.0;   // rollRef 슬루 제한(°/s) — 레퍼런스 계단 급변 방지 [B]
     double TanRefM      = 1500.0; // atan2 유도 기준거리
     double ThetaMax     = 25.0, ThetaMin = -20.0;

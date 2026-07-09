@@ -19,6 +19,11 @@
 #include "WeaponComponent.h"
 #include "InnerLoopAutopilot.h"   // PID 내루프 (GetStick 조준 제어기 대체)
 #include "FormationGuidance.h"    // 인엔진 60Hz 유도 (편대 슬롯 / 추격) — Phase 4
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
+#include "HAL/PlatformMisc.h"
 
 // Per-UAV control state. The inner-loop PIDs hold integrator/derivative state
 // that must persist per aircraft across the 60 Hz ticks, so one instance per name.
@@ -30,6 +35,61 @@ struct FUavControl
     FGuidanceCmd        LastGuidCmd;          // 리더/표적 일시 소실 시 홀드용
     double              LastGuidTime = -1.0;  // World seconds (마지막 유효 유도 계산 시각)
     bool                bHasGuidCmd  = false;
+};
+
+// ─── 인엔진 편대 시험 ────────────────────────────────────────────────────────
+// 리더를 스크립트 direct 명령으로 몰고(이 경로도 내루프를 통과), 팔로워는 BT와 동일한
+// 게이팅(자기 +150m ∧ 리더 +80m)으로 formation 모드에 진입시킨다. 유도는 리더의
+// '실제' 상태(VelocityNEDfps)를 읽으므로 리더가 명령을 덜 따라가도 시험은 유효하다.
+struct FFormationTest
+{
+    enum class EPhase : uint8 { Takeoff = 0, Straight, Turn3, Turn4Climb, Rollout, Done };
+
+    static constexpr double kDt        = 1.0 / 60.0;
+    static constexpr double kRunwayHdg = 90.0;
+
+    struct FStat
+    {
+        double MaxE = 0.0, SumE = 0.0, MaxPhi = 0.0;
+        int32  N = 0;
+        void Add(double E, double Phi)
+        {
+            MaxE = FMath::Max(MaxE, E); SumE += E; ++N;
+            MaxPhi = FMath::Max(MaxPhi, FMath::Abs(Phi));
+        }
+        double Mean() const { return N ? SumE / N : 0.0; }
+    };
+
+    // 구간: 이름, 지속(s), 정착유예(s, 이 시간 전은 과도로 보고 게이트 제외), 슬롯오차 게이트(m).
+    // Straight는 초기 합류(캡처)를 포함하므로 유예가 길다 — 캡처 자체는 SettleTime으로 별도 측정.
+    struct FPhaseDef { const TCHAR* Name; double Dur; double SettleS; double GateM; };
+    static const FPhaseDef& Def(EPhase P)
+    {
+        static const FPhaseDef Defs[] = {
+            { TEXT("Takeoff"),          0.0,  0.0, 1e9 },   // 리더 +200m 까지
+            { TEXT("Straight 220"),    55.0, 30.0,  30.0 },
+            { TEXT("Turn 3dps@220"),   30.0,  6.0,  60.0 },
+            { TEXT("Turn 4dps+400m"),  40.0,  6.0, 120.0 },
+            { TEXT("Rollout 170"),     25.0,  6.0,  60.0 },
+            { TEXT("Done"),             0.0,  0.0, 1e9 },
+        };
+        return Defs[(int32)P];
+    }
+
+    EPhase Phase = EPhase::Takeoff;
+    double PhaseT = 0.0, TotalT = 0.0;
+    double LdrSpawnAlt = -1e9, FolSpawnAlt = -1e9;
+    double CruiseAlt = 0.0, HdgCmd = kRunwayHdg;
+    bool   bFolFormation = false, bWarned = false;
+    double MaxEAfterForm = 0.0;      // 발산 가드
+    double FormEntryT = -1.0, SettleT = -1.0;   // 합류 시각 / 슬롯 30m 이내 정착 시각
+    FStat  Stat[6];
+    double CsvAccum = 0.0;
+    TArray<FString> Csv;
+
+    void Advance() { PhaseT += kDt; TotalT += kDt; }
+    void Enter(EPhase P) { Phase = P; PhaseT = 0.0; }
+    bool InGate() const { return PhaseT >= Def(Phase).SettleS; }
 };
 
 namespace
@@ -96,6 +156,16 @@ AUDPControlReceiver::AUDPControlReceiver()
 void AUDPControlReceiver::BeginPlay()
 {
     Super::BeginPlay();
+
+    // 헤드리스 회귀: -FormationTest [-FormationTestExit] 로 에디터 설정 없이 시험 실행
+    if (FParse::Param(FCommandLine::Get(), TEXT("FormationTest")))
+    {
+        bRunFormationTest = true;
+        if (FParse::Param(FCommandLine::Get(), TEXT("FormationTestExit")))
+            bTestExitOnFinish = true;
+        UE_LOG(LogTemp, Warning, TEXT("[FormTest] 커맨드라인으로 활성화 (leader='%s' follower='%s' exit=%d)"),
+            *TestLeaderName, *TestFollowerName, bTestExitOnFinish ? 1 : 0);
+    }
 
     if (StartUDPReceiver())
     {
@@ -371,14 +441,19 @@ void AUDPControlReceiver::AutopilotTick()
         SP.TargetSpeedMps = DebugTargetSpeedMps;
     }
 
-    if (Setpoints.Num() == 0) return;
-
     UWorld* World = GetWorld();
     if (!World) return;
 
     // Build the current pawn list once, then drive each aircraft that has a setpoint.
     TArray<AActor*> Pawns;
     UGameplayStatics::GetAllActorsOfClass(World, APawn::StaticClass(), Pawns);
+
+    // 인엔진 편대 시험: 리더를 스크립트로 몰고 팔로워 슬롯오차를 기록한다. 실제 경로
+    // (플러그인 상태 → pawn 매칭 → 유도 → 내루프 → JSBSim)를 그대로 지나므로,
+    // JSBSim 단독 하네스가 구조적으로 못 보는 배선·전환·포화 결함을 잡는다.
+    if (bRunFormationTest) UpdateFormationTest(Pawns);
+
+    if (Setpoints.Num() == 0) return;
 
     for (const TPair<FString, FUavSetpoint>& Entry : Setpoints)
     {
@@ -398,6 +473,191 @@ void AUDPControlReceiver::AutopilotTick()
 
         if (Match)
             ApplyAutopilotToPawn(Match, Key, Entry.Value, Pawns);
+    }
+}
+
+// ─── 인엔진 편대 시험 (60 Hz, AutopilotTick에서 호출) ─────────────────────────
+void AUDPControlReceiver::UpdateFormationTest(const TArray<AActor*>& Pawns)
+{
+    if (!FormationTest.IsValid()) FormationTest = MakeShared<FFormationTest>();
+    FFormationTest& T = *FormationTest;
+    if (T.Phase == FFormationTest::EPhase::Done) return;
+
+    APawn* Ldr = MatchPawnByKey(Pawns, TestLeaderName);
+    APawn* Fol = MatchPawnByKey(Pawns, TestFollowerName);
+    UJSBSimMovementComponent* LJ = Ldr ? FindJSBSimMovementComponent(Ldr) : nullptr;
+    UJSBSimMovementComponent* FJ = Fol ? FindJSBSimMovementComponent(Fol) : nullptr;
+    if (!LJ || !FJ)
+    {
+        if (!T.bWarned)
+        {
+            T.bWarned = true;
+            UE_LOG(LogTemp, Error, TEXT("[FormTest] pawn 없음 (leader='%s' %s / follower='%s' %s) — 시험 중단"),
+                *TestLeaderName, LJ ? TEXT("OK") : TEXT("MISSING"),
+                *TestFollowerName, FJ ? TEXT("OK") : TEXT("MISSING"));
+        }
+        return;
+    }
+
+    const FVector LLoc = Ldr->GetActorLocation(), FLoc = Fol->GetActorLocation();
+    const double LdrAlt = LLoc.Z * 0.01, FolAlt = FLoc.Z * 0.01;
+    if (T.LdrSpawnAlt < -1e8) { T.LdrSpawnAlt = LdrAlt; T.FolSpawnAlt = FolAlt; }
+
+    const FAircraftState& LS = LJ->AircraftState;
+    const double LTas = LS.TotalVelocityKts * KnotToMetersPerSecond;
+    const double LdrClimb = LdrAlt - T.LdrSpawnAlt;
+    const double FolClimb = FolAlt - T.FolSpawnAlt;
+
+    // ── 리더 스크립트 (direct 명령 — 내루프가 추종) ──
+    using EP = FFormationTest::EPhase;
+    double LdrAltCmd = T.LdrSpawnAlt + 800.0, LdrSpdCmd = 220.0, LdrRff = 0.0, TurnRate = 0.0;
+
+    switch (T.Phase)
+    {
+    case EP::Takeoff:
+        T.HdgCmd = FFormationTest::kRunwayHdg;
+        if (LdrClimb >= 200.0)
+        {
+            T.CruiseAlt = LdrAlt;
+            T.HdgCmd    = LS.LocalEulerAngles.Yaw;
+            T.Enter(EP::Straight);
+            UE_LOG(LogTemp, Warning, TEXT("[FormTest] 리더 이륙 완료(+%.0fm) → 직선 구간"), LdrClimb);
+        }
+        break;
+    case EP::Straight:
+        LdrAltCmd = T.CruiseAlt;
+        if (T.PhaseT >= FFormationTest::Def(EP::Straight).Dur) { T.Enter(EP::Turn3); }
+        break;
+    case EP::Turn3:
+        TurnRate = 3.0; LdrAltCmd = T.CruiseAlt;
+        if (T.PhaseT >= FFormationTest::Def(EP::Turn3).Dur) { T.Enter(EP::Turn4Climb); }
+        break;
+    case EP::Turn4Climb:
+    {
+        const double F = FMath::Clamp(T.PhaseT / FFormationTest::Def(EP::Turn4Climb).Dur, 0.0, 1.0);
+        TurnRate  = 4.0;
+        LdrAltCmd = T.CruiseAlt + 400.0 * F;
+        LdrSpdCmd = 220.0 - 50.0 * F;                      // 220 → 170
+        if (T.PhaseT >= FFormationTest::Def(EP::Turn4Climb).Dur) { T.CruiseAlt += 400.0; T.Enter(EP::Rollout); }
+        break;
+    }
+    case EP::Rollout:
+        LdrAltCmd = T.CruiseAlt; LdrSpdCmd = 170.0;
+        if (T.PhaseT >= FFormationTest::Def(EP::Rollout).Dur) { T.Enter(EP::Done); }
+        break;
+    default: break;
+    }
+
+    if (T.Phase != EP::Takeoff && T.Phase != EP::Done)
+    {
+        T.HdgCmd = FMath::Fmod(T.HdgCmd + TurnRate * FFormationTest::kDt + 360.0, 360.0);
+        LdrRff   = FMath::RadiansToDegrees(FMath::Atan2(FMath::DegreesToRadians(TurnRate) * FMath::Max(LTas, 50.0), 9.80665));
+    }
+
+    {
+        FUavSetpoint LSP;                       // Direct (기본값)
+        LSP.HeadingDeg     = (float)T.HdgCmd;
+        LSP.AltitudeM      = (float)LdrAltCmd;
+        LSP.TargetSpeedMps = (float)LdrSpdCmd;
+        LSP.RollFfDeg      = (float)LdrRff;
+        Setpoints.Add(PawnIdName(Ldr), LSP);
+    }
+
+    // ── 팔로워: BT와 동일한 게이팅으로 formation 진입 ──
+    if (bTestDriveFollower)
+    {
+        if (!T.bFolFormation && FolClimb >= 150.0 && LdrClimb >= 80.0)
+        {
+            T.bFolFormation = true;
+            T.FormEntryT = T.TotalT;
+            UE_LOG(LogTemp, Warning, TEXT("[FormTest] 팔로워 편대 진입 (own+%.0fm, leader+%.0fm)"), FolClimb, LdrClimb);
+        }
+        FUavSetpoint FSP;
+        if (!T.bFolFormation)
+        {
+            FSP.HeadingDeg     = (float)FFormationTest::kRunwayHdg;
+            FSP.AltitudeM      = (float)(T.FolSpawnAlt + 800.0);
+            FSP.TargetSpeedMps = 220.f;
+        }
+        else
+        {
+            FSP.Mode        = EGuidanceMode::Formation;
+            FSP.LeaderName  = PawnIdName(Ldr);
+            FSP.SlotFrontM  = -80.f; FSP.SlotRightM = 100.f; FSP.SlotUpM = 0.f;
+            FSP.MinSpeedMps = 120.f; FSP.MaxSpeedMps = 335.f;
+            FSP.MinAltM     = (float)(T.FolSpawnAlt + 150.0);
+        }
+        Setpoints.Add(PawnIdName(Fol), FSP);
+    }
+
+    // ── 계측: 리더 실제 track 기준 슬롯 오차 ──
+    const double LN = -LLoc.Y * 0.01, LE = LLoc.X * 0.01;
+    const double FN = -FLoc.Y * 0.01, FE = FLoc.X * 0.01;
+    const double LVn = LS.VelocityNEDfps.X * 0.3048, LVe = LS.VelocityNEDfps.Y * 0.3048;
+    const double Trk = FMath::Atan2(LVe, LVn);
+    const double Cs = FMath::Cos(Trk), Sn = FMath::Sin(Trk);
+    const double SlotN = LN + (-80.0) * Cs - (100.0) * Sn;
+    const double SlotE = LE + (-80.0) * Sn + (100.0) * Cs;
+    const double ESlot = FMath::Sqrt(FMath::Square(SlotN - FN) + FMath::Square(SlotE - FE));
+    const double FolPhi = FJ->AircraftState.LocalEulerAngles.Roll;
+
+    if (T.bFolFormation)
+    {
+        T.MaxEAfterForm = FMath::Max(T.MaxEAfterForm, ESlot);
+        if (T.SettleT < 0.0 && ESlot < 30.0) T.SettleT = T.TotalT;   // 최초 30m 이내 진입
+        if (T.InGate()) T.Stat[(int32)T.Phase].Add(ESlot, FolPhi);
+    }
+
+    T.CsvAccum += FFormationTest::kDt;
+    if (T.CsvAccum >= 0.1)                       // 10 Hz 기록
+    {
+        T.CsvAccum = 0.0;
+        T.Csv.Add(FString::Printf(TEXT("%.2f,%s,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%d"),
+            T.TotalT, FFormationTest::Def(T.Phase).Name, ESlot,
+            (LdrAlt - FolAlt), FolPhi, LS.LocalEulerAngles.Roll,
+            FJ->AircraftState.TotalVelocityKts * KnotToMetersPerSecond, LTas,
+            FMath::RadiansToDegrees(Trk), T.bFolFormation ? 1 : 0));
+    }
+
+    T.Advance();
+
+    // ── 종료: CSV 저장 + 게이트 판정 ──
+    if (T.Phase == EP::Done)
+    {
+        const FString Path = FPaths::ProjectSavedDir() / TEXT("FormationTest.csv");
+        FString Out = TEXT("t,phase,eSlot,dAlt,phiFol,phiLdr,vFol,vLdr,trkLdr,formation\n");
+        Out += FString::Join(T.Csv, TEXT("\n"));
+        FFileHelper::SaveStringToFile(Out, *Path);
+
+        int32 Fail = 0;
+        double MaxPhi = 0.0;
+        UE_LOG(LogTemp, Warning, TEXT("[FormTest] ══ 인엔진 편대 시험 결과 ══"));
+        for (int32 i = (int32)EP::Straight; i <= (int32)EP::Rollout; ++i)
+        {
+            const FFormationTest::FStat& S = T.Stat[i];
+            const FFormationTest::FPhaseDef& D = FFormationTest::Def((EP)i);
+            const bool bOk = S.N > 0 && S.MaxE < D.GateM;
+            if (!bOk) ++Fail;
+            MaxPhi = FMath::Max(MaxPhi, S.MaxPhi);
+            UE_LOG(LogTemp, Warning, TEXT("[FormTest]   %-18s max=%7.1fm mean=%7.1fm (n=%d) gate<%.0fm  %s"),
+                D.Name, S.MaxE, S.Mean(), S.N, D.GateM, bOk ? TEXT("PASS") : TEXT("★FAIL"));
+        }
+        const bool bPhiOk = MaxPhi <= 64.0;
+        const bool bDivOk = T.MaxEAfterForm < 600.0;
+        if (!bPhiOk) ++Fail;
+        if (!bDivOk) ++Fail;
+        const double Capture = (T.SettleT > 0.0 && T.FormEntryT > 0.0) ? (T.SettleT - T.FormEntryT) : -1.0;
+        const bool bCapOk = Capture > 0.0 && Capture < 45.0;
+        if (!bCapOk) ++Fail;
+        UE_LOG(LogTemp, Warning, TEXT("[FormTest]   합류→30m 캡처   = %.1fs  gate<45s  %s"),
+            Capture, bCapOk ? TEXT("PASS") : TEXT("★FAIL"));
+        UE_LOG(LogTemp, Warning, TEXT("[FormTest]   |phi|max(팔로워) = %.1f°  gate<=64°  %s"), MaxPhi, bPhiOk ? TEXT("PASS") : TEXT("★FAIL"));
+        UE_LOG(LogTemp, Warning, TEXT("[FormTest]   발산가드 maxE    = %.0fm  gate<600m  %s"), T.MaxEAfterForm, bDivOk ? TEXT("PASS") : TEXT("★FAIL"));
+        UE_LOG(LogTemp, Warning, TEXT("[FormTest] %s (FAIL=%d)  csv=%s"),
+            Fail ? TEXT("★★ 게이트 불통과") : TEXT("══ 전체 PASS ══"), Fail, *Path);
+
+        bRunFormationTest = false;
+        if (bTestExitOnFinish) FPlatformMisc::RequestExit(false);
     }
 }
 

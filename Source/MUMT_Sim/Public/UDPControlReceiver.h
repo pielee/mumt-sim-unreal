@@ -14,6 +14,8 @@ class UJSBSimMovementComponent;
 // Per-UAV stick-controller + autothrottle state; defined in the .cpp so
 // Controller_CY.h (which redefines PI via BT_Geometry) stays out of this header.
 struct FUavControl;
+// 인엔진 편대 시험 상태 (스크립트 리더 + 슬롯오차 기록) — .cpp 정의.
+struct FFormationTest;
 
 struct FRemoteControlCommand
 {
@@ -94,6 +96,7 @@ private:
     void AutopilotTick();         // called at 60 Hz via FTimerHandle
     void ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, const FUavSetpoint& Setpoint,
                               const TArray<AActor*>& Pawns);   // Pawns: 리더/표적 직독용 현재 pawn 목록
+    void UpdateFormationTest(const TArray<AActor*>& Pawns);    // 인엔진 편대 시험 (스크립트 리더)
 
     bool StartUDPSender();
     void StopUDPSender();
@@ -135,6 +138,7 @@ private:
     // their own PID controller instance (so their control state never mixes).
     TMap<FString, FUavSetpoint>            Setpoints;    // aircraft name -> latest setpoint
     TMap<FString, TSharedPtr<FUavControl>> UavControls;  // aircraft name -> stick controller + autothrottle
+    TSharedPtr<FFormationTest>             FormationTest;
     FTimerHandle AutopilotTimerHandle;
     FTimerHandle StateSendTimerHandle;
 
@@ -217,6 +221,28 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Stick")
     float StickElevatorScale = 1.f;
+
+    // ── 인엔진 편대 시험 ──────────────────────────────────────────────────
+    // 리더를 스크립트로 조종(이륙→직선→3°/s→4°/s+400m상승→롤아웃)하고, 팔로워의
+    // 슬롯오차/뱅크/모드를 Saved/FormationTest.csv 에 기록한 뒤 게이트 판정을 로그로 남긴다.
+    // JSBSim 단독 하네스와 달리 플러그인 상태·pawn 매칭·모드 전환·포화를 전부 지나간다.
+    // 커맨드라인 -FormationTest 로도 켤 수 있다 (헤드리스 회귀용).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Test")
+    bool bRunFormationTest = false;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Test")
+    FString TestLeaderName = TEXT("M_F16");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Test")
+    FString TestFollowerName = TEXT("F16_UAV1");
+
+    // true = 시험이 팔로워 setpoint도 주입(ROS/BT 없이 단독 실행). false = BT가 몰게 둠.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Test")
+    bool bTestDriveFollower = true;
+
+    // 시험 종료 시 프로세스 종료 (헤드리스 배치 실행용). -FormationTestExit 로도 설정.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Test")
+    bool bTestExitOnFinish = false;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Stick")
     float StickRudderScale   = 1.f;
