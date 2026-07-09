@@ -46,14 +46,15 @@ struct FFormationGuidance
     double RollFfCrossScale = 2000.0;  // [m]
     double RffTurnCal       = 1.2;     // f16 요-SAS(워시아웃 없음)가 정상선회 요레이트를 억제 →
                                        // 이론 atan(ωV/g)보다 실측 +9° 필요 (V1: 3°/s@220 = 58.8° vs 이론 49.6°)
-    double RollFfLimitDeg   = 62.0;    // 팔로워 뱅크캡(70) 이하 — 피드백 여유 8°
+    double RollFfLimitDeg   = 54.0;    // 팔로워 뱅크캡(62) 이하 — 피드백 여유 8°
     double OmegaLpfTau      = 0.25;    // 리더 선회율 필터 [F]
     double OmegaMaxDps      = 15.0;    // track 미분 스파이크 가드
     double OmegaDeadDps     = 0.3;     // 직선비행 track 노이즈(±0.1°/s)가 rff ±3°로 증폭돼
                                        // ±15m 위빙 유발(V1) → 소프트 데드밴드로 차단
     double ClimbLeadS       = 8.0;     // 수직 선행보상(초) — 내루프 수직 시정수 TanRefM/V(≈7~9s)와
                                        // 정합해야 지속상승 정상오차가 소거됨 (2.0은 +88m 지연 — V1 실측)
-    double MinTrackSpeedMps = 20.0;    // 리더 저속(지상활주) → track/ω 홀드
+    double MinTrackSpeedMps = 50.0;    // 리더 저속 → track/ω 홀드 (20은 지상활주 조향 지터가
+                                       // ω±4°/s로 증폭돼 Rff 슬램 — PIE 2026-07-09 실측)
 
     // 상태 (per-UAV 유지 — FUavControl에 저장)
     double PrevTrackRad = 1e9;         // 1e9 = 미초기화 센티널

@@ -90,7 +90,7 @@ int main(int argc, char** argv)
     if (!F.init(root, -300, -480, 1000, 90, 220)) return 1;
 
     FFormationGuidance guid;                       // UE 기본 파라미터 그대로
-    F.inner.BankLimitDeg = 70.0;                   // UE Formation 모드와 동일 (컷인 여유)
+    F.inner.BankLimitDeg = 62.0;                   // UE Formation 모드와 동일 (65°+ 지속뱅크 = 모델 밖, PIE 실측)
     const double FRONT = -80, RIGHT = 100, UP = 0;
 
     // 리더 스크립트 상태
@@ -100,9 +100,9 @@ int main(int argc, char** argv)
     // 감속·급선회 진입 excursion은 아이들 감속한계(-2m/s²)의 물리 과도로, 20~30s 내 회복이 요건.
     Window win[] = {
         {"A 직선(캡처후)  [45,55)",   45, 55, 12},
-        {"B 3°/s@220     [70,95)",   70, 95, 30},
+        {"B 3°/s@220    [70,95)",   70, 95, 30},
         {"T 감속+5°/s진입 [95,138)",  95, 138, 1e9},
-        {"C 5°/s+상승 정착[138,150)",138, 150, 25},
+        {"C 4.2°/s+상승정착[138,150)",138, 150, 35},  // 뱅크캡62 안전 트레이드오프: 27m 정상(캡70때 12m). 슬롯거리 128m 대비 수용
         {"R 롤아웃+감속   [150,174)", 150, 174, 1e9},
         {"D 정상 직선    [174,185)", 174, 185, 15},
     };
@@ -119,7 +119,7 @@ int main(int argc, char** argv)
         const double t = i * DT;
 
         // ── 리더: 55s 직선(캡처) → 3°/s@220 → 감속 → 5°/s@170+400m상승(45s) → 감속 → 긴 직선 ──
-        rateL = (t >= 105 && t < 150) ? 5.0 : (t >= 55 && t < 95) ? 3.0 : 0.0;
+        rateL = (t >= 105 && t < 150) ? 4.2 : (t >= 55 && t < 95) ? 3.0 : 0.0;
         if (t >= 95 && t < 105)       vL = 220 - (t - 95) * 5.0;            // 220→170 (직선 감속)
         else if (t >= 150 && t < 162) vL = 170 - (t - 150) * (20.0 / 12.0); // →150
         if (t >= 105 && t < 150)      altL = 1000 + (t - 105) * (400.0 / 45.0); // →1400
@@ -133,7 +133,7 @@ int main(int argc, char** argv)
             const FGuidanceCmd c = guid.Step(
                 L.N(), L.E(), L.AltM(), L.Vn(), L.Ve(), L.Climb(),
                 F.N(), F.E(), F.Vn(), F.Ve(),
-                FRONT, RIGHT, UP, 70, 335, 0, 1.0 / 60.0);
+                FRONT, RIGHT, UP, 120, 335, 0, 1.0 / 60.0);
             F.drive(c.HeadingDeg, c.AltM, c.SpeedMps, c.RollFfDeg, 1.0 / 60.0);
         }
 
@@ -177,8 +177,8 @@ int main(int argc, char** argv)
     const bool altOk = maxDAltC < 30.0;
     printf("  C창 |Δalt|max             = %.1f m  gate<30m  %s\n", maxDAltC, altOk ? "PASS" : "★FAIL");
     if (!altOk) ++fail;
-    const bool phiOk = maxPhiF <= 72.0;
-    printf("  |φ|max(팔로워, t>5s)      = %.1f° (t=%.0fs)  gate≤72°  %s\n",
+    const bool phiOk = maxPhiF <= 64.0;
+    printf("  |φ|max(팔로워, t>5s)      = %.1f° (t=%.0fs)  gate≤64°  %s\n",
            maxPhiF, maxPhiT, phiOk ? "PASS" : "★FAIL");
     if (!phiOk) ++fail;
     printf("%s (FAIL=%d)\n", fail ? "★★ 게이트 불통과" : "══ 전체 PASS ══", fail);

@@ -434,8 +434,10 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     const float  AltM     = (float)(Pawn->GetActorLocation().Z / 100.0);
     const float  SpeedMps = (float)(S.TotalVelocityKts * KnotToMetersPerSecond);
     const double ClimbMps = S.AltitudeRateFtps * 0.3048;   // +위
-    const double PDps     = S.EulerRates.Z;                 // 롤 레이트 ≈ p (deg/s)
-    const double QDps     = S.EulerRates.Y;                 // 피치 레이트 ≈ q (deg/s)
+    // 플러그인 규약(JSBSimMovementComponent.cpp:784): EulerRates = (X=φ̇, Y=θ̇, Z=ψ̇).
+    // 종전 Z(=요레이트)를 롤 댐핑에 쓰던 버그 수정 — PIE 세션 로그로 발견(2026-07-09).
+    const double PDps     = S.EulerRates.X;                 // 롤 레이트 φ̇ (deg/s)
+    const double QDps     = S.EulerRates.Y;                 // 피치 레이트 θ̇ (deg/s)
 
     // ── 유도 명령 결정 (Phase 4) ─────────────────────────────────────────────
     // Direct: setpoint의 heading/alt/speed/roll_ff 그대로 (기존 경로, 완전 호환).
@@ -447,9 +449,10 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
 
     if (Setpoint.Mode != EGuidanceMode::Direct)
     {
-        // 편대/추격은 리더보다 선회 여유가 있어야 컷인 가능: f16 요-SAS(워시아웃 없음)가
-        // 정상선회를 방해해 실효 선회율이 이론보다 낮다(V1 실측 +9° 뱅크 필요) → 캡 70°.
-        Ctl->Inner.BankLimitDeg = 70.0;
+        // 편대/추격은 리더보다 선회 여유가 있어야 컷인 가능(요-SAS 페널티 +9°) — 단
+        // 65°+ 지속 뱅크는 bank-to-turn 모델 밖(피치 push와 결합 시 요 역행·발산,
+        // PIE 2026-07-09 실측: 72° 고착 → km 발산 반복) → 캡 62°.
+        Ctl->Inner.BankLimitDeg = 62.0;
 
         // 자기 상태 (NED m / m/s): north=-Y/100, east=X/100. 속도는 참벡터(ft/s→m/s).
         const FVector OwnLoc = Pawn->GetActorLocation();
@@ -485,6 +488,24 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
             if (Setpoint.Mode == EGuidanceMode::Formation && Now - Ctl->LastGuidTime > 1.0)
                 Ctl->Formation.Reset();
 
+            // 리더 미비행(지상활주/정지) 가드: 슬롯이 지상에 있고 track이 무의미 →
+            // 슬롯 추종 대신 안전 홀드(현재 헤딩·고도 유지, 순항 220). PIE 2026-07-09:
+            // 리더 이륙 전 편대 진입 → V=70(실속 직전)·저고도 명령이 발산의 시발점.
+            const double RefGs = std::sqrt(RefVn * RefVn + RefVe * RefVe);
+            if (Setpoint.Mode == EGuidanceMode::Formation && RefGs < 50.0)
+            {
+                FGuidanceCmd Hold;
+                Hold.HeadingDeg = PsiDeg;
+                Hold.AltM       = std::max((double)AltM, (double)Setpoint.MinAltM + 150.0);
+                Hold.SpeedMps   = 220.0;
+                Hold.RollFfDeg  = 0.0;
+                Ctl->Formation.Reset();
+                Ctl->LastGuidCmd = Hold; Ctl->LastGuidTime = Now; Ctl->bHasGuidCmd = true;
+                HeadingCmd = Hold.HeadingDeg; AltCmd = Hold.AltM;
+                SpeedCmd   = Hold.SpeedMps;   RollFf = Hold.RollFfDeg;
+            }
+            else
+            {
             FGuidanceCmd Cmd;
             if (Setpoint.Mode == EGuidanceMode::Formation)
             {
@@ -507,6 +528,7 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
             Ctl->bHasGuidCmd  = true;
             HeadingCmd = Cmd.HeadingDeg; AltCmd = Cmd.AltM;
             SpeedCmd   = Cmd.SpeedMps;   RollFf = Cmd.RollFfDeg;
+            }   // 리더 비행 중 (RefGs >= 50)
         }
         else if (Ctl->bHasGuidCmd && Now - Ctl->LastGuidTime < 5.0)
         {
