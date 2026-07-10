@@ -79,7 +79,10 @@ void UHealthComponent::TickComponent(float DeltaTime, ELevelTick TickType,
         {
             Color = FColor::Yellow;  // 피격 누적 경고
         }
-        const FString Label = FString::Printf(TEXT("HP %.0f / %.0f%s"), CurrentHP, MaxHP, *Suffix);
+        // 기체명 접두: 라벨이 2개로 보일 때 "다른 기체의 라벨"인지 "같은 기체에 컴포넌트가
+        // 중복 부착"인지 즉시 판별하기 위함 (2026-07-10 HP 이중상 진단).
+        const FString Label = FString::Printf(TEXT("[%s] HP %.0f / %.0f%s"),
+            GetOwner() ? *GetOwner()->GetActorNameOrLabel() : TEXT("?"), CurrentHP, MaxHP, *Suffix);
         DrawDebugString(GetWorld(), FVector(0.f, 0.f, DebugTextHeightCm), Label,
                         GetOwner(), Color, /*Duration=*/0.f, /*bDrawShadow=*/true, DebugTextScale);
     }
