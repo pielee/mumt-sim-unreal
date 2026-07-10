@@ -1122,8 +1122,22 @@ bool AUDPControlReceiver::ApplyControlCommandToPawn(APawn* Pawn, const FRemoteCo
     {
         // Scale surface authority so full stick stays gentle (formation-followable).
         const double Auth = FMath::Clamp((double)MannedControlAuthority, 0.05, 1.0);
-        JSBSim->Commands.Aileron  = Command.Roll  * Auth;
-        JSBSim->Commands.Elevator = Command.Pitch * Auth;
+
+        // Roll: 어시스트 켜짐 = 스틱을 뱅크각 명령으로 해석(FBWA류). f16 FCS가 레이트
+        // 루프를 이미 닫고 있으므로 여기는 '자세(뱅크)'만 담당 — 레이트 루프 이중적재 아님.
+        // (무인기 내루프의 heading→roll→FCS 캐스케이드와 같은 구조로 이미 검증된 방식.)
+        double RollCmd = Command.Roll * Auth;                  // 구 방식(어시스트 꺼짐)
+        if (bMannedRollAssist)
+        {
+            const double Phi    = JSBSim->AircraftState.LocalEulerAngles.Roll;
+            const double PhiRef = FMath::Clamp((double)Command.Roll, -1.0, 1.0) * (double)MannedBankLimitDeg;
+            const double Rate   = FMath::Clamp((double)MannedRollKp * (PhiRef - Phi),
+                                               -(double)MannedRollRateLimitDps,
+                                                (double)MannedRollRateLimitDps);
+            RollCmd = Rate / 180.0;                            // f16 FCS 규격: 1.0 = 180°/s
+        }
+        JSBSim->Commands.Aileron  = RollCmd;
+        JSBSim->Commands.Elevator = Command.Pitch * Auth;      // FCS에 G/받음각 제한 내장
         JSBSim->Commands.Rudder   = Command.Yaw   * Auth;
         if (JSBSim->EngineCommands.Num() > 0)
         {

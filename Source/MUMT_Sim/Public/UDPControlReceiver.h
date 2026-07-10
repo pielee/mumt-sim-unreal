@@ -204,14 +204,37 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
     float MannedSpeedLimitMps = 300.f;
 
-    // Manned control authority: scales the joystick surface commands (roll/pitch/
-    // yaw, [-1,1]) before they hit the flight model. 0.4 = full stick gives only
-    // 40% surface, so even a hard input is gentle enough for the formation UAV to
-    // follow. 1.0 = full authority (raw). Throttle is NOT scaled (governor handles
-    // top speed). Manned/joystick path only — UAV autopilot is unaffected.
+    // Manned control authority: scales the joystick PITCH/YAW commands before the
+    // flight model (roll too, but only when bMannedRollAssist is off). Throttle is
+    // NOT scaled (governor handles top speed). Manned/joystick path only.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target",
               meta = (ClampMin = "0.05", ClampMax = "1.0"))
     float MannedControlAuthority = 0.4f;
+
+    // ── 유인기 Roll Assist (FBWA/PX4-Stabilized류 스틱 해석층) ─────────────────
+    // f16 FCS는 rate-command FBW라 스틱 유지 = 무한정 롤(뱅크 상한 없음) → 리더 선회율이
+    // 요동쳐 무인기 roll_ff 가정이 깨진다. 어시스트가 스틱을 '뱅크각 명령'으로 재해석:
+    //   목표뱅크 = 스틱 × BankLimit → 필요 롤레이트 = Kp×(목표−현재), ±RateLimit
+    //   → /180 정규화(f16 FCS 규격: 1.0 = 180°/s) → aileron-cmd.
+    // 효과: 스틱 유지 = 그 뱅크 유지(선회 유지), 놓으면 수평 복귀, 리더 ω 유계·평활.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
+    bool bMannedRollAssist = true;
+
+    // 풀스틱 뱅크각. 무인기 뱅크캡이 70°이므로 65~70이 '편대 추종 보장' 범위 —
+    // 그 이상은 도그파이트용(무인기가 순간적으로 밀릴 수 있음).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target",
+              meta = (EditCondition = "bMannedRollAssist", ClampMin = "10.0", ClampMax = "85.0"))
+    float MannedBankLimitDeg = 70.f;
+
+    // 뱅크오차 1° → 롤레이트 명령(°/s). 2.0이면 시정수 ~0.5s의 부드러운 캡처.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target",
+              meta = (EditCondition = "bMannedRollAssist"))
+    float MannedRollKp = 2.0f;
+
+    // 롤레이트 상한(°/s) — 리더 롤 기동의 민첩성 한계 (풀 F-16은 180+).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target",
+              meta = (EditCondition = "bMannedRollAssist"))
+    float MannedRollRateLimitDps = 120.f;
 
     // StickController output → JSBSim surface sign/scale. Verify in PIE and flip a
     // sign here (no recompile) if a surface is inverted. BVRGym left rudder at 0;
