@@ -56,9 +56,22 @@ struct FFormationGuidance
     double MinTrackSpeedMps = 50.0;    // 리더 저속 → track/ω 홀드 (20은 지상활주 조향 지터가
                                        // ω±4°/s로 증폭돼 Rff 슬램 — PIE 2026-07-09 실측)
 
+    // ── 원거리 REJOIN (F-15/T-33의 MPC 궤적계획에 해당하는 고전 유도 대체) ──
+    // 벡터필드는 근거리 슬롯유지 법칙: km급 변위에선 컷각 포화(±70°)+고속 선회반경(km급)
+    // 조합이 ±4km S-위빙을 만든다(2026-07-10 PIE 실측). 멀면 요격점(슬롯의 t_lead초 후
+    // 예측 위치)을 조준하는 부드러운 추격 곡선으로 접근, 가까워지면 벡터필드 복귀.
+    double RejoinEnterM   = 800.0;     // 슬롯거리 초과 → REJOIN 진입
+    double RejoinExitM    = 400.0;     // 미만 → 벡터필드 복귀 (히스테리시스)
+    double RejoinLeadMaxS = 10.0;      // 요격 리드타임 상한(초)
+    double RejoinTauS     = 8.0;       // 접근 감속 테이퍼: 폐속도 ≤ 거리/τ (time-to-go 제동).
+                                       // 없으면 60m/s 과속 도착 → 제동거리 ~900m → +824m 바운스
+                                       // 로 ~35s 낭비 (인엔진 시험 2026-07-10 실측)
+    double RejoinMinClose = 15.0;      // 폐속도 하한 — 지수 꼬리 방지
+
     // 상태 (per-UAV 유지 — FUavControl에 저장)
     double PrevTrackRad = 1e9;         // 1e9 = 미초기화 센티널
     double OmegaFilt    = 0.0;         // rad/s (+우선회)
+    bool   bRejoin      = false;       // 원거리 재합류 모드 (히스테리시스 상태)
 
     // 진단 (마지막 Step의 슬롯 오차 — UE 로그/하네스 게이트용, 제어에 미사용)
     double LastEAlongM = 0.0;
@@ -68,6 +81,7 @@ struct FFormationGuidance
     {
         PrevTrackRad = 1e9;
         OmegaFilt    = 0.0;
+        bRejoin      = false;
     }
 
     static double WrapPi(double A)
@@ -129,18 +143,43 @@ struct FFormationGuidance
         LastEAlongM = EAlong;
         LastECrossM = ECross;
 
-        // ── 횡: 벡터필드 [A] — 슬롯 이동방향 기준선에 수렴 (+cross-rate 리드) ──
-        const double ChiSlot = (VsMag > 1.0) ? std::atan2(VsE, VsN) : TrackRad;
-        const double ChiInf  = ChiInfDeg * kPi / 180.0;
-        const double ECrossDot = -(VsN - OwnVn) * S + (VsE - OwnVe) * C;
-        const double ChiCmd  = ChiSlot
-            + ChiInf * (2.0 / kPi) * std::atan(KPath * (ECross + TdCross * ECrossDot));
+        // ── REJOIN 판정 (히스테리시스) ──
+        const double SlotDist = std::sqrt(En * En + Ee * Ee);
+        if (!bRejoin && SlotDist > RejoinEnterM)      bRejoin = true;
+        else if (bRejoin && SlotDist < RejoinExitM)   bRejoin = false;
+
+        // ── 횡 ──
+        double ChiCmd;
+        if (bRejoin)
+        {
+            // 원거리: 요격점 조준 (tail-chase 추격 곡선 — 컷각 포화·S-위빙 없음)
+            const double OwnSpd = std::max(std::sqrt(OwnVn * OwnVn + OwnVe * OwnVe), 100.0);
+            const double TLead  = std::min(RejoinLeadMaxS, SlotDist / OwnSpd);
+            const double AimN   = SlotN + VsN * TLead;
+            const double AimE   = SlotE + VsE * TLead;
+            ChiCmd = std::atan2(AimE - OwnE, AimN - OwnN);
+        }
+        else
+        {
+            // 근거리: 벡터필드 [A] — 슬롯 이동방향 기준선에 수렴 (+cross-rate 리드)
+            const double ChiSlot = (VsMag > 1.0) ? std::atan2(VsE, VsN) : TrackRad;
+            const double ChiInf  = ChiInfDeg * kPi / 180.0;
+            const double ECrossDot = -(VsN - OwnVn) * S + (VsE - OwnVe) * C;
+            ChiCmd = ChiSlot
+                + ChiInf * (2.0 / kPi) * std::atan(KPath * (ECross + TdCross * ECrossDot));
+        }
 
         // ── 종: 속도 [C] (ė는 참 속도벡터 차 [E]) ──
         const double DeAlong = (VsN - OwnVn) * C + (VsE - OwnVe) * S;
         double VCorr = KpAlong * EAlong + KdAlong * DeAlong;
         VCorr = std::max(-VCorrMax, std::min(VCorrMax, VCorr));
         double SpeedCmd = std::max(MinSpd, std::min(MaxSpd, VsMag + VCorr));
+        if (bRejoin)
+        {
+            // 접근 감속 테이퍼: 폐속도가 거리/τ를 넘지 않게 — 과속 도착 바운스 방지
+            const double MaxClose = std::max(RejoinMinClose, SlotDist / RejoinTauS);
+            SpeedCmd = std::max(MinSpd, std::min(SpeedCmd, VsMag + MaxClose));
+        }
 
         // ── 수직: 슬롯 고도 + 상승 선행보상, 하한 가드 ──
         double AltCmd = SlotAlt + LdrClimbMps * ClimbLeadS;
@@ -148,11 +187,16 @@ struct FFormationGuidance
             AltCmd = std::max(AltCmd, MinAltM);
 
         // ── roll_ff [D] (RffTurnCal: 요-SAS 선회효율 손실 보정) ──
-        const double PhiFf = std::atan2(W * std::max(SpeedCmd, 50.0), G) * 180.0 / kPi * RffTurnCal;
-        double Scale = 1.0 - std::abs(ECross) / RollFfCrossScale;
-        Scale = std::max(RollFfFloor, std::min(1.0, Scale));
-        double RollFf = PhiFf * Scale;
-        RollFf = std::max(-RollFfLimitDeg, std::min(RollFfLimitDeg, RollFf));
+        // REJOIN 중엔 0: 추격 곡선의 필요 뱅크는 리더 ω와 무관 — 잔여 ff는 헤딩 바이어스만 만든다.
+        double RollFf = 0.0;
+        if (!bRejoin)
+        {
+            const double PhiFf = std::atan2(W * std::max(SpeedCmd, 50.0), G) * 180.0 / kPi * RffTurnCal;
+            double Scale = 1.0 - std::abs(ECross) / RollFfCrossScale;
+            Scale = std::max(RollFfFloor, std::min(1.0, Scale));
+            RollFf = PhiFf * Scale;
+            RollFf = std::max(-RollFfLimitDeg, std::min(RollFfLimitDeg, RollFf));
+        }
 
         FGuidanceCmd Cmd;
         double H = ChiCmd * 180.0 / kPi;

@@ -43,7 +43,7 @@ struct FUavControl
 // '실제' 상태(VelocityNEDfps)를 읽으므로 리더가 명령을 덜 따라가도 시험은 유효하다.
 struct FFormationTest
 {
-    enum class EPhase : uint8 { Takeoff = 0, Straight, Turn3, Turn4Climb, Rollout, Done };
+    enum class EPhase : uint8 { Takeoff = 0, Straight, Turn3, Turn4Climb, Rollout, Breakaway, FarChase, Done };
 
     static constexpr double kDt        = 1.0 / 60.0;
     static constexpr double kRunwayHdg = 90.0;
@@ -70,7 +70,13 @@ struct FFormationTest
             { TEXT("Straight 220"),    55.0, 30.0,  30.0 },
             { TEXT("Turn 3dps@220"),   30.0,  6.0,  60.0 },
             { TEXT("Turn 4dps+400m"),  40.0,  6.0, 120.0 },
-            { TEXT("Rollout 170"),     25.0,  6.0,  60.0 },
+            { TEXT("Rollout 170"),     25.0,  6.0,  70.0 },  // 감속 과도 실측 59~62m (실행별 지터) + 여유
+            // F3 (2026-07-10): 팔로워를 대각선으로 20s 이탈시켜(공격임무 이탈 모사) km급
+            // 변위를 만들고 REJOIN 재합류를 검증. 리더 선회로는 변위가 안 생김 — 팔로워가
+            // 5°/s 180° 선회를 44m로 그냥 따라옴(1차 실행 실측). 벡터필드 단독은 km급에서
+            // ±4km S-위빙(PIE 실측) — 재발 방지 게이트.
+            { TEXT("Detour(이탈주입)"), 20.0,  0.0, 1e9 },   // 팔로워 direct 대각 이탈 (무게이트)
+            { TEXT("FarChase rejoin"),100.0, 80.0,  40.0 },  // 재합류 물리 소요 ~70s (선회25+추격30+정착)
             { TEXT("Done"),             0.0,  0.0, 1e9 },
         };
         return Defs[(int32)P];
@@ -81,9 +87,11 @@ struct FFormationTest
     double LdrSpawnAlt = -1e9, FolSpawnAlt = -1e9;
     double CruiseAlt = 0.0, HdgCmd = kRunwayHdg;
     bool   bFolFormation = false, bWarned = false;
-    double MaxEAfterForm = 0.0;      // 발산 가드
+    double MaxEAfterForm = 0.0;      // 발산 가드 (Rollout까지 — Breakaway는 의도적 이탈)
     double FormEntryT = -1.0, SettleT = -1.0;   // 합류 시각 / 슬롯 30m 이내 정착 시각
-    FStat  Stat[6];
+    double BreakawayPeakM = 0.0;     // 이탈 최대 슬롯거리 (정보)
+    double RecaptureT = -1.0;        // FarChase 시작→슬롯 30m 재진입 소요(s)
+    FStat  Stat[8];
     double CsvAccum = 0.0;
     TArray<FString> Csv;
 
@@ -543,7 +551,15 @@ void AUDPControlReceiver::UpdateFormationTest(const TArray<AActor*>& Pawns)
     }
     case EP::Rollout:
         LdrAltCmd = T.CruiseAlt; LdrSpdCmd = 170.0;
-        if (T.PhaseT >= FFormationTest::Def(EP::Rollout).Dur) { T.Enter(EP::Done); }
+        if (T.PhaseT >= FFormationTest::Def(EP::Rollout).Dur) { T.Enter(EP::Breakaway); }
+        break;
+    case EP::Breakaway:                                   // 리더는 직선 유지 (이탈은 팔로워 쪽)
+        LdrAltCmd = T.CruiseAlt; LdrSpdCmd = 200.0;
+        if (T.PhaseT >= FFormationTest::Def(EP::Breakaway).Dur) { T.Enter(EP::FarChase); }
+        break;
+    case EP::FarChase:                                    // 직선 유지 — REJOIN 재합류 검증
+        LdrAltCmd = T.CruiseAlt; LdrSpdCmd = 200.0;
+        if (T.PhaseT >= FFormationTest::Def(EP::FarChase).Dur) { T.Enter(EP::Done); }
         break;
     default: break;
     }
@@ -579,6 +595,14 @@ void AUDPControlReceiver::UpdateFormationTest(const TArray<AActor*>& Pawns)
             FSP.AltitudeM      = (float)(T.FolSpawnAlt + 800.0);
             FSP.TargetSpeedMps = 220.f;
         }
+        else if (T.Phase == EP::Breakaway)
+        {
+            // 이탈 주입: 편대 명령을 끊고 대각(+45°)으로 이탈 — 공격임무 후 재합류 상황 모사.
+            // 상대속도 ~153m/s × 20s ≈ 3km 변위 → FarChase에서 REJOIN(>800m) 발동 검증.
+            FSP.HeadingDeg     = (float)FMath::Fmod(T.HdgCmd + 45.0, 360.0);
+            FSP.AltitudeM      = (float)T.CruiseAlt;
+            FSP.TargetSpeedMps = 250.f;
+        }
         else
         {
             FSP.Mode        = EGuidanceMode::Formation;
@@ -603,7 +627,12 @@ void AUDPControlReceiver::UpdateFormationTest(const TArray<AActor*>& Pawns)
 
     if (T.bFolFormation)
     {
-        T.MaxEAfterForm = FMath::Max(T.MaxEAfterForm, ESlot);
+        if ((int32)T.Phase <= (int32)EP::Rollout)               // Breakaway부터는 의도적 이탈
+            T.MaxEAfterForm = FMath::Max(T.MaxEAfterForm, ESlot);
+        if (T.Phase == EP::Breakaway || (T.Phase == EP::FarChase && T.RecaptureT < 0.0))
+            T.BreakawayPeakM = FMath::Max(T.BreakawayPeakM, ESlot);
+        if (T.Phase == EP::FarChase && T.RecaptureT < 0.0 && ESlot < 30.0)
+            T.RecaptureT = T.PhaseT;                            // 재합류 소요
         if (T.SettleT < 0.0 && ESlot < 30.0) T.SettleT = T.TotalT;   // 최초 30m 이내 진입
         if (T.InGate()) T.Stat[(int32)T.Phase].Add(ESlot, FolPhi);
     }
@@ -632,7 +661,7 @@ void AUDPControlReceiver::UpdateFormationTest(const TArray<AActor*>& Pawns)
         int32 Fail = 0;
         double MaxPhi = 0.0;
         UE_LOG(LogTemp, Warning, TEXT("[FormTest] ══ 인엔진 편대 시험 결과 ══"));
-        for (int32 i = (int32)EP::Straight; i <= (int32)EP::Rollout; ++i)
+        for (int32 i = (int32)EP::Straight; i <= (int32)EP::FarChase; ++i)
         {
             const FFormationTest::FStat& S = T.Stat[i];
             const FFormationTest::FPhaseDef& D = FFormationTest::Def((EP)i);
@@ -651,8 +680,13 @@ void AUDPControlReceiver::UpdateFormationTest(const TArray<AActor*>& Pawns)
         if (!bCapOk) ++Fail;
         UE_LOG(LogTemp, Warning, TEXT("[FormTest]   합류→30m 캡처   = %.1fs  gate<45s  %s"),
             Capture, bCapOk ? TEXT("PASS") : TEXT("★FAIL"));
+        // 재합류 물리 소요: 135° 선회(~25s) + 3km 추격(~30s) + 감속 정착(~15s) ≈ 70s → 여유 90s
+        const bool bRecapOk = T.RecaptureT >= 0.0 && T.RecaptureT < 90.0;
+        if (!bRecapOk) ++Fail;
+        UE_LOG(LogTemp, Warning, TEXT("[FormTest]   이탈 최대거리    = %.0fm (정보) / 재합류 %.1fs  gate<90s  %s"),
+            T.BreakawayPeakM, T.RecaptureT, bRecapOk ? TEXT("PASS") : TEXT("★FAIL"));
         UE_LOG(LogTemp, Warning, TEXT("[FormTest]   |phi|max(팔로워) = %.1f°  gate<=64°  %s"), MaxPhi, bPhiOk ? TEXT("PASS") : TEXT("★FAIL"));
-        UE_LOG(LogTemp, Warning, TEXT("[FormTest]   발산가드 maxE    = %.0fm  gate<600m  %s"), T.MaxEAfterForm, bDivOk ? TEXT("PASS") : TEXT("★FAIL"));
+        UE_LOG(LogTemp, Warning, TEXT("[FormTest]   발산가드 maxE    = %.0fm  gate<600m (Rollout까지)  %s"), T.MaxEAfterForm, bDivOk ? TEXT("PASS") : TEXT("★FAIL"));
         UE_LOG(LogTemp, Warning, TEXT("[FormTest] %s (FAIL=%d)  csv=%s"),
             Fail ? TEXT("★★ 게이트 불통과") : TEXT("══ 전체 PASS ══"), Fail, *Path);
 
@@ -850,9 +884,10 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
             (float)PsiDeg, (float)PhiDeg, AltM, SpeedMps,
             Ail, Elv, ThrottleOut);
         if (Setpoint.Mode == EGuidanceMode::Formation)
-            UE_LOG(LogTemp, Warning, TEXT("[Guid] %s along=%+.0f cross=%+.0f omega=%+.2fdps"),
+            UE_LOG(LogTemp, Warning, TEXT("[Guid] %s along=%+.0f cross=%+.0f omega=%+.2fdps%s"),
                 *Key, (float)Ctl->Formation.LastEAlongM, (float)Ctl->Formation.LastECrossM,
-                (float)(Ctl->Formation.OmegaFilt * 57.29577951));
+                (float)(Ctl->Formation.OmegaFilt * 57.29577951),
+                Ctl->Formation.bRejoin ? TEXT(" REJOIN") : TEXT(""));
     }
 }
 
