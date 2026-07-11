@@ -12,6 +12,13 @@ public class MUMT_Sim : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[] {  });
 
+		// Editor-only: the dev/automation live-snapshot test (WITH_EDITOR && WITH_DEV_AUTOMATION_TESTS)
+		// drives PIE via UnrealEd latent commands. Excluded from non-editor (game/shipping) builds.
+		if (Target.bBuildEditor)
+		{
+			PrivateDependencyModuleNames.Add("UnrealEd");
+		}
+
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
 		
