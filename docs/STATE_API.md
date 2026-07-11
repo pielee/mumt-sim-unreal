@@ -127,19 +127,36 @@ Full editor build (engine-installed machine):
     -project="<abs>/MUMT_Sim/MUMT_Sim.uproject" -waitmutex
 ```
 
-No `MUMT_Sim.Build.cs` change is required (JSBSimFlightDynamicsModel is already a public dependency).
+The adapter/getter need no `MUMT_Sim.Build.cs` change (JSBSimFlightDynamicsModel is already a public
+dependency). The dev/editor-only live-snapshot PIE test (`MumtLiveSnapshotTest.cpp`) adds an
+editor-only `if (Target.bBuildEditor) UnrealEd` dependency for the PIE latent commands; it is
+excluded from non-editor (game/shipping) builds.
 
-## Unverified / open items (kept explicit)
+## Verification status
 
-- **Full Unreal compile & link** of the plugin getter + adapter — not run (no UE 5.4 here); only
-  pure logic + JSBSim-call/adapter syntax verified.
-- **Thread-affinity** — documented as a Game-Thread/JSBSim-tick precondition; **not verified at
-  runtime**.
-- **Live JSBSim values** — behaviour with a running sim is unverified.
-- **Wind N/E blowing-toward sign** — reasoned from the plugin's `SetWindNED` usage; **not
-  live-verified**.
-- **Reset detection** — the sim-time-backwards heuristic is **not authoritative**; an explicit
-  RunIC/Respawn/Reset-generation lifecycle hook is required as follow-up (a reset that restarts at
-  the same sim time would be missed). Until then `ResetGeneration` from the heuristic is best-effort.
-- **Build.cs transitive public dependency** (`MUMT_Sim → JSBSimFlightDynamicsModel → JSBSim`) —
-  validated by header syntax only; unverified in a real UE build until a full compile.
+**Verified:**
+- **Full UE 5.4.4 (Linux, Development editor) build** — plugin getter + module compile & link, UHT OK.
+- **Adapter UBT compile** — `MumtControlState.h` compiled and `FJsbFlightSnapshot -> ConvertJsbToControlState
+  -> FMumtControlState` instantiated in-module (automation test `MUMT.StateApi.AdapterCompiles`, Result=Success).
+- **Live PIE (RL_2, existing F-16, post-FDM-init success path)** — existing-component reuse (1 per
+  actor, no new component/FGFDMExec), `GetJsbFlightSnapshot` on the Game Thread, snapshot -> adapter ->
+  `FMumtControlState`, property-tree cross-check (EAS/TAS/Alt/Climb/Pitch/Roll/SimTime raw == property to
+  ~1e-10; SI == independent calc), SimTime monotonic + microseconds, TASRate (first invalid then valid),
+  ForwardAcceleration invalid/0, Game-Thread affinity, `eas_to_tas = TAS/EAS` valid path (962 samples).
+
+Automation verdict vs process exit (recorded separately): the automation **Result = Success**
+(1 test performed, *Automation Test Queue Empty*); the `UnrealEditor-Cmd` **process exit code was 1** —
+this is not asserted to be normal and is reported independently of the Success verdict.
+
+**Not verified (kept explicit):**
+- **Pre-init / null-object getter FAILURE path** — did not occur live (the FDM was valid by the first
+  sample); covered only by the getter's `Out = FJsbFlightSnapshot{}` reset + host tests.
+- **Stale-clear on a live failure** — proven by code + host tests, not by a live failure path.
+- **Pause / Resume events** — not exercised (the read-only scenario cannot call `Exec->Hold()`;
+  world-pause would not set `bHolding`; forcing it is out of scope).
+- **Reset lifecycle / `ResetGeneration`** — the sim-time-backwards heuristic is not authoritative; an
+  explicit RunIC/Respawn/Reset-generation hook is still required as follow-up. Not verified.
+- **Non-zero Wind blowing-toward sign** — the live scenario is zero-wind; sign remains unverified
+  (wind was not forced).
+- **High-speed flight dynamics** — the live scenario was near-stationary (ground); high-dynamic values
+  were not reached.
