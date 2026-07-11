@@ -38,6 +38,29 @@ struct FGeographicCoordinates;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FDelegateAircraftCrashed);
 
+/**
+ * Read-only raw JSBSim flight snapshot in native JSBSim units. Plain POD (no Unreal
+ * reflection, no control law). Filled by UJSBSimMovementComponent::GetJsbFlightSnapshot so
+ * external guidance/energy controllers can read flight state without touching the protected
+ * JSBSim objects. Field names mirror MumtState::FJsbRawState 1:1 so the MUMT state adapter
+ * (SI/NED conversion) can consume it directly; no conversion is performed here.
+ */
+struct FJsbFlightSnapshot
+{
+	bool   bValidFrame    = false; // false if the required JSBSim objects are not initialized
+	double VequivalentKTS = 0.0;   // FGAuxiliary::GetVequivalentKTS()          [knots] (EAS, NOT CAS)
+	double VtFps          = 0.0;   // FGAuxiliary::GetVt()                      [ft/s]  (TAS)
+	double VcalibratedKTS = 0.0;   // FGAuxiliary::GetVcalibratedKTS()          [knots] (CAS, reference only)
+	double WindNorthFps   = 0.0;   // FGWinds::GetTotalWindNED(eNorth)          [ft/s]
+	double WindEastFps    = 0.0;   // FGWinds::GetTotalWindNED(eEast)           [ft/s]
+	double AltAslFt       = 0.0;   // FGPropagate::GetAltitudeASL()             [ft, +up]
+	double HdotFps        = 0.0;   // FGPropagate::Gethdot()                    [ft/s, +up]
+	double PitchRad       = 0.0;   // FGPropagate::GetEuler(eTht)               [rad]
+	double RollRad        = 0.0;   // FGPropagate::GetEuler(ePhi)               [rad]
+	double SimTimeSec     = 0.0;   // FGFDMExec::GetSimTime()                   [s, monotonic]
+	bool   bHolding       = false; // FGFDMExec::Holding()                      [paused]
+};
+
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class JSBSIMFLIGHTDYNAMICSMODEL_API UJSBSimMovementComponent : public UActorComponent
 {
@@ -250,7 +273,19 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, DisplayName = "Set Winds")
 	void SetWind(FSimpleWindState WindState);
-	
+
+	/**
+	 * Read-only raw JSBSim flight snapshot in native units, so external guidance/energy
+	 * controllers never access the protected JSBSim objects directly. No SI/NED conversion
+	 * and no control law here (that lives in the MUMT state adapter). Returns false and
+	 * leaves Out.bValidFrame = false if the FDM objects are not initialized.
+	 *
+	 * Thread affinity: must be called on the Game Thread in sync with the JSBSim tick (the
+	 * same thread that runs TickComponent / CopyFromJSBSim). It reads live FDM state and is
+	 * not thread-safe against a concurrent Run() or reset.
+	 */
+	bool GetJsbFlightSnapshot(FJsbFlightSnapshot& Out) const;
+
 protected:
 	// Called when the game starts
 	virtual void BeginPlay() override;

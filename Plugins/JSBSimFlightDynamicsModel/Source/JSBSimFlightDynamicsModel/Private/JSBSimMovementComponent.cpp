@@ -795,6 +795,31 @@ void UJSBSimMovementComponent::CopyFromJSBSim()
   GetEnginesStates();
 }
 
+bool UJSBSimMovementComponent::GetJsbFlightSnapshot(FJsbFlightSnapshot& Out) const
+{
+  Out = FJsbFlightSnapshot{}; // reset ALL fields first: a failed call must not leak stale state
+
+  // Only this component reads the protected JSBSim objects; controllers use the snapshot.
+  if (Exec == nullptr || !Auxiliary || !Winds || !Propagate)
+  {
+    return false; // FDM not initialized -> Out.bValidFrame stays false
+  }
+
+  Out.bValidFrame    = true;
+  Out.VequivalentKTS = Auxiliary->GetVequivalentKTS();                    // EAS (NOT CAS)
+  Out.VtFps          = Auxiliary->GetVt();                                // TAS [ft/s]
+  Out.VcalibratedKTS = Auxiliary->GetVcalibratedKTS();                    // CAS, reference only
+  Out.WindNorthFps   = Winds->GetTotalWindNED(JSBSim::FGJSBBase::eNorth); // total wind N [ft/s]
+  Out.WindEastFps    = Winds->GetTotalWindNED(JSBSim::FGJSBBase::eEast);  // total wind E [ft/s]
+  Out.AltAslFt       = Propagate->GetAltitudeASL();                       // ASL [ft, +up]
+  Out.HdotFps        = Propagate->Gethdot();                              // climb [ft/s, +up]
+  Out.PitchRad       = Propagate->GetEuler(JSBSim::FGJSBBase::eTht);      // pitch [rad]
+  Out.RollRad        = Propagate->GetEuler(JSBSim::FGJSBBase::ePhi);      // roll  [rad]
+  Out.SimTimeSec     = Exec->GetSimTime();                                // sim time [s]
+  Out.bHolding       = Exec->Holding();                                   // paused
+  return true;
+}
+
 /////////// JSBSim Private methods
 void UJSBSimMovementComponent::DoTrim()
 {
