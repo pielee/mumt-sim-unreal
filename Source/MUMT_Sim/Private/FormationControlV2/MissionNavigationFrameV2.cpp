@@ -6,18 +6,18 @@ namespace FormationControlV2 {
 namespace {
 constexpr double Wgs84A = 6378137.0;
 constexpr double Wgs84InverseFlattening = 298.257223563;
-constexpr double Pi = 3.1415926535897932384626433832795;
-bool Finite(double value) { return std::isfinite(value); }
+constexpr double kMissionNavigationPi = 3.1415926535897932384626433832795;
+bool IsFiniteMissionNavigation(double value) { return std::isfinite(value); }
 }
 
-bool Vec3dV2::IsFinite() const { return Finite(X) && Finite(Y) && Finite(Z); }
+bool Vec3dV2::IsFinite() const { return IsFiniteMissionNavigation(X) && IsFiniteMissionNavigation(Y) && IsFiniteMissionNavigation(Z); }
 
 Vec3dV2 MissionNavigationFrameV2::GeodeticToEcefM(
     double latitude, double longitude, double height, bool &valid)
 {
     valid = false;
-    if (!Finite(latitude) || !Finite(longitude) || !Finite(height)
-        || latitude < -0.5 * Pi || latitude > 0.5 * Pi) return {};
+    if (!IsFiniteMissionNavigation(latitude) || !IsFiniteMissionNavigation(longitude) || !IsFiniteMissionNavigation(height)
+        || latitude < -0.5 * kMissionNavigationPi || latitude > 0.5 * kMissionNavigationPi) return {};
     const double flattening = 1.0 / Wgs84InverseFlattening;
     const double eccentricitySquared = flattening * (2.0 - flattening);
     const double sinLat = std::sin(latitude), cosLat = std::cos(latitude);
