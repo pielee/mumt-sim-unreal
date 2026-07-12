@@ -26,6 +26,7 @@
 #include "FormationControlV2/CanonicalNavigationAdapterV2.h"
 #include "FormationControlV2/FormationSlotGeneratorV2.h"
 #include "FormationControlV2/FormationPlannerV2.h"
+#include "FormationControlV2/FormationGuidanceCoordinatorV2.h"
 #include "FormationControlV2/PlannerV2Adapters.h"
 #include "Tests/AutomationEditorCommon.h" // FEditorLoadMap, FStartPIECommand, FEndPlayMapCommand
 #include "Editor.h"                        // GEditor
@@ -90,6 +91,10 @@ struct FMumtLiveState
 	double DEcefPositionM = 0, DNedVelocityMps = 0;
 	bool bNavigationFinite = true, bOriginGenerationMatch = true;
 	bool bTrackerIndependent = false, bDtoPipelineObserved = false;
+	FormationControlV2::FormationGuidanceCoordinatorV2 Guidance;
+	bool bGuidanceObserved = false, bGuidanceFinite = true;
+	int32 GuidanceUpdates = 0;
+	double RollRefMin = 1e9, RollRefMax = -1e9, PitchRefMin = 1e9, PitchRefMax = -1e9, ThrottleRefMin = 1e9, ThrottleRefMax = -1e9;
 
 	TArray<FString> Csv;
 };
@@ -266,7 +271,7 @@ public:
 			FormationControlV2::FFormationSlotCommandV2 SlotCommand{};SlotCommand.FrontM=-200;SlotCommand.RightM=100;SlotCommand.CommandReceivedSimulationTimeS=Snap.SimTimeSec;SlotCommand.SourceSequence=1;SlotCommand.bValid=true;
 			const auto Slot=FormationControlV2::FormationSlotGeneratorV2::Calculate(Nav,SlotCommand,Snap.SimTimeSec);
 			const auto PlannerInput=FormationControlV2::PlannerV2InputAdapter::Build({Nav,Slot,Snap.SimTimeSec,1.0/60.0});
-			if (PlannerInput.bValid&&!Nav.bPaused){FormationControlV2::FormationPlannerV2Diagnostics Diagnostics{};const auto PlannerOutput=S->Planner.Update(PlannerInput.Input,Diagnostics);const auto Dto=FormationControlV2::PlannerV2OutputAdapter::Build(PlannerOutput,Slot,Nav);if(Dto.Npfg.bValid&&Dto.Tecs.bCommandReady)S->bDtoPipelineObserved=true;}
+			if (PlannerInput.bValid&&!Nav.bPaused){FormationControlV2::FormationPlannerV2Diagnostics Diagnostics{};const auto PlannerOutput=S->Planner.Update(PlannerInput.Input,Diagnostics);const auto Dto=FormationControlV2::PlannerV2OutputAdapter::Build(PlannerOutput,Slot,Nav);if(Dto.Npfg.bValid&&Dto.Tecs.bCommandReady){S->bDtoPipelineObserved=true;FormationControlV2::FGuidanceCoordinatorInputV2 GuidanceInput{};GuidanceInput.Follower=Nav;GuidanceInput.Slot=Slot;GuidanceInput.PlannerDto=Dto;GuidanceInput.CurrentPitchRad=St.Pitch_rad;GuidanceInput.bCurrentPitchValid=St.bAttitudeValid;GuidanceInput.SimulationTimeS=Snap.SimTimeSec;GuidanceInput.DtS=1.0/60.0;GuidanceInput.ResetGeneration=St.ResetGeneration;GuidanceInput.OriginGeneration=Nav.OriginGeneration;const auto GuidanceOutput=S->Guidance.Update(GuidanceInput);if(GuidanceOutput.bCommandReady){S->bGuidanceObserved=true;S->GuidanceUpdates++;S->bGuidanceFinite&=IsFin(GuidanceOutput.RollReferenceRad)&&IsFin(GuidanceOutput.PitchReferenceRad)&&IsFin(GuidanceOutput.ThrottleReferenceNorm);S->RollRefMin=FMath::Min(S->RollRefMin,GuidanceOutput.RollReferenceRad);S->RollRefMax=FMath::Max(S->RollRefMax,GuidanceOutput.RollReferenceRad);S->PitchRefMin=FMath::Min(S->PitchRefMin,GuidanceOutput.PitchReferenceRad);S->PitchRefMax=FMath::Max(S->PitchRefMax,GuidanceOutput.PitchReferenceRad);S->ThrottleRefMin=FMath::Min(S->ThrottleRefMin,GuidanceOutput.ThrottleReferenceNorm);S->ThrottleRefMax=FMath::Max(S->ThrottleRefMax,GuidanceOutput.ThrottleReferenceNorm);}}}
 
 			S->Csv.Add(FString::Printf(TEXT("%.6f,%llu,%.6f,%.6f,%.4f,%.4f,%.3f,%.3f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.6f,%.4f,%.4f,%.4f,%d,%d"),
 				Snap.SimTimeSec, (unsigned long long)St.SimTimeMicros, Snap.VequivalentKTS, oEAS, Snap.VtFps, oTAS, Snap.AltAslFt, oAlt,
@@ -322,6 +327,7 @@ private:
 			S->DEasSI, S->DTasSI, S->DAltSI, S->DClimbSI, S->MaxAbsWindN, S->MaxAbsWindE);
 		UE_LOG(LogMumtLive, Display, TEXT("[MUMTLIVE] nav origin=(lat=0.6 rad lon=2.2 rad h=100m gen=9001) ecefPosDiff=%.9g m nedVelDiff=%.9g mps finite=%d originGen=%d"), S->DEcefPositionM, S->DNedVelocityMps, S->bNavigationFinite, S->bOriginGenerationMatch);
 		UE_LOG(LogMumtLive, Display, TEXT("[MUMTLIVE] observationalPipeline trackerIndependent=%d dtoObserved=%d commandWrites=0 newComponents=0 newFdm=0"),S->bTrackerIndependent,S->bDtoPipelineObserved);
+		UE_LOG(LogMumtLive, Display, TEXT("[MUMTLIVE] guidanceShadow observed=%d updates=%d finite=%d roll=[%.6g..%.6g] pitch=[%.6g..%.6g] throttle=[%.6g..%.6g] npfgTecsUpdateOnly=1 commandWrites=0"),S->bGuidanceObserved,S->GuidanceUpdates,S->bGuidanceFinite,S->RollRefMin,S->RollRefMax,S->PitchRefMin,S->PitchRefMax,S->ThrottleRefMin,S->ThrottleRefMax);
 
 		if (AbortReason) { Test->AddError(FString::Printf(TEXT("[MUMTLIVE] aborted: %s"), AbortReason)); return true; }
 
@@ -355,6 +361,7 @@ private:
 		Test->TestTrue(TEXT("explicit mission origin generation propagated"), S->bOriginGenerationMatch);
 		Test->TestTrue(TEXT("aircraft tracker state is independently resettable"), S->bTrackerIndependent);
 		Test->TestTrue(TEXT("canonical-slot-planner-NPFG/TECS DTO observational pipeline produced valid DTO"), S->bDtoPipelineObserved);
+		Test->TestTrue(TEXT("NPFG/TECS shadow guidance produced finite references"), S->bGuidanceObserved && S->bGuidanceFinite && S->GuidanceUpdates > 0);
 		return true;
 	}
 
