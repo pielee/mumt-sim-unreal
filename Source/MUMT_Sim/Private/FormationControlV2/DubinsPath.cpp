@@ -127,7 +127,12 @@ ProjectionResult DubinsPath::ProjectSegment(const Vec2&x,const DubinsSegment&seg
     if(seg.Type==SegmentType::Straight){const Vec2 t=FromCourse(seg.StartPose.CourseRad);local=Clamp((x-seg.StartPose.Position).Dot(t),lo,hi);}
     else {const double k=Curvature(seg.Type,RadiusM);const Vec2 center=seg.StartPose.Position+RightNormal(seg.StartPose.CourseRad)*(1.0/k);
         const Vec2 radial=x-center;if(radial.Norm()>1e-12){const double radialAngle=std::atan2(radial.E,radial.N);
-            const double course=radialAngle+(k>0?Pi/2:-Pi/2);const double angular=Mod2Pi((k>0?1:-1)*(course-seg.StartPose.CourseRad));
+            const double course=radialAngle+(k>0?Pi/2:-Pi/2);double angular=Mod2Pi((k>0?1:-1)*(course-seg.StartPose.CourseRad));
+            // Mod2Pi lands in [0,2pi), so a point at (or just before) the arc START wraps to ~2pi and
+            // would otherwise project onto the arc END. Outside the swept angle, snap to whichever
+            // endpoint is angularly closer -- the standard nearest-point-on-arc rule.
+            const double sweep=seg.LengthM*std::abs(k);
+            if(angular>sweep){const double pastEnd=angular-sweep,backToStart=2.0*Pi-angular;angular=backToStart<pastEnd?0.0:sweep;}
             local=Clamp(angular/std::abs(k),lo,hi);}}
     const Pose2 p=Advance(seg.StartPose,seg.Type,local,RadiusM);o.S=seg.StartS+local;o.DistanceM=(x-p.Position).Norm();o.bValid=Finite(o.DistanceM);return o;
 }
