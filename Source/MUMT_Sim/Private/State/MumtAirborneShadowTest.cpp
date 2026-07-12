@@ -26,6 +26,7 @@
 #include "FormationControlV2/FormationGuidanceCoordinatorV2.h"
 #include "FormationControlV2/F16StickAdapterV2.h"
 #include "FormationControlV2/PlannerV2Adapters.h"
+#include "FormationControlV2/SlotLocalPathPrimitiveV2.h"
 #include "Tests/AutomationEditorCommon.h"
 #include "Editor.h"
 #include "Engine/Engine.h"
@@ -41,7 +42,9 @@ DEFINE_LOG_CATEGORY_STATIC(LogMumtAir, Display, All);
 
 namespace
 {
-constexpr double FT_TO_M = 0.3048;
+// Unity builds concatenate this TU with MumtLiveSnapshotTest.cpp, which has its own anonymous
+// namespace; identically-named helpers would collide there. Keep these names TU-distinct.
+constexpr double kAirFtToM = 0.3048;
 constexpr double kDtS = 1.0 / 60.0;
 const TCHAR *kAirMap = TEXT("/Game/RL_2");
 constexpr double kMaxWallSeconds = 420.0;   // hard cap for the whole observation
@@ -49,7 +52,20 @@ constexpr double kMaxSimSeconds  = 300.0;   // covers takeoff + all scripted pha
 // Single reset generation for the whole observation: the canonical conversion, the slot, the
 // guidance coordinator and the stick adapter must all agree, or the coordinator rejects the frame.
 constexpr uint32 kResetGen = 1u;
-static bool IsFin(double x) { return std::isfinite(x); }
+static bool AirIsFin(double x) { return std::isfinite(x); }
+
+// Frame populations. Every observed sample lands in exactly one of these — see the accounting
+// assertion (Unclassified must be 0).
+enum class EFramePop : uint8 { Initial, Feasible, Infeasible, Boundary, InvalidInput, Unclassified };
+
+// Which acceptance contract this run grades. All three observe the SAME frames and log the SAME
+// populations; they differ only in which population they grade and which assertions they raise.
+enum class EAcceptance : uint8 { PlannerFeasible, EnvelopeRejection, FullControl };
+
+// The settling window used to grade convergence: the last 20% of a feasible run.
+constexpr double kSettlingWindowFraction = 0.20;
+// Recovery must happen within this many frames after feasibility returns.
+constexpr int32 kMaxRecoveryFrames = 90;   // 1.5 s at 60 Hz
 
 // One shadow chain (adapters are per-aircraft, proving instance independence).
 struct FShadowChain
@@ -95,8 +111,40 @@ struct FAirState
 	int32 ModeTransitions = 0, ReplanCount = 0, HeldPathFrames = 0, ZeroTangentFrames = 0;
 	uint8 LastMode = 255; uint32 ReplanReasonMask = 0;
 	int32 TypeCount[7] = {0,0,0,0,0,0,0};
-	int32 PlannerFailCount[16] = {0};   // indexed by PlannerFailure
+	// ---- near-field / candidate-storm observation ----
+	int32 ModeFrames[5] = {0,0,0,0,0};          // Rejoin, NearFieldSlotTrack, CaptureEntry, ClosureTaper, SlotHold
+	int32 CandidateEvaluations = 0, MaxConsecutiveCandidateFailures = 0, SlotTrackFrames = 0;
+	uint32 CandidateRejectMask = 0;
+	double NfTargetEasMin = 1e9, NfTargetEasMax = -1e9;
+	double InitialAbsAlong = -1.0, InitialAbsCross = -1.0, BestAbsAlong = 1e9, BestAbsCross = 1e9;
+	// Histogram is sized off the enum sentinel, so a newly added PlannerFailure can never fall
+	// outside the reporting range again.
+	int32 PlannerFailCount[FormationControlV2::kPlannerFailureCount] = {0};
 	int32 GuidanceFailCount[16] = {0};  // indexed by EGuidanceFailureV2
+
+	// ---- frame populations (authoritative shared turn-bound contract) ----
+	// total == Initial + Feasible + Infeasible + Boundary + InvalidInput, and Unclassified == 0.
+	int32 PopInitial = 0, PopFeasible = 0, PopInfeasible = 0, PopBoundary = 0, PopInvalidInput = 0, PopUnclassified = 0;
+
+	// feasible-population acceptance
+	int32 FeasValid = 0, FeasInvalid = 0, FeasCandidateFail = 0, FeasCurvInfeasible = 0;
+	int32 FeasStale = 0, FeasNonFinite = 0, FeasGenMismatch = 0, FeasExactPoseDubins = 0;
+	int32 FeasModeFrames[5] = {0,0,0,0,0};
+	double FeasFirstAbsCross = -1.0, FeasFirstAbsAlong = -1.0;
+	TArray<double> FeasAbsCross, FeasAbsAlong;   // per valid feasible frame, in order (settling window)
+
+	// infeasible-population rejection acceptance
+	int32 InfCurvInfeasible = 0, InfOtherFailure = 0, InfFalseAccept = 0, InfCandidateFail = 0;
+	int32 InfPathValid = 0, InfTargetEasValid = 0, InfStale = 0, InfGuidanceReady = 0, InfStickReady = 0;
+	int32 InfRun = 0, InfLongestRun = 0;
+	int32 RecoveryFrames = -1, MaxRecoveryFrames = 0;   // frames from last infeasible frame to next valid
+	int32 InfByLeaderRate[4] = {0,0,0,0};               // <1, 1-2.5, 2.5-3.5, >3.5 deg/s
+	int32 FalseReject = 0;                              // feasible frame rejected as SlotCurvatureInfeasible
+	int32 CurvClampViolations = 0;                      // |output curvature| > 1/Rmin on ANY valid frame
+
+	// boundary-population
+	int32 BndRun = 0, BndLongestRun = 0, BndStale = 0, BndNonFinite = 0, BndPartial = 0, BndContradiction = 0;
+	int32 BndModeChanges = 0; uint8 BndLastMode = 255;
 
 	// ---- guidance ----
 	double RollRefMin = 1e9, RollRefMax = -1e9, PitchRefMin = 1e9, PitchRefMax = -1e9, ThrRefMin = 1e9, ThrRefMax = -1e9;
@@ -119,7 +167,7 @@ struct FAirState
 	TArray<FString> Csv;
 };
 
-static UWorld *GetPIEWorld()
+static UWorld *GetAirPIEWorld()
 {
 	if (!GEditor) return nullptr;
 	for (const FWorldContext &C : GEditor->GetWorldContexts())
@@ -145,7 +193,8 @@ static FormationControlV2::FNavigationRawSnapshotV2 ToRaw(const FJsbFlightSnapsh
 class FMumtAirborneSampleCommand : public IAutomationLatentCommand
 {
 public:
-	FMumtAirborneSampleCommand(FAutomationTestBase *T, TSharedPtr<FAirState> S) : Test(T), St(S) {}
+	FMumtAirborneSampleCommand(FAutomationTestBase *T, TSharedPtr<FAirState> S, EAcceptance InMode)
+		: Test(T), St(S), Mode(InMode) {}
 
 	virtual bool Update() override
 	{
@@ -153,7 +202,7 @@ public:
 		if (St->FirstWall < 0) St->FirstWall = NowWall;
 		if (!IsInGameThread()) St->bGameThread = false;
 
-		UWorld *World = GetPIEWorld();
+		UWorld *World = GetAirPIEWorld();
 		if (!World) { if (NowWall - St->FirstWall > 60.0) { Test->AddError(TEXT("[AIR] no PIE world")); return Finalize(); } return false; }
 
 		if (!St->bDiscovered)
@@ -200,7 +249,7 @@ public:
 
 		if (!St->bFrameSet)
 		{
-			St->Frame.SetOrigin({LS.GeodeticLatitudeRad, LS.LongitudeRad, LS.GeodeticAltitudeFt * FT_TO_M, 1u, true});
+			St->Frame.SetOrigin({LS.GeodeticLatitudeRad, LS.LongitudeRad, LS.GeodeticAltitudeFt * kAirFtToM, 1u, true});
 			St->bFrameSet = true; St->FirstSimTime = FS.SimTimeSec;
 		}
 		// sample only when the follower's sim time advanced (JSBSim stepped)
@@ -240,8 +289,8 @@ public:
 		SI.ThrottleReferenceNorm = GO.ThrottleReferenceNorm; SI.bGuidanceValid = GO.bCommandReady;
 		SI.CurrentRollRad = FSt.Roll_rad; SI.CurrentPitchRad = FSt.Pitch_rad; SI.bAttitudeValid = FSt.bAttitudeValid;
 		SI.BodyRollRateRadps = FS.BodyRollRatePRadps; SI.BodyPitchRateRadps = FS.BodyPitchRateQRadps; SI.BodyYawRateRadps = FS.BodyYawRateRRadps;
-		SI.bBodyRatesValid = IsFin(FS.BodyRollRatePRadps) && IsFin(FS.BodyPitchRateQRadps) && IsFin(FS.BodyYawRateRRadps);
-		SI.AlphaRad = FS.AlphaRad; SI.BetaRad = FS.BetaRad; SI.bAlphaBetaValid = IsFin(FS.AlphaRad) && IsFin(FS.BetaRad);
+		SI.bBodyRatesValid = AirIsFin(FS.BodyRollRatePRadps) && AirIsFin(FS.BodyPitchRateQRadps) && AirIsFin(FS.BodyYawRateRRadps);
+		SI.AlphaRad = FS.AlphaRad; SI.BetaRad = FS.BetaRad; SI.bAlphaBetaValid = AirIsFin(FS.AlphaRad) && AirIsFin(FS.BetaRad);
 		SI.EasMps = FSt.EquivalentAirspeed_mps; SI.TasMps = FSt.TrueAirspeed_mps; SI.bAirspeedValid = FSt.bEasValid && FSt.bTasValid;
 		SI.SimulationTimeS = FS.SimTimeSec; SI.DtS = kDtS; SI.bPaused = FSt.bPaused; SI.ResetGeneration = GO.ResetGeneration;
 		const auto SO = St->FollowerChain.Stick.Update(SI, St->StickConfig);
@@ -290,12 +339,120 @@ public:
 		St->MaxAbsWind = FMath::Max(St->MaxAbsWind, FNav.WindNE_mps.Norm());
 		if (FSt.EquivalentAirspeed_mps > 40.0) St->AirborneSamples++;
 
+		// candidate-evaluation observation runs on EVERY frame, valid or not: a replan storm shows up
+		// precisely on the frames where the planner failed to select a candidate.
+		St->CandidateEvaluations = FMath::Max(St->CandidateEvaluations, D.CandidateEvaluationCount);
+		St->MaxConsecutiveCandidateFailures = FMath::Max(St->MaxConsecutiveCandidateFailures, D.ConsecutiveCandidateFailures);
+		St->CandidateRejectMask |= D.LastCandidateRejectMask;
+		if (D.bSlotLocalPath) St->SlotTrackFrames++;
+		{
+			const int mi = (int)PO.Mode;
+			if (mi >= 0 && mi < 5) St->ModeFrames[mi]++;
+		}
+
+		// ---------------- frame population (AUTHORITATIVE shared turn-bound contract) ----------------
+		// The classification uses FormationControlV2::ClassifySlotCurvature — the SAME function the
+		// production primitive rejects with. This test never re-derives Rmin, the bank limit or the
+		// safety factor, and never applies a threshold of its own to let the planner through.
+		using FPF = FormationControlV2::PlannerFailure;
+		using FCC = FormationControlV2::SlotCurvatureClassV2;
+		const bool bAirborneNow = FSt.EquivalentAirspeed_mps > 40.0;
+		EFramePop Pop = EFramePop::Unclassified;
+		if (!bAirborneNow || St->Samples <= 1) {
+			Pop = EFramePop::Initial;                                  // on-ground / first sample after reset
+		} else if (PO.Failure == FPF::Paused || PO.Failure == FPF::AbnormalDt ||
+		           PO.Failure == FPF::CriticalInputInvalid || PO.Failure == FPF::TurnBoundInvalid ||
+		           PO.Failure == FPF::SlotCurvatureUnavailable || !D.bTurnBoundValid) {
+			Pop = EFramePop::InvalidInput;                             // input-contract failures
+		} else {
+			switch ((FCC)D.SlotCurvatureClass) {
+			case FCC::Feasible:             Pop = EFramePop::Feasible;   break;
+			case FCC::Infeasible:           Pop = EFramePop::Infeasible; break;
+			case FCC::Boundary:             Pop = EFramePop::Boundary;   break;
+			// No usable slot curvature but the straight assumption is on => effective kappa 0,
+			// which is trivially inside any positive turn bound.
+			case FCC::CurvatureUnavailable: Pop = EFramePop::Feasible;   break;
+			}
+		}
+		switch (Pop) {
+		case EFramePop::Initial:      St->PopInitial++;      break;
+		case EFramePop::Feasible:     St->PopFeasible++;     break;
+		case EFramePop::Infeasible:   St->PopInfeasible++;   break;
+		case EFramePop::Boundary:     St->PopBoundary++;     break;
+		case EFramePop::InvalidInput: St->PopInvalidInput++; break;
+		default:                      St->PopUnclassified++; break;
+		}
+
+		// curvature clamp check applies to EVERY valid frame, in every population: the planner must
+		// never emit a path tighter than the bound it itself computed.
+		if (PO.bValid && PO.bPathValid && D.bTurnBoundValid && D.RminM > 0) {
+			if (FMath::Abs(PO.Path.SignedCurvaturePerM) > 1.0 / D.RminM + 1e-9) St->CurvClampViolations++;
+		}
+		// A "stale" output is any invalid frame still carrying path or speed content.
+		const bool bStaleNow = !PO.bValid && (PO.bPathValid || PO.bTargetEasValid || PO.TargetEasMps != 0.0);
+
+		if (Pop == EFramePop::Feasible) {
+			if (PO.bValid) St->FeasValid++; else St->FeasInvalid++;
+			if (PO.Failure == FPF::CandidateSelectionFailed) St->FeasCandidateFail++;
+			if (PO.Failure == FPF::SlotCurvatureInfeasible) { St->FeasCurvInfeasible++; St->FalseReject++; }
+			if (bStaleNow) St->FeasStale++;
+			if (D.bNearFieldExactPoseDubinsCalled) St->FeasExactPoseDubins++;
+			const int fmi = (int)PO.Mode; if (fmi >= 0 && fmi < 5) St->FeasModeFrames[fmi]++;
+			if (PO.bValid) {
+				if (!AirIsFin(PO.Path.Position.N) || !AirIsFin(PO.Path.Position.E) ||
+				    !AirIsFin(PO.Path.UnitTangent.N) || !AirIsFin(PO.Path.SignedCurvaturePerM) ||
+				    !AirIsFin(PO.TargetEasMps)) St->FeasNonFinite++;
+				if (!PO.bPathValid || !PO.bTargetEasValid) St->FeasGenMismatch++;   // path/TargetEAS must agree
+				if (St->FeasFirstAbsCross < 0) { St->FeasFirstAbsCross = FMath::Abs(D.CrossErrorM); St->FeasFirstAbsAlong = FMath::Abs(D.AlongErrorM); }
+				St->FeasAbsCross.Add(FMath::Abs(D.CrossErrorM));
+				St->FeasAbsAlong.Add(FMath::Abs(D.AlongErrorM));
+			}
+		} else if (Pop == EFramePop::Infeasible) {
+			if (PO.bValid) St->InfFalseAccept++;
+			if (PO.Failure == FPF::SlotCurvatureInfeasible) St->InfCurvInfeasible++;
+			else if (!PO.bValid) St->InfOtherFailure++;
+			if (PO.Failure == FPF::CandidateSelectionFailed) St->InfCandidateFail++;
+			if (PO.bPathValid) St->InfPathValid++;
+			if (PO.bTargetEasValid) St->InfTargetEasValid++;
+			if (bStaleNow) St->InfStale++;
+			if (GO.bCommandReady) St->InfGuidanceReady++;
+			if (SO.bValid) St->InfStickReady++;
+			// phase correspondence: leader course rate implied by the slot curvature it is flying
+			const double leaderRateDps = FMath::RadiansToDegrees(FMath::Abs(D.SlotCurvaturePerM) * D.SlotGroundSpeedMps);
+			const int band = leaderRateDps < 1.0 ? 0 : (leaderRateDps < 2.5 ? 1 : (leaderRateDps < 3.5 ? 2 : 3));
+			St->InfByLeaderRate[band]++;
+			St->InfRun++; St->InfLongestRun = FMath::Max(St->InfLongestRun, St->InfRun);
+			St->RecoveryFrames = 0;   // start counting recovery on the next feasible/valid frame
+		} else if (Pop == EFramePop::Boundary) {
+			St->BndRun++; St->BndLongestRun = FMath::Max(St->BndLongestRun, St->BndRun);
+			if (bStaleNow) St->BndStale++;
+			if (PO.bValid && (!PO.bPathValid || !PO.bTargetEasValid)) St->BndContradiction++;
+			if (!PO.bValid && (PO.bPathValid || PO.bTargetEasValid)) St->BndPartial++;
+			if (PO.bValid && (!AirIsFin(PO.TargetEasMps) || !AirIsFin(PO.Path.SignedCurvaturePerM))) St->BndNonFinite++;
+			const uint8 bm = (uint8)PO.Mode;
+			if (St->BndLastMode != 255 && bm != St->BndLastMode) St->BndModeChanges++;
+			St->BndLastMode = bm;
+		}
+		if (Pop != EFramePop::Infeasible) St->InfRun = 0;
+		if (Pop != EFramePop::Boundary) St->BndRun = 0;
+		// recovery latency: once feasibility returns, how long until the planner is valid again
+		if (St->RecoveryFrames >= 0 && Pop != EFramePop::Infeasible) {
+			if (PO.bValid) { St->MaxRecoveryFrames = FMath::Max(St->MaxRecoveryFrames, St->RecoveryFrames); St->RecoveryFrames = -1; }
+			else St->RecoveryFrames++;
+		}
+
 		if (PO.bValid) {
 			St->PlannerValid++;
+			if (PO.Mode == FormationControlV2::PlannerMode::NearFieldSlotTrack) {
+				St->NfTargetEasMin = FMath::Min(St->NfTargetEasMin, PO.TargetEasMps);
+				St->NfTargetEasMax = FMath::Max(St->NfTargetEasMax, PO.TargetEasMps);
+			}
 			const double tn = PO.Path.UnitTangent.Norm();
-			if (!IsFin(tn) || tn < 1e-6) St->ZeroTangentFrames++;
+			if (!AirIsFin(tn) || tn < 1e-6) St->ZeroTangentFrames++;
 			St->AlongMin = FMath::Min(St->AlongMin, D.AlongErrorM); St->AlongMax = FMath::Max(St->AlongMax, D.AlongErrorM);
 			St->CrossMin = FMath::Min(St->CrossMin, D.CrossErrorM); St->CrossMax = FMath::Max(St->CrossMax, D.CrossErrorM);
+			if (St->InitialAbsAlong < 0) { St->InitialAbsAlong=FMath::Abs(D.AlongErrorM); St->InitialAbsCross=FMath::Abs(D.CrossErrorM); }
+			St->BestAbsAlong=FMath::Min(St->BestAbsAlong,FMath::Abs(D.AlongErrorM));St->BestAbsCross=FMath::Min(St->BestAbsCross,FMath::Abs(D.CrossErrorM));
 			St->CurvMin = FMath::Min(St->CurvMin, PO.Path.SignedCurvaturePerM); St->CurvMax = FMath::Max(St->CurvMax, PO.Path.SignedCurvaturePerM);
 			St->TgtEasMin = FMath::Min(St->TgtEasMin, PO.TargetEasMps); St->TgtEasMax = FMath::Max(St->TgtEasMax, PO.TargetEasMps);
 			if (Dto.Tecs.bTargetAltitudeValid) { St->TgtAltMin = FMath::Min(St->TgtAltMin, Dto.Tecs.TargetAltitudeAslM); St->TgtAltMax = FMath::Max(St->TgtAltMax, Dto.Tecs.TargetAltitudeAslM); }
@@ -307,7 +464,8 @@ public:
 			const int ti = (int)D.SelectedType; if (ti >= 0 && ti < 7) St->TypeCount[ti]++;
 		} else {
 			St->PlannerInvalid++;
-			const int fi = (int)PO.Failure; if (fi >= 0 && fi < 16) St->PlannerFailCount[fi]++;
+			const int fi = (int)PO.Failure;
+			if (fi >= 0 && fi < (int)FormationControlV2::kPlannerFailureCount) St->PlannerFailCount[fi]++;
 			if (!SO.bValid) St->StickNotReadyOnPlannerInvalid++;
 		}
 		if (!GO.bCommandReady) { const int gi2 = (int)GO.FailureReason; if (gi2 >= 0 && gi2 < 16) St->GuidanceFailCount[gi2]++; }
@@ -323,14 +481,14 @@ public:
 			St->FeasMin = FMath::Min(St->FeasMin, GO.WindFeasibility); St->FeasMax = FMath::Max(St->FeasMax, GO.WindFeasibility);
 			if (GO.UnderspeedRatio > 0.0) St->UnderspeedFrames++;
 			if (GO.FastDescendRatio > 0.0) St->FastDescendFrames++;
-			St->bAllFinite &= IsFin(GO.RollReferenceRad) && IsFin(GO.PitchReferenceRad) && IsFin(GO.ThrottleReferenceNorm) &&
-			                  IsFin(GO.LateralAccelerationTotalMps2) && IsFin(GO.WindFeasibility);
+			St->bAllFinite &= AirIsFin(GO.RollReferenceRad) && AirIsFin(GO.PitchReferenceRad) && AirIsFin(GO.ThrottleReferenceNorm) &&
+			                  AirIsFin(GO.LateralAccelerationTotalMps2) && AirIsFin(GO.WindFeasibility);
 		}
 
 		if (SO.bValid) {
 			St->StickValid++; St->InvalidRun = 0;
 			if (SO.ResetGeneration != GO.ResetGeneration) St->bResetGenOk = false;
-			St->bAllFinite &= IsFin(SO.AileronCmdNorm) && IsFin(SO.ElevatorCmdNorm) && IsFin(SO.RudderCmdNorm) && IsFin(SO.ThrottleCmdNorm);
+			St->bAllFinite &= AirIsFin(SO.AileronCmdNorm) && AirIsFin(SO.ElevatorCmdNorm) && AirIsFin(SO.RudderCmdNorm) && AirIsFin(SO.ThrottleCmdNorm);
 			St->bAllInRange &= SO.AileronCmdNorm >= -1 && SO.AileronCmdNorm <= 1 && SO.ElevatorCmdNorm >= -1 && SO.ElevatorCmdNorm <= 1 &&
 			                   SO.RudderCmdNorm >= -1 && SO.RudderCmdNorm <= 1 && SO.ThrottleCmdNorm >= 0 && SO.ThrottleCmdNorm <= 1;
 			St->AilMin = FMath::Min(St->AilMin, SO.AileronCmdNorm); St->AilMax = FMath::Max(St->AilMax, SO.AileronCmdNorm);
@@ -426,16 +584,32 @@ private:
 			St->PlannerValid, St->PlannerInvalid, St->AlongMin, St->AlongMax, St->CrossMin, St->CrossMax, St->CurvMin, St->CurvMax,
 			St->TgtEasMin, St->TgtEasMax, St->TgtAltMin, St->TgtAltMax, St->ModeTransitions, St->ReplanCount, St->ReplanReasonMask, St->HeldPathFrames, St->ZeroTangentFrames,
 			St->TypeCount[0], St->TypeCount[1], St->TypeCount[2], St->TypeCount[3], St->TypeCount[4], St->TypeCount[5], St->TypeCount[6]);
+		UE_LOG(LogMumtAir, Display, TEXT("[AIRSHADOW] nearfield modeFrames(Rejoin/NearFieldSlotTrack/CaptureEntry/ClosureTaper/SlotHold)=%d/%d/%d/%d/%d candidateEvaluations=%d maxConsecutiveCandidateFailures=%d lastRejectMask=0x%02x slotTrackFrames=%d nfTargetEas=[%.1f..%.1f] evalPerValidUpdateHz=%.2f"),
+			St->ModeFrames[0], St->ModeFrames[1], St->ModeFrames[2], St->ModeFrames[3], St->ModeFrames[4],
+			St->CandidateEvaluations, St->MaxConsecutiveCandidateFailures, St->CandidateRejectMask, St->SlotTrackFrames,
+			St->NfTargetEasMin, St->NfTargetEasMax, (double)St->CandidateEvaluations / span);
 		UE_LOG(LogMumtAir, Display, TEXT("[AIRSHADOW] guidance valid=%d roll=[%.5f..%.5f] pitch=[%.5f..%.5f] throttle=[%.4f..%.4f] ff=[%.3f..%.3f] fb=[%.3f..%.3f] total=[%.3f..%.3f] feasibility=[%.4f..%.4f] underspeedFrames=%d fastDescendFrames=%d"),
 			St->GuidanceValid, St->RollRefMin, St->RollRefMax, St->PitchRefMin, St->PitchRefMax, St->ThrRefMin, St->ThrRefMax,
 			St->FfMin, St->FfMax, St->FbMin, St->FbMax, St->LatMin, St->LatMax, St->FeasMin, St->FeasMax, St->UnderspeedFrames, St->FastDescendFrames);
 		UE_LOG(LogMumtAir, Display, TEXT("[AIRSHADOW] stick valid=%d leaderStickValid=%d aileron=[%.6f..%.6f] elevator=[%.6f..%.6f] rudder=[%.6f..%.6f] throttle=[%.6f..%.6f] satFrames=%d satRatio=%.4f maxSatRunS=%.2f slewFrames=%d"),
 			St->StickValid, St->LeaderStickValid, St->AilMin, St->AilMax, St->ElevMin, St->ElevMax, St->RudMin, St->RudMax, St->ThrCmdMin, St->ThrCmdMax,
 			St->SatFrames, satRatio, St->MaxSatRun * kDtS, St->SlewFrames);
-		UE_LOG(LogMumtAir, Display, TEXT("[AIRSHADOW] plannerFailures None/Paused/AbnormalDt/CriticalInput/TurnBound/PredRefresh/HeldExpired/Projection/Candidate/RejoinTO/CaptureTO/TaperTO/Wind/Ratio/Decel=%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d"),
-			St->PlannerFailCount[0], St->PlannerFailCount[1], St->PlannerFailCount[2], St->PlannerFailCount[3], St->PlannerFailCount[4],
-			St->PlannerFailCount[5], St->PlannerFailCount[6], St->PlannerFailCount[7], St->PlannerFailCount[8], St->PlannerFailCount[9],
-			St->PlannerFailCount[10], St->PlannerFailCount[11], St->PlannerFailCount[12], St->PlannerFailCount[13], St->PlannerFailCount[14]);
+		// Printed straight off the enum sentinel: adding a PlannerFailure can never again leave a
+		// failure out of the report (which is exactly how SlotCurvatureInfeasible stayed invisible).
+		static_assert(FormationControlV2::kPlannerFailureCount == 18,
+			"PlannerFailure changed: update kPlannerFailureNames below to match the enum.");
+		static const TCHAR *kPlannerFailureNames[FormationControlV2::kPlannerFailureCount] = {
+			TEXT("None"), TEXT("Paused"), TEXT("AbnormalDt"), TEXT("CriticalInput"), TEXT("TurnBound"),
+			TEXT("PredRefresh"), TEXT("HeldExpired"), TEXT("Projection"), TEXT("Candidate"), TEXT("RejoinTO"),
+			TEXT("CaptureTO"), TEXT("TaperTO"), TEXT("Wind"), TEXT("Ratio"), TEXT("Decel"),
+			TEXT("SlotPathInvalid"), TEXT("SlotCurvUnavail"), TEXT("SlotCurvInfeasible")
+		};
+		{
+			FString FailLine;
+			for (int32 k = 0; k < (int32)FormationControlV2::kPlannerFailureCount; ++k)
+				FailLine += FString::Printf(TEXT("%s=%d "), kPlannerFailureNames[k], St->PlannerFailCount[k]);
+			UE_LOG(LogMumtAir, Display, TEXT("[AIRSHADOW] plannerFailures %s"), *FailLine);
+		}
 		UE_LOG(LogMumtAir, Display, TEXT("[AIRSHADOW] guidanceFailures None/Disabled/Shadow/Paused/ResetFrame/InvFollower/InvDto/InvWind/InvTime/OriginMis/ResetMis/ZeroTan/NonFinIn/NonFinOut=%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d"),
 			St->GuidanceFailCount[0], St->GuidanceFailCount[1], St->GuidanceFailCount[2], St->GuidanceFailCount[3], St->GuidanceFailCount[4],
 			St->GuidanceFailCount[5], St->GuidanceFailCount[6], St->GuidanceFailCount[7], St->GuidanceFailCount[8], St->GuidanceFailCount[9],
@@ -443,12 +617,52 @@ private:
 		UE_LOG(LogMumtAir, Display, TEXT("[AIRSHADOW] signs rollChecks=%d rollViolations=%d (+err/+ail=%d, -err/-ail=%d) pitchChecks=%d pitchViolations=%d (+err/-elev=%d, -err/+elev=%d)"),
 			St->RollSignChecks, St->RollSignViolations, St->PosRollErrPosAil, St->NegRollErrNegAil,
 			St->PitchSignChecks, St->PitchSignViolations, St->PosPitchErrNegElev, St->NegPitchErrPosElev);
+		UE_LOG(LogMumtAir, Display, TEXT("[AIRSHADOW] KNOWN_BLOCKER_TECS_PITCH pitchRef=[%.6f..%.6f] checks=%d violations=%d positiveCoverage=%d negativeCoverage=%d elevatorSatFrames=%d maxSatRunS=%.2f"),St->PitchRefMin,St->PitchRefMax,St->PitchSignChecks,St->PitchSignViolations,St->PosPitchErrNegElev,St->NegPitchErrPosElev,St->SatFrames,St->MaxSatRun*kDtS);
 		UE_LOG(LogMumtAir, Display, TEXT("[AIRSHADOW] invariants finite=%d inRange=%d slewOk=%d noStale=%d resetGenOk=%d plannerInvalid->stickNotReady=%d/%d longestInvalidS=%.2f validUpdateHz=%.1f commandWrites=0 fcsCmdNormWrites=0 newComponents=0 newFdm=0"),
 			St->bAllFinite, St->bAllInRange, St->bSlewOk, St->bNoStale, St->bResetGenOk,
 			St->StickNotReadyOnPlannerInvalid, St->PlannerInvalid, St->MaxInvalidRun * kDtS, (double)St->StickValid / span);
 
+		// ---- frame-population accounting (shared authoritative contract) ----
+		const int32 PopTotal = St->PopInitial + St->PopFeasible + St->PopInfeasible + St->PopBoundary + St->PopInvalidInput;
+		// settling window: mean |cross| / |along| over the last kSettlingWindowFraction of feasible frames
+		auto TailMean = [](const TArray<double> &V) -> double {
+			if (V.Num() == 0) return -1.0;
+			const int32 N = FMath::Max(1, (int32)(V.Num() * kSettlingWindowFraction));
+			double s = 0.0; for (int32 k = V.Num() - N; k < V.Num(); ++k) s += V[k];
+			return s / N;
+		};
+		auto HeadMean = [](const TArray<double> &V) -> double {
+			if (V.Num() == 0) return -1.0;
+			const int32 N = FMath::Max(1, (int32)(V.Num() * kSettlingWindowFraction));
+			double s = 0.0; for (int32 k = 0; k < N; ++k) s += V[k];
+			return s / N;
+		};
+		const double CrossHead = HeadMean(St->FeasAbsCross), CrossTail = TailMean(St->FeasAbsCross);
+		const double AlongHead = HeadMean(St->FeasAbsAlong), AlongTail = TailMean(St->FeasAbsAlong);
+		const double FeasAvail = St->PopFeasible > 0 ? (double)St->FeasValid / (double)St->PopFeasible : 0.0;
+
+		UE_LOG(LogMumtAir, Display, TEXT("[AIRSHADOW] populations total=%d = initial=%d + feasible=%d + infeasible=%d + boundary=%d + invalidInput=%d | unclassified=%d accountingOk=%d"),
+			St->Samples, St->PopInitial, St->PopFeasible, St->PopInfeasible, St->PopBoundary, St->PopInvalidInput,
+			St->PopUnclassified, PopTotal == St->Samples);
+		UE_LOG(LogMumtAir, Display, TEXT("[AIRSHADOW] feasible valid=%d invalid=%d availability=%.5f candidateFail=%d curvInfeasible(falseReject)=%d stale=%d nonFinite=%d genMismatch=%d exactPoseDubins=%d modeFrames=%d/%d/%d/%d/%d cross=%.1f->%.1f along=%.1f->%.1f"),
+			St->FeasValid, St->FeasInvalid, FeasAvail, St->FeasCandidateFail, St->FeasCurvInfeasible,
+			St->FeasStale, St->FeasNonFinite, St->FeasGenMismatch, St->FeasExactPoseDubins,
+			St->FeasModeFrames[0], St->FeasModeFrames[1], St->FeasModeFrames[2], St->FeasModeFrames[3], St->FeasModeFrames[4],
+			CrossHead, CrossTail, AlongHead, AlongTail);
+		UE_LOG(LogMumtAir, Display, TEXT("[AIRSHADOW] infeasible frames=%d slotCurvInfeasible=%d otherFailure(mismatch)=%d falseAccept=%d candidateFail=%d pathValid=%d tgtEasValid=%d stale=%d guidanceReady=%d stickReady=%d longestRejectionS=%.2f maxRecoveryS=%.2f leaderRateBands(<1/1-2.5/2.5-3.5/>3.5 degps)=%d/%d/%d/%d"),
+			St->PopInfeasible, St->InfCurvInfeasible, St->InfOtherFailure, St->InfFalseAccept, St->InfCandidateFail,
+			St->InfPathValid, St->InfTargetEasValid, St->InfStale, St->InfGuidanceReady, St->InfStickReady,
+			St->InfLongestRun * kDtS, St->MaxRecoveryFrames * kDtS,
+			St->InfByLeaderRate[0], St->InfByLeaderRate[1], St->InfByLeaderRate[2], St->InfByLeaderRate[3]);
+		UE_LOG(LogMumtAir, Display, TEXT("[AIRSHADOW] boundary frames=%d longestRunS=%.2f stale=%d nonFinite=%d partial=%d contradiction=%d modeChanges=%d | curvatureClampViolations=%d"),
+			St->PopBoundary, St->BndLongestRun * kDtS, St->BndStale, St->BndNonFinite, St->BndPartial,
+			St->BndContradiction, St->BndModeChanges, St->CurvClampViolations);
+
 		// ---- assertions ----
 		Test->TestTrue(TEXT("leader and follower JSBSim components found (1 per actor)"), St->bDiscovered && St->MaxCompsPerActor == 1);
+		// Accounting is a hard contract for every mode: no frame may be silently dropped.
+		Test->TestTrue(TEXT("frame accounting closes (no unclassified frames)"),
+			St->PopUnclassified == 0 && PopTotal == St->Samples);
 		Test->TestTrue(TEXT("aircraft actually got airborne (EAS > 40 m/s sustained)"), St->AirborneSamples > 100);
 		Test->TestTrue(TEXT("all valid shadow outputs finite"), St->bAllFinite);
 		Test->TestTrue(TEXT("stick commands within [-1,1] / throttle [0,1]"), St->bAllInRange);
@@ -460,32 +674,100 @@ private:
 		Test->TestTrue(TEXT("all shadow calls on game thread"), St->bGameThread);
 		Test->TestTrue(TEXT("simulation time monotonic"), St->bSimMonotonic);
 		Test->TestTrue(TEXT("roll sign contract holds (+err -> +aileron)"), St->RollSignChecks > 0 && St->RollSignViolations == 0);
-		Test->TestTrue(TEXT("pitch sign contract holds (+err -> -elevator)"), St->PitchSignChecks > 0 && St->PitchSignViolations == 0);
 		Test->TestTrue(TEXT("guidance and stick produced valid airborne updates"), St->GuidanceValid > 100 && St->StickValid > 100);
 		Test->TestTrue(TEXT("per-aircraft shadow instances independent (leader chain ran)"), St->LeaderStickValid > 0);
+		using PM = FormationControlV2::PlannerMode;
+		using PF = FormationControlV2::PlannerFailure;
+
+		if (Mode == EAcceptance::PlannerFeasible) {
+			// Graded ONLY on the feasible population. Infeasible frames are still counted and logged
+			// above (and are graded by the EnvelopeRejection acceptance) — never deleted or hidden.
+			Test->TestTrue(TEXT("feasible sample count sufficient"), St->PopFeasible >= 1000);
+			Test->TestTrue(TEXT("feasible planner availability >= 99.9%"), FeasAvail >= 0.999);
+			Test->TestTrue(TEXT("feasible CandidateSelectionFailed absent"), St->FeasCandidateFail == 0);
+			Test->TestTrue(TEXT("feasible SlotCurvatureInfeasible absent (no false reject)"), St->FeasCurvInfeasible == 0);
+			Test->TestTrue(TEXT("no exact-pose Dubins call in near field"), St->FeasExactPoseDubins == 0);
+			Test->TestTrue(TEXT("feasible outputs finite"), St->FeasNonFinite == 0);
+			Test->TestTrue(TEXT("feasible stale output absent"), St->FeasStale == 0);
+			Test->TestTrue(TEXT("feasible path/TargetEAS validity agree"), St->FeasGenMismatch == 0);
+			Test->TestTrue(TEXT("curvature never exceeds the planner's own turn bound"), St->CurvClampViolations == 0);
+			Test->TestTrue(TEXT("NearFieldSlotTrack observed"), St->FeasModeFrames[(int)PM::NearFieldSlotTrack] > 0);
+			Test->TestTrue(TEXT("ClosureTaper or SlotHold observed"),
+				St->FeasModeFrames[(int)PM::ClosureTaper] + St->FeasModeFrames[(int)PM::SlotHold] > 0);
+			Test->TestTrue(TEXT("cross error improves over the settling window"),
+				St->FeasAbsCross.Num() > 0 && CrossTail <= CrossHead);
+			Test->TestTrue(TEXT("along error improves or tapers"),
+				(St->FeasAbsAlong.Num() > 0 && AlongTail <= AlongHead) || St->FeasModeFrames[(int)PM::ClosureTaper] > 0);
+		} else if (Mode == EAcceptance::EnvelopeRejection) {
+			// Graded ONLY on the infeasible population: the planner must refuse a slot curvature it
+			// cannot fly, and must refuse it CLEANLY — no stale output, no partial path, nothing
+			// downstream ever becomes command-ready, and it must not latch.
+			Test->TestTrue(TEXT("infeasible sample count sufficient"), St->PopInfeasible >= 500);
+			Test->TestTrue(TEXT("every infeasible frame reports SlotCurvatureInfeasible"),
+				St->InfCurvInfeasible == St->PopInfeasible);
+			Test->TestTrue(TEXT("no other PlannerFailure on infeasible frames"), St->InfOtherFailure == 0);
+			Test->TestTrue(TEXT("no false accept (infeasible frame produced valid output)"), St->InfFalseAccept == 0);
+			Test->TestTrue(TEXT("CandidateSelectionFailed absent on infeasible frames"), St->InfCandidateFail == 0);
+			Test->TestTrue(TEXT("rejected frames carry no path"), St->InfPathValid == 0);
+			Test->TestTrue(TEXT("rejected frames carry no TargetEAS"), St->InfTargetEasValid == 0);
+			Test->TestTrue(TEXT("rejected frames emit no stale output"), St->InfStale == 0);
+			Test->TestTrue(TEXT("guidance never command-ready on a rejected frame"), St->InfGuidanceReady == 0);
+			Test->TestTrue(TEXT("stick never command-ready on a rejected frame"), St->InfStickReady == 0);
+			Test->TestTrue(TEXT("no curvature clamp anywhere"), St->CurvClampViolations == 0);
+			Test->TestTrue(TEXT("no false reject in the feasible population"), St->FalseReject == 0);
+			// Phase correspondence: rejection must coincide with a genuinely aggressive leader turn,
+			// never with straight flight. (Turn3 = 3 deg/s, Turn4Climb = 4 deg/s.)
+			Test->TestTrue(TEXT("rejection never occurs in straight leader flight"), St->InfByLeaderRate[0] == 0);
+			Test->TestTrue(TEXT("rejection concentrated in the scripted 3/4 deg/s turns"),
+				St->InfByLeaderRate[2] + St->InfByLeaderRate[3] > 0);
+			// No permanent latch: once feasibility returns, the planner must be valid again quickly.
+			Test->TestTrue(TEXT("planner recovers within bounded dwell (no latch)"),
+				St->MaxRecoveryFrames <= kMaxRecoveryFrames);
+			Test->TestTrue(TEXT("feasible frames still exist after rejection (not latched off)"), St->FeasValid > 0);
+		} else {
+			// FullControl: unchanged. These MUST fail until the TECS pitch loop is configured.
+			Test->TestTrue(TEXT("PitchReference non-constant"), St->PitchRefMax - St->PitchRefMin > 1e-4);
+			Test->TestTrue(TEXT("pitch sign contract holds (+err -> -elevator)"), St->PitchSignChecks > 0 && St->PitchSignViolations == 0);
+			Test->TestTrue(TEXT("pitch response has both non-zero directions"), St->PosPitchErrNegElev > 0 && St->NegPitchErrPosElev > 0);
+			Test->TestTrue(TEXT("no persistent elevator saturation"), St->MaxSatRun * kDtS < 2.0);
+		}
 		return true;
 	}
 
 	FAutomationTestBase *Test;
 	TSharedPtr<FAirState> St;
+	EAcceptance Mode{EAcceptance::FullControl};
 };
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMumtAirborneShadowTest, "MUMT.ControlV2.AirborneShadow",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
-
-bool FMumtAirborneShadowTest::RunTest(const FString & /*Parameters*/)
+// All three acceptances observe the identical shadow run and log the identical populations. They
+// differ only in which population they grade — the frames are never deleted or hidden.
+static void RunAirborneShadow(FAutomationTestBase *T, EAcceptance InMode)
 {
 	// Pre-existing, unrelated Blueprint Construction Script error in F16_UAV / M_F16
 	// ("Set bUseAttachParentBound" -> array-get on None). Content is out of scope and not fixed
 	// here; matched narrowly so it cannot hide any V2 guidance/stick error.
-	AddExpectedErrorPlain(TEXT("bUseAttachParentBound"), EAutomationExpectedErrorFlags::Contains, 0);
+	T->AddExpectedErrorPlain(TEXT("bUseAttachParentBound"), EAutomationExpectedErrorFlags::Contains, 0);
 
 	TSharedPtr<FAirState> State = MakeShared<FAirState>();
 	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(kAirMap));
 	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
-	ADD_LATENT_AUTOMATION_COMMAND(FMumtAirborneSampleCommand(this, State));
+	ADD_LATENT_AUTOMATION_COMMAND(FMumtAirborneSampleCommand(T, State, InMode));
 	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
-	return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMumtAirborneNearFieldPlannerShadowTest, "MUMT.ControlV2.AirborneNearFieldPlannerShadow",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FMumtAirborneNearFieldPlannerShadowTest::RunTest(const FString &)
+{ RunAirborneShadow(this, EAcceptance::PlannerFeasible); return true; }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMumtAirborneNearFieldEnvelopeRejectionShadowTest, "MUMT.ControlV2.AirborneNearFieldEnvelopeRejectionShadow",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FMumtAirborneNearFieldEnvelopeRejectionShadowTest::RunTest(const FString &)
+{ RunAirborneShadow(this, EAcceptance::EnvelopeRejection); return true; }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMumtAirborneFullControlShadowTest, "MUMT.ControlV2.AirborneFullControlShadow",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FMumtAirborneFullControlShadowTest::RunTest(const FString &)
+{ RunAirborneShadow(this, EAcceptance::FullControl); return true; }
 
 #endif // WITH_EDITOR && WITH_DEV_AUTOMATION_TESTS
