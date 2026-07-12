@@ -52,6 +52,9 @@ struct FJsbRawState {
 	double SimTimeSec     = 0.0; // time : FGFDMExec::GetSimTime            [s, monotonic]
 	bool   bHolding       = false; //      FGFDMExec::Holding (sim time frozen = paused)
 	bool   bValidFrame    = true;  // false when the JSBSim objects are unavailable
+	double VehicleCgEcefXFt = 0.0, VehicleCgEcefYFt = 0.0, VehicleCgEcefZFt = 0.0;
+	double EcefVelocityXFps = 0.0, EcefVelocityYFps = 0.0, EcefVelocityZFps = 0.0;
+	double GeodeticLatitudeRad = 0.0, LongitudeRad = 0.0, GeodeticAltitudeFt = 0.0;
 };
 
 // SI / local-NED read-only snapshot consumed by the guidance/energy controllers.

@@ -16,6 +16,12 @@ struct FCanonicalNavigationStateV2 {
     double ClimbRate_mps{};
     double SimulationTimeS{};
     std::uint32_t ResetGeneration{};
+    std::uint32_t OriginGeneration{};
+    double EquivalentAirspeed_mps{};
+    double TrueAirspeed_mps{};
+    Vec2 WindNE_mps{};
+    double EasToTasRatio{1.0};
+    bool bPaused{};
 
     bool bPositionValid{};
     bool bGroundVelocityValid{};
@@ -25,6 +31,7 @@ struct FCanonicalNavigationStateV2 {
     bool bAltitudeValid{};
     bool bClimbRateValid{};
     bool bSimulationTimeValid{};
+    bool bEasValid{}, bTasValid{}, bWindValid{}, bRatioValid{}, bOriginValid{};
 };
 
 struct FFormationSlotCommandV2 {
@@ -70,6 +77,7 @@ struct FFormationSlotStateV2 {
     double StateTimestampS{};
     double StateAgeS{};
     std::uint32_t ResetGeneration{};
+    std::uint32_t OriginGeneration{};
     std::uint64_t SourceSequence{};
 
     bool bPositionValid{};

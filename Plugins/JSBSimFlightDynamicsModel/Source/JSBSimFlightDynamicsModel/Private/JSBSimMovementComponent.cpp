@@ -817,6 +817,17 @@ bool UJSBSimMovementComponent::GetJsbFlightSnapshot(FJsbFlightSnapshot& Out) con
   Out.RollRad        = Propagate->GetEuler(JSBSim::FGJSBBase::ePhi);      // roll  [rad]
   Out.SimTimeSec     = Exec->GetSimTime();                                // sim time [s]
   Out.bHolding       = Exec->Holding();                                   // paused
+  const JSBSim::FGLocation& location = Propagate->GetLocation();
+  const JSBSim::FGColumnVector3 ecefVelocity = Propagate->GetECEFVelocity();
+  Out.VehicleCgEcefXFt = location(1);
+  Out.VehicleCgEcefYFt = location(2);
+  Out.VehicleCgEcefZFt = location(3);
+  Out.EcefVelocityXFps = ecefVelocity(1);
+  Out.EcefVelocityYFps = ecefVelocity(2);
+  Out.EcefVelocityZFps = ecefVelocity(3);
+  Out.GeodeticLatitudeRad = location.GetGeodLatitudeRad();
+  Out.LongitudeRad = location.GetLongitude();
+  Out.GeodeticAltitudeFt = location.GetGeodAltitude();
   return true;
 }
 

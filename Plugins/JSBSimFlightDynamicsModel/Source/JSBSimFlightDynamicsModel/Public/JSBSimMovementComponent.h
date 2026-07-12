@@ -59,6 +59,15 @@ struct FJsbFlightSnapshot
 	double RollRad        = 0.0;   // FGPropagate::GetEuler(ePhi)               [rad]
 	double SimTimeSec     = 0.0;   // FGFDMExec::GetSimTime()                   [s, monotonic]
 	bool   bHolding       = false; // FGFDMExec::Holding()                      [paused]
+	double VehicleCgEcefXFt = 0.0; // FGPropagate::GetLocation()(1)             [ft, ECEF X]
+	double VehicleCgEcefYFt = 0.0; // FGPropagate::GetLocation()(2)             [ft, ECEF Y]
+	double VehicleCgEcefZFt = 0.0; // FGPropagate::GetLocation()(3)             [ft, ECEF Z]
+	double EcefVelocityXFps = 0.0; // FGPropagate::GetECEFVelocity()(1)         [ft/s]
+	double EcefVelocityYFps = 0.0; // FGPropagate::GetECEFVelocity()(2)         [ft/s]
+	double EcefVelocityZFps = 0.0; // FGPropagate::GetECEFVelocity()(3)         [ft/s]
+	double GeodeticLatitudeRad = 0.0; // FGLocation::GetGeodLatitudeRad()       [rad]
+	double LongitudeRad = 0.0;        // FGLocation::GetLongitude()             [rad, east+]
+	double GeodeticAltitudeFt = 0.0;  // FGLocation::GetGeodAltitude()          [ft]
 };
 
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))

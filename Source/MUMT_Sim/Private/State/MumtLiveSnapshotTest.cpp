@@ -23,6 +23,10 @@
 
 #include "JSBSimMovementComponent.h"
 #include "State/MumtControlState.h"
+#include "FormationControlV2/CanonicalNavigationAdapterV2.h"
+#include "FormationControlV2/FormationSlotGeneratorV2.h"
+#include "FormationControlV2/FormationPlannerV2.h"
+#include "FormationControlV2/PlannerV2Adapters.h"
 #include "Tests/AutomationEditorCommon.h" // FEditorLoadMap, FStartPIECommand, FEndPlayMapCommand
 #include "Editor.h"                        // GEditor
 #include "Engine/Engine.h"                 // FWorldContext
@@ -58,6 +62,10 @@ struct FMumtLiveState
 	FString PropEAS, PropTAS, PropAlt, PropClimb, PropPitch, PropRoll, PropTime, PropWindN, PropWindE;
 
 	MumtState::FMumtStateTracker Tracker;
+	FormationControlV2::FCanonicalNavigationTrackerV2 NavTracker;
+	FormationControlV2::FCanonicalNavigationTrackerV2 IndependentTracker;
+	FormationControlV2::MissionNavigationFrameV2 MissionFrame;
+	FormationControlV2::FormationPlannerV2 Planner;
 	double FirstWall = -1.0, FirstValidWall = -1.0;
 	int32  NumValid = 0;
 	double LastSimTime = -1.0, MinSimTime = 0.0, MaxSimTime = 0.0;
@@ -79,6 +87,9 @@ struct FMumtLiveState
 	double DEas = 0, DTas = 0, DAlt = 0, DClimb = 0, DPitch = 0, DRoll = 0, DTime = 0, DWindN = 0, DWindE = 0;
 	// SI diff (adapter SI vs independent calc from property raw)
 	double DEasSI = 0, DTasSI = 0, DAltSI = 0, DClimbSI = 0;
+	double DEcefPositionM = 0, DNedVelocityMps = 0;
+	bool bNavigationFinite = true, bOriginGenerationMatch = true;
+	bool bTrackerIndependent = false, bDtoPipelineObserved = false;
 
 	TArray<FString> Csv;
 };
@@ -127,6 +138,9 @@ public:
 			}
 			if (!S->Comp.IsValid()) { return TimedOut(NowWall, TEXT("no JSBSim component found in map")); }
 			S->bDiscovered = true;
+			// Explicit test-only mission origin; never derived from the first aircraft or Cesium runtime origin.
+			if (!S->MissionFrame.SetOrigin({0.6, 2.2, 100.0, 9001u, true}))
+				return Finalize(TEXT("explicit mission origin invalid"));
 
 			TArray<FString> Catalog;
 			S->Comp->PropertyManagerNode(Catalog);
@@ -229,6 +243,31 @@ public:
 			if (hAlt) S->DAltSI = FMath::Max(S->DAltSI, FMath::Abs(St.AltitudeAsl_m - oAlt * FT_TO_M));
 			if (hClimb) S->DClimbSI = FMath::Max(S->DClimbSI, FMath::Abs(St.ClimbRate_mps - oClimb * FT_TO_M));
 
+			const FVector AircraftEcefM = Comp->AircraftState.ECEFLocation;
+			const FVector SnapshotEcefM(Snap.VehicleCgEcefXFt * FT_TO_M, Snap.VehicleCgEcefYFt * FT_TO_M, Snap.VehicleCgEcefZFt * FT_TO_M);
+			S->DEcefPositionM = FMath::Max(S->DEcefPositionM, FVector::Distance(AircraftEcefM, SnapshotEcefM));
+			FormationControlV2::MissionNavigationFrameV2 CurrentFrame;
+			CurrentFrame.SetOrigin({Snap.GeodeticLatitudeRad, Snap.LongitudeRad, Snap.GeodeticAltitudeFt * FT_TO_M, 1u, true});
+			const auto CurrentNed = CurrentFrame.EcefVelocityToMissionNedMps({Snap.EcefVelocityXFps * FT_TO_M, Snap.EcefVelocityYFps * FT_TO_M, Snap.EcefVelocityZFps * FT_TO_M});
+			if (CurrentNed.bValid) {
+				const FVector PublicNedMps = Comp->AircraftState.VelocityNEDfps * FT_TO_M;
+				const FVector OracleNedMps(CurrentNed.Ned.X, CurrentNed.Ned.Y, CurrentNed.Ned.Z);
+				S->DNedVelocityMps = FMath::Max(S->DNedVelocityMps, FVector::Distance(OracleNedMps, FVector(PublicNedMps.X, PublicNedMps.Y, -PublicNedMps.Z)));
+			} else S->bNavigationFinite = false;
+			FormationControlV2::FNavigationRawSnapshotV2 Raw{};
+			Raw.VehicleCgEcefFt={Snap.VehicleCgEcefXFt,Snap.VehicleCgEcefYFt,Snap.VehicleCgEcefZFt};Raw.EcefVelocityFps={Snap.EcefVelocityXFps,Snap.EcefVelocityYFps,Snap.EcefVelocityZFps};
+			Raw.GeodeticLatitudeRad=Snap.GeodeticLatitudeRad;Raw.LongitudeRad=Snap.LongitudeRad;Raw.GeodeticAltitudeFt=Snap.GeodeticAltitudeFt;Raw.EquivalentAirspeedKts=Snap.VequivalentKTS;Raw.TrueAirspeedFps=Snap.VtFps;Raw.WindNEDFps={Snap.WindNorthFps,Snap.WindEastFps};Raw.AltitudeAslFt=Snap.AltAslFt;Raw.ClimbRateFps=Snap.HdotFps;Raw.SimulationTimeS=Snap.SimTimeSec;Raw.bHolding=Snap.bHolding;Raw.bValidFrame=Snap.bValidFrame;
+			const auto Nav=FormationControlV2::CanonicalNavigationAdapterV2::Convert(Raw,S->MissionFrame,St.ResetGeneration,S->NavTracker);
+			S->bNavigationFinite &= Nav.bPositionValid && Nav.bGroundVelocityValid && Nav.PositionNE_m.IsFinite() && Nav.GroundVelocityNE_mps.IsFinite();
+			S->bOriginGenerationMatch &= Nav.OriginGeneration == 9001u;
+			if (S->NumValid > 1) S->IndependentTracker.Reset();
+			const auto IndependentNav=FormationControlV2::CanonicalNavigationAdapterV2::Convert(Raw,S->MissionFrame,St.ResetGeneration,S->IndependentTracker);
+			if (Nav.bCourseRateValid && !IndependentNav.bCourseRateValid) S->bTrackerIndependent = true;
+			FormationControlV2::FFormationSlotCommandV2 SlotCommand{};SlotCommand.FrontM=-200;SlotCommand.RightM=100;SlotCommand.CommandReceivedSimulationTimeS=Snap.SimTimeSec;SlotCommand.SourceSequence=1;SlotCommand.bValid=true;
+			const auto Slot=FormationControlV2::FormationSlotGeneratorV2::Calculate(Nav,SlotCommand,Snap.SimTimeSec);
+			const auto PlannerInput=FormationControlV2::PlannerV2InputAdapter::Build({Nav,Slot,Snap.SimTimeSec,1.0/60.0});
+			if (PlannerInput.bValid&&!Nav.bPaused){FormationControlV2::FormationPlannerV2Diagnostics Diagnostics{};const auto PlannerOutput=S->Planner.Update(PlannerInput.Input,Diagnostics);const auto Dto=FormationControlV2::PlannerV2OutputAdapter::Build(PlannerOutput,Slot,Nav);if(Dto.Npfg.bValid&&Dto.Tecs.bCommandReady)S->bDtoPipelineObserved=true;}
+
 			S->Csv.Add(FString::Printf(TEXT("%.6f,%llu,%.6f,%.6f,%.4f,%.4f,%.3f,%.3f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.6f,%.4f,%.4f,%.4f,%d,%d"),
 				Snap.SimTimeSec, (unsigned long long)St.SimTimeMicros, Snap.VequivalentKTS, oEAS, Snap.VtFps, oTAS, Snap.AltAslFt, oAlt,
 				Snap.HdotFps, oClimb, Snap.PitchRad, oPitch, Snap.RollRad, oRoll, Snap.WindNorthFps, oWN, Snap.WindEastFps, oWE,
@@ -281,6 +320,8 @@ private:
 			S->DEas, S->DTas, S->DAlt, S->DClimb, S->DPitch, S->DRoll, S->DTime, S->DWindN, S->DWindE);
 		UE_LOG(LogMumtLive, Display, TEXT("[MUMTLIVE] oracleSIMaxDiff EAS=%.6g TAS=%.6g Alt=%.6g Climb=%.6g | maxAbsWindN=%.4g maxAbsWindE=%.4g"),
 			S->DEasSI, S->DTasSI, S->DAltSI, S->DClimbSI, S->MaxAbsWindN, S->MaxAbsWindE);
+		UE_LOG(LogMumtLive, Display, TEXT("[MUMTLIVE] nav origin=(lat=0.6 rad lon=2.2 rad h=100m gen=9001) ecefPosDiff=%.9g m nedVelDiff=%.9g mps finite=%d originGen=%d"), S->DEcefPositionM, S->DNedVelocityMps, S->bNavigationFinite, S->bOriginGenerationMatch);
+		UE_LOG(LogMumtLive, Display, TEXT("[MUMTLIVE] observationalPipeline trackerIndependent=%d dtoObserved=%d commandWrites=0 newComponents=0 newFdm=0"),S->bTrackerIndependent,S->bDtoPipelineObserved);
 
 		if (AbortReason) { Test->AddError(FString::Printf(TEXT("[MUMTLIVE] aborted: %s"), AbortReason)); return true; }
 
@@ -308,6 +349,12 @@ private:
 		if (!S->PropTime.IsEmpty()) Test->TestTrue(TEXT("oracle: snapshot raw == property (SimTime)"), S->DTime < 0.05);
 		Test->TestTrue(TEXT("oracle SI conversion matches independent calc (TAS)"), S->DTasSI < 1e-3);
 		Test->TestTrue(TEXT("oracle SI conversion matches independent calc (Alt)"), S->DAltSI < 1e-3);
+		Test->TestTrue(TEXT("snapshot ECEF position matches existing AircraftState direct getter copy"), S->DEcefPositionM < 1e-3);
+		Test->TestTrue(TEXT("snapshot ECEF velocity rotates to published current-position NED"), S->DNedVelocityMps < 1e-3);
+		Test->TestTrue(TEXT("explicit mission navigation output finite"), S->bNavigationFinite);
+		Test->TestTrue(TEXT("explicit mission origin generation propagated"), S->bOriginGenerationMatch);
+		Test->TestTrue(TEXT("aircraft tracker state is independently resettable"), S->bTrackerIndependent);
+		Test->TestTrue(TEXT("canonical-slot-planner-NPFG/TECS DTO observational pipeline produced valid DTO"), S->bDtoPipelineObserved);
 		return true;
 	}
 

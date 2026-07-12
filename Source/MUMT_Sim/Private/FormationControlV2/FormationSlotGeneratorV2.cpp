@@ -110,6 +110,7 @@ FFormationSlotStateV2 FormationSlotGeneratorV2::Calculate(
     output.StateTimestampS = leader.SimulationTimeS;
     output.StateAgeS = leaderAge < 0.0 ? 0.0 : leaderAge;
     output.ResetGeneration = leader.ResetGeneration;
+    output.OriginGeneration = leader.OriginGeneration;
     output.SourceSequence = command.SourceSequence;
     output.bPositionValid = true;
     output.bGroundVelocityValid = true;
