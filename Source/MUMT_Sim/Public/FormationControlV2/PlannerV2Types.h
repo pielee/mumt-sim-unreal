@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cmath>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 
@@ -12,8 +14,8 @@ constexpr double GravityMps2 = 9.80665;
 
 inline bool Finite(double x) { return std::isfinite(x); }
 inline double Clamp(double x, double lo, double hi) { return x < lo ? lo : (x > hi ? hi : x); }
-inline double WrapPi(double x) { return std::remainder(x, TwoPi); }
 inline double Mod2Pi(double x) { x = std::fmod(x, TwoPi); return x < 0.0 ? x + TwoPi : x; }
+inline double WrapPi(double x) { return Mod2Pi(x + Pi) - Pi; }
 
 struct Vec2 {
     double N{};
@@ -60,6 +62,9 @@ struct ProjectionResult {
     int SegmentIndex{-1};
     ProjectionFailure Failure{ProjectionFailure::None};
     bool bValid{};
+};
+struct ProjectionWindowConfig {
+    double AdvanceFactor{2.0},ForwardMarginM{50.0},MinimumForwardWindowM{100.0},MaximumForwardWindowM{2000.0},MinimumDtS{0.0001},MaximumDtS{0.25};
 };
 
 enum class PredictionModel : std::uint8_t { Straight, ConstantCurvature, StraightAssumedCurvatureUnavailable };
@@ -123,6 +128,72 @@ struct CaptureSpeedOutput {
     double TargetEasMps{};
     SpeedPlanFailure Failure{SpeedPlanFailure::None};
     bool bTargetEasValid{};
+};
+
+enum class PlannerMode : std::uint8_t { Rejoin, CaptureEntry, ClosureTaper, SlotHold };
+enum class GuardTransition : std::uint8_t {
+    RejoinToCapture, CaptureToTaper, CaptureToRejoin, TaperToHold,
+    TaperToCapture, TaperToRejoin, HoldToRejoin, Count
+};
+enum class PlannerFailure : std::uint8_t {
+    None, Paused, AbnormalDt, CriticalInputInvalid, TurnBoundInvalid,
+    PredictionRefreshFailed, HeldPathExpired, ProjectionFailed,
+    CandidateSelectionFailed, RejoinTimeout, CaptureTimeout, TaperTimeout,
+    InvalidWind, InvalidRatio, InvalidDeceleration
+};
+enum ReplanReason : std::uint32_t {
+    ReplanNone=0, TerminalPositionChanged=1u<<0, TerminalHeadingChanged=1u<<1,
+    PathDeviationExceeded=1u<<2, PathExpired=1u<<3, ProjectionFailed=1u<<4,
+    ModeChanged=1u<<5, PredictionRefreshFailed=1u<<6,
+    RemainingPathExhausted=1u<<7, HardCandidateInvalid=1u<<8,
+    ResetGenerationChanged=1u<<9, NoActivePath=1u<<10
+};
+
+struct FormationPlannerV2Input {
+    Vec2 FollowerPositionNE{};
+    Vec2 FollowerGroundVelocityNE{};
+    double FollowerCourseRad{};
+    MovingSlotState Slot{};
+    Vec2 WindVelocityNE{};
+    double EasToTasRatio{1.0};
+    double EquivalentAirspeedMps{};
+    double SimulationTimeS{};
+    double DtS{};
+    std::uint32_t ResetGeneration{};
+    bool bFollowerValid{};
+    bool bCourseValid{};
+    bool bWindValid{};
+    bool bRatioValid{};
+    bool bPaused{};
+};
+
+struct FormationPlannerV2Config {
+    double PlannerBankLimitRad{45.0*Pi/180.0},MinimumTurnRadiusM{100.0},TurnRadiusSafetyFactor{1.25},PlanningSpeedFloorMps{30.0};
+    double PredictionTimeS{2.0},MaximumSlotStateAgeS{0.5}; PredictionConfig Prediction{}; ProjectionWindowConfig Projection{};
+    double ProjectionBacktrackM{20.0},ProjectionFailureDistanceM{150.0};
+    double TerminalPositionReplanM{25.0},TerminalHeadingReplanRad{2.0*Pi/180.0},PathExpirationS{5.0},MinimumReplanIntervalS{0.5},RemainingPathReplanM{50.0};
+    double MaxHeldPathAgeS{2.0},HeldPathMinimumRemainingM{100.0};
+    double MaxPathLengthM{50000.0},MaxCaptureTimeS{120.0},ReferenceGroundSpeedFloorMps{30.0};
+    double CaptureTimeWeight{1.0},CccPenaltyS{4.0},CccAbsoluteAdvantageS{3.0},CccRelativeAdvantage{0.15},CccMinimumHeadingErrorRad{120.0*Pi/180.0},CccMaximumRangeRadiusFactor{6.0};
+    double TypeSwitchAbsoluteAdvantageS{2.0},TypeSwitchRelativeAdvantage{0.10};
+    double DesiredClosureMps{25.0},MaxClosureMps{50.0},SafetyDistanceM{150.0},ConfiguredDecelerationMps2{2.0},MinTargetEasMps{50.0},MaxTargetEasMps{350.0};
+    bool bDecelerationEnvelopeValid{true};
+    double RejoinTimeoutS{0.0},CaptureEntryTimeoutS{30.0},ClosureTaperTimeoutS{20.0};
+};
+
+struct PlannerCandidateCost {
+    DubinsType Type{DubinsType::Invalid}; double TransitTimeS{},ClosureTimeS{},CccPenaltyS{},HeadingExcursionPenaltyS{},TerminalClosurePenaltyS{},TotalS{std::numeric_limits<double>::infinity()}; bool bCsc{},bValid{};
+};
+struct FormationPlannerV2Diagnostics {
+    double AlongErrorM{},CrossErrorM{},RangeM{},PathHeadingErrorRad{},SlotHeadingErrorRad{},RelativeAlongSpeedMps{};
+    double RminM{},ProjectionDistanceM{},StateAgeS{},HeldPathAgeS{},RegeneratedActiveTypeCostS{std::numeric_limits<double>::infinity()},ActivePathRemainingCostS{std::numeric_limits<double>::infinity()};
+    std::array<double,(std::size_t)GuardTransition::Count> GuardDwellS{};
+    std::array<PlannerCandidateCost,6> CandidateCosts{};
+    std::uint32_t ReplanReasons{}; int ReplanCount{}; DubinsType SelectedType{DubinsType::Invalid}; bool bUsingHeldPath{},bCccEligible{},bTypeSwitched{};
+};
+struct FormationPlannerV2Output {
+    PathSample Path{}; double TargetEasMps{}; PlannerMode Mode{PlannerMode::Rejoin}; PlannerFailure Failure{PlannerFailure::None};
+    std::uint64_t PathGeneration{}; double ProgressS{}; bool bPathValid{},bTargetEasValid{},bValid{};
 };
 
 } // namespace FormationControlV2

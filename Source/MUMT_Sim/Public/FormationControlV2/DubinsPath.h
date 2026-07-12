@@ -20,15 +20,6 @@ struct DubinsCandidate {
     bool bValid{};
 };
 
-struct ProjectionWindowConfig {
-    double AdvanceFactor{2.0};
-    double ForwardMarginM{50.0};
-    double MinimumForwardWindowM{100.0};
-    double MaximumForwardWindowM{2000.0};
-    double MinimumDtS{0.0001};
-    double MaximumDtS{0.25};
-};
-
 class DubinsPath {
 public:
     static std::vector<DubinsCandidate> BuildCandidates(const Pose2 &start, const Pose2 &terminal, double radiusM);
