@@ -68,6 +68,11 @@ struct FJsbFlightSnapshot
 	double GeodeticLatitudeRad = 0.0; // FGLocation::GetGeodLatitudeRad()       [rad]
 	double LongitudeRad = 0.0;        // FGLocation::GetLongitude()             [rad, east+]
 	double GeodeticAltitudeFt = 0.0;  // FGLocation::GetGeodAltitude()          [ft]
+	double BodyRollRatePRadps  = 0.0; // FGPropagate::GetPQR(1)                 [rad/s, body P] (NOT Euler-angle rates)
+	double BodyPitchRateQRadps = 0.0; // FGPropagate::GetPQR(2)                 [rad/s, body Q]
+	double BodyYawRateRRadps   = 0.0; // FGPropagate::GetPQR(3)                 [rad/s, body R]
+	double AlphaRad            = 0.0; // FGAuxiliary::Getalpha()                [rad]
+	double BetaRad             = 0.0; // FGAuxiliary::Getbeta()                 [rad]
 };
 
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))

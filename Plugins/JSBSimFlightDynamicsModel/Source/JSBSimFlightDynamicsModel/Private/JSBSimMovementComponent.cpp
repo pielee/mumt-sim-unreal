@@ -828,6 +828,11 @@ bool UJSBSimMovementComponent::GetJsbFlightSnapshot(FJsbFlightSnapshot& Out) con
   Out.GeodeticLatitudeRad = location.GetGeodLatitudeRad();
   Out.LongitudeRad = location.GetLongitude();
   Out.GeodeticAltitudeFt = location.GetGeodAltitude();
+  Out.BodyRollRatePRadps  = Propagate->GetPQR(1); // body P [rad/s] (NOT Euler-angle rates)
+  Out.BodyPitchRateQRadps = Propagate->GetPQR(2); // body Q [rad/s]
+  Out.BodyYawRateRRadps   = Propagate->GetPQR(3); // body R [rad/s]
+  Out.AlphaRad            = Auxiliary->Getalpha();  // [rad]
+  Out.BetaRad             = Auxiliary->Getbeta();   // [rad]
   return true;
 }
 

@@ -1,4 +1,8 @@
 // MUMT provenance: PX4-Autopilot v1.17.0, d6f12ad1c4f70ad3230afd7d86e971421e02fef4.
+// Include-structure fix only (matches Px4TecsAdapter.h): the PX4-copied sections carry their own
+// PX4_*_HPP guards, but the trailing MumtPx4 wrapper block was unguarded, which breaks unity
+// builds that include this header from two members. No control-law change.
+#pragma once
 /****************************************************************************
  *
  * Copyright (c) 2025 PX4 Development Team. All rights reserved.

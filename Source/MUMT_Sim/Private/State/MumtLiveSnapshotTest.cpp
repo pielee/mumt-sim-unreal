@@ -27,6 +27,7 @@
 #include "FormationControlV2/FormationSlotGeneratorV2.h"
 #include "FormationControlV2/FormationPlannerV2.h"
 #include "FormationControlV2/FormationGuidanceCoordinatorV2.h"
+#include "FormationControlV2/F16StickAdapterV2.h"
 #include "FormationControlV2/PlannerV2Adapters.h"
 #include "Tests/AutomationEditorCommon.h" // FEditorLoadMap, FStartPIECommand, FEndPlayMapCommand
 #include "Editor.h"                        // GEditor
@@ -95,6 +96,12 @@ struct FMumtLiveState
 	bool bGuidanceObserved = false, bGuidanceFinite = true;
 	int32 GuidanceUpdates = 0;
 	double RollRefMin = 1e9, RollRefMax = -1e9, PitchRefMin = 1e9, PitchRefMax = -1e9, ThrottleRefMin = 1e9, ThrottleRefMax = -1e9;
+	// F-16 stick shadow (computed and observed only; never written to JSBSim)
+	FormationControlV2::F16StickAdapterV2 Stick;
+	bool bStickObserved = false, bStickFinite = true, bStickInRange = true;
+	int32 StickUpdates = 0;
+	double AilMin = 1e9, AilMax = -1e9, ElevMin = 1e9, ElevMax = -1e9;
+	double RudMin = 1e9, RudMax = -1e9, ThrCmdMin = 1e9, ThrCmdMax = -1e9;
 
 	TArray<FString> Csv;
 };
@@ -271,7 +278,29 @@ public:
 			FormationControlV2::FFormationSlotCommandV2 SlotCommand{};SlotCommand.FrontM=-200;SlotCommand.RightM=100;SlotCommand.CommandReceivedSimulationTimeS=Snap.SimTimeSec;SlotCommand.SourceSequence=1;SlotCommand.bValid=true;
 			const auto Slot=FormationControlV2::FormationSlotGeneratorV2::Calculate(Nav,SlotCommand,Snap.SimTimeSec);
 			const auto PlannerInput=FormationControlV2::PlannerV2InputAdapter::Build({Nav,Slot,Snap.SimTimeSec,1.0/60.0});
-			if (PlannerInput.bValid&&!Nav.bPaused){FormationControlV2::FormationPlannerV2Diagnostics Diagnostics{};const auto PlannerOutput=S->Planner.Update(PlannerInput.Input,Diagnostics);const auto Dto=FormationControlV2::PlannerV2OutputAdapter::Build(PlannerOutput,Slot,Nav);if(Dto.Npfg.bValid&&Dto.Tecs.bCommandReady){S->bDtoPipelineObserved=true;FormationControlV2::FGuidanceCoordinatorInputV2 GuidanceInput{};GuidanceInput.Follower=Nav;GuidanceInput.Slot=Slot;GuidanceInput.PlannerDto=Dto;GuidanceInput.CurrentPitchRad=St.Pitch_rad;GuidanceInput.bCurrentPitchValid=St.bAttitudeValid;GuidanceInput.SimulationTimeS=Snap.SimTimeSec;GuidanceInput.DtS=1.0/60.0;GuidanceInput.ResetGeneration=St.ResetGeneration;GuidanceInput.OriginGeneration=Nav.OriginGeneration;const auto GuidanceOutput=S->Guidance.Update(GuidanceInput);if(GuidanceOutput.bCommandReady){S->bGuidanceObserved=true;S->GuidanceUpdates++;S->bGuidanceFinite&=IsFin(GuidanceOutput.RollReferenceRad)&&IsFin(GuidanceOutput.PitchReferenceRad)&&IsFin(GuidanceOutput.ThrottleReferenceNorm);S->RollRefMin=FMath::Min(S->RollRefMin,GuidanceOutput.RollReferenceRad);S->RollRefMax=FMath::Max(S->RollRefMax,GuidanceOutput.RollReferenceRad);S->PitchRefMin=FMath::Min(S->PitchRefMin,GuidanceOutput.PitchReferenceRad);S->PitchRefMax=FMath::Max(S->PitchRefMax,GuidanceOutput.PitchReferenceRad);S->ThrottleRefMin=FMath::Min(S->ThrottleRefMin,GuidanceOutput.ThrottleReferenceNorm);S->ThrottleRefMax=FMath::Max(S->ThrottleRefMax,GuidanceOutput.ThrottleReferenceNorm);}}}
+			if (PlannerInput.bValid&&!Nav.bPaused){FormationControlV2::FormationPlannerV2Diagnostics Diagnostics{};const auto PlannerOutput=S->Planner.Update(PlannerInput.Input,Diagnostics);const auto Dto=FormationControlV2::PlannerV2OutputAdapter::Build(PlannerOutput,Slot,Nav);if(Dto.Npfg.bValid&&Dto.Tecs.bCommandReady){S->bDtoPipelineObserved=true;FormationControlV2::FGuidanceCoordinatorInputV2 GuidanceInput{};GuidanceInput.Follower=Nav;GuidanceInput.Slot=Slot;GuidanceInput.PlannerDto=Dto;GuidanceInput.CurrentPitchRad=St.Pitch_rad;GuidanceInput.bCurrentPitchValid=St.bAttitudeValid;GuidanceInput.SimulationTimeS=Snap.SimTimeSec;GuidanceInput.DtS=1.0/60.0;GuidanceInput.ResetGeneration=St.ResetGeneration;GuidanceInput.OriginGeneration=Nav.OriginGeneration;const auto GuidanceOutput=S->Guidance.Update(GuidanceInput);if(GuidanceOutput.bCommandReady){S->bGuidanceObserved=true;S->GuidanceUpdates++;S->bGuidanceFinite&=IsFin(GuidanceOutput.RollReferenceRad)&&IsFin(GuidanceOutput.PitchReferenceRad)&&IsFin(GuidanceOutput.ThrottleReferenceNorm);S->RollRefMin=FMath::Min(S->RollRefMin,GuidanceOutput.RollReferenceRad);S->RollRefMax=FMath::Max(S->RollRefMax,GuidanceOutput.RollReferenceRad);S->PitchRefMin=FMath::Min(S->PitchRefMin,GuidanceOutput.PitchReferenceRad);S->PitchRefMax=FMath::Max(S->PitchRefMax,GuidanceOutput.PitchReferenceRad);S->ThrottleRefMin=FMath::Min(S->ThrottleRefMin,GuidanceOutput.ThrottleReferenceNorm);S->ThrottleRefMax=FMath::Max(S->ThrottleRefMax,GuidanceOutput.ThrottleReferenceNorm);
+				// F-16 stick shadow: guidance references -> normalized FCS commands. Observed/logged
+				// ONLY; nothing is written to JSBSim Commands or fcs/*-cmd-norm.
+				FormationControlV2::FF16StickInputV2 StickInput{};
+				StickInput.RollReferenceRad=GuidanceOutput.RollReferenceRad;StickInput.PitchReferenceRad=GuidanceOutput.PitchReferenceRad;
+				StickInput.ThrottleReferenceNorm=GuidanceOutput.ThrottleReferenceNorm;StickInput.bGuidanceValid=GuidanceOutput.bCommandReady;
+				StickInput.CurrentRollRad=St.Roll_rad;StickInput.CurrentPitchRad=St.Pitch_rad;StickInput.bAttitudeValid=St.bAttitudeValid;
+				StickInput.BodyRollRateRadps=Snap.BodyRollRatePRadps;StickInput.BodyPitchRateRadps=Snap.BodyPitchRateQRadps;StickInput.BodyYawRateRadps=Snap.BodyYawRateRRadps;
+				StickInput.bBodyRatesValid=IsFin(Snap.BodyRollRatePRadps)&&IsFin(Snap.BodyPitchRateQRadps)&&IsFin(Snap.BodyYawRateRRadps);
+				StickInput.AlphaRad=Snap.AlphaRad;StickInput.BetaRad=Snap.BetaRad;StickInput.bAlphaBetaValid=IsFin(Snap.AlphaRad)&&IsFin(Snap.BetaRad);
+				StickInput.EasMps=St.EquivalentAirspeed_mps;StickInput.TasMps=St.TrueAirspeed_mps;StickInput.bAirspeedValid=St.bEasValid&&St.bTasValid;
+				StickInput.SimulationTimeS=Snap.SimTimeSec;StickInput.DtS=1.0/60.0;StickInput.bPaused=St.bPaused;StickInput.ResetGeneration=GuidanceOutput.ResetGeneration;
+				const auto StickOut=S->Stick.Update(StickInput);
+				if(StickOut.bValid){
+					S->bStickObserved=true;S->StickUpdates++;
+					S->bStickFinite&=IsFin(StickOut.AileronCmdNorm)&&IsFin(StickOut.ElevatorCmdNorm)&&IsFin(StickOut.RudderCmdNorm)&&IsFin(StickOut.ThrottleCmdNorm);
+					S->bStickInRange&=StickOut.AileronCmdNorm>=-1.0&&StickOut.AileronCmdNorm<=1.0&&StickOut.ElevatorCmdNorm>=-1.0&&StickOut.ElevatorCmdNorm<=1.0
+						&&StickOut.RudderCmdNorm>=-1.0&&StickOut.RudderCmdNorm<=1.0&&StickOut.ThrottleCmdNorm>=0.0&&StickOut.ThrottleCmdNorm<=1.0;
+					S->AilMin=FMath::Min(S->AilMin,StickOut.AileronCmdNorm);S->AilMax=FMath::Max(S->AilMax,StickOut.AileronCmdNorm);
+					S->ElevMin=FMath::Min(S->ElevMin,StickOut.ElevatorCmdNorm);S->ElevMax=FMath::Max(S->ElevMax,StickOut.ElevatorCmdNorm);
+					S->RudMin=FMath::Min(S->RudMin,StickOut.RudderCmdNorm);S->RudMax=FMath::Max(S->RudMax,StickOut.RudderCmdNorm);
+					S->ThrCmdMin=FMath::Min(S->ThrCmdMin,StickOut.ThrottleCmdNorm);S->ThrCmdMax=FMath::Max(S->ThrCmdMax,StickOut.ThrottleCmdNorm);
+				}}}}
 
 			S->Csv.Add(FString::Printf(TEXT("%.6f,%llu,%.6f,%.6f,%.4f,%.4f,%.3f,%.3f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.6f,%.4f,%.4f,%.4f,%d,%d"),
 				Snap.SimTimeSec, (unsigned long long)St.SimTimeMicros, Snap.VequivalentKTS, oEAS, Snap.VtFps, oTAS, Snap.AltAslFt, oAlt,
@@ -328,6 +357,7 @@ private:
 		UE_LOG(LogMumtLive, Display, TEXT("[MUMTLIVE] nav origin=(lat=0.6 rad lon=2.2 rad h=100m gen=9001) ecefPosDiff=%.9g m nedVelDiff=%.9g mps finite=%d originGen=%d"), S->DEcefPositionM, S->DNedVelocityMps, S->bNavigationFinite, S->bOriginGenerationMatch);
 		UE_LOG(LogMumtLive, Display, TEXT("[MUMTLIVE] observationalPipeline trackerIndependent=%d dtoObserved=%d commandWrites=0 newComponents=0 newFdm=0"),S->bTrackerIndependent,S->bDtoPipelineObserved);
 		UE_LOG(LogMumtLive, Display, TEXT("[MUMTLIVE] guidanceShadow observed=%d updates=%d finite=%d roll=[%.6g..%.6g] pitch=[%.6g..%.6g] throttle=[%.6g..%.6g] npfgTecsUpdateOnly=1 commandWrites=0"),S->bGuidanceObserved,S->GuidanceUpdates,S->bGuidanceFinite,S->RollRefMin,S->RollRefMax,S->PitchRefMin,S->PitchRefMax,S->ThrottleRefMin,S->ThrottleRefMax);
+		UE_LOG(LogMumtLive, Display, TEXT("[MUMTLIVE] stickShadow observed=%d updates=%d finite=%d inRange=%d aileron=[%.6g..%.6g] elevator=[%.6g..%.6g] rudder=[%.6g..%.6g] throttleCmd=[%.6g..%.6g] commandWrites=0 fcsCmdNormWrites=0"),S->bStickObserved,S->StickUpdates,S->bStickFinite,S->bStickInRange,S->AilMin,S->AilMax,S->ElevMin,S->ElevMax,S->RudMin,S->RudMax,S->ThrCmdMin,S->ThrCmdMax);
 
 		if (AbortReason) { Test->AddError(FString::Printf(TEXT("[MUMTLIVE] aborted: %s"), AbortReason)); return true; }
 
@@ -362,6 +392,7 @@ private:
 		Test->TestTrue(TEXT("aircraft tracker state is independently resettable"), S->bTrackerIndependent);
 		Test->TestTrue(TEXT("canonical-slot-planner-NPFG/TECS DTO observational pipeline produced valid DTO"), S->bDtoPipelineObserved);
 		Test->TestTrue(TEXT("NPFG/TECS shadow guidance produced finite references"), S->bGuidanceObserved && S->bGuidanceFinite && S->GuidanceUpdates > 0);
+		Test->TestTrue(TEXT("F-16 stick shadow produced finite in-range commands"), S->bStickObserved && S->bStickFinite && S->bStickInRange && S->StickUpdates > 0);
 		return true;
 	}
 
