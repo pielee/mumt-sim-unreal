@@ -10,6 +10,7 @@ g++ -std=c++20 -O2 -Wall -Wextra -Wno-unused-parameter -pedantic -I"$ROOT/Source
  "$ROOT/Source/MUMT_Sim/Private/FormationControlV2/DubinsPath.cpp" \
  "$ROOT/Source/MUMT_Sim/Private/FormationControlV2/MovingSlotPredictor.cpp" \
  "$ROOT/Source/MUMT_Sim/Private/FormationControlV2/CaptureSpeedPlanner.cpp" \
+ "$ROOT/Source/MUMT_Sim/Private/FormationControlV2/SlotLocalPathPrimitiveV2.cpp" \
  "$ROOT/Source/MUMT_Sim/Private/FormationControlV2/FormationPlannerV2.cpp" \
  "$ROOT/Source/MUMT_Sim/Private/FormationControlV2/PlannerV2Adapters.cpp" \
  "$ROOT/Source/MUMT_Sim/Private/FormationControlV2/FormationGuidanceCoordinatorV2.cpp" \
