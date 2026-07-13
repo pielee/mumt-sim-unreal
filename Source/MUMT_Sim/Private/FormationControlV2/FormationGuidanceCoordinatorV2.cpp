@@ -80,6 +80,17 @@ bool IsGuidanceConfigValid(const FGuidanceConfigV2 &config) {
     // Reference-trajectory rates are a separate quantity from the energy limits above.
     if (!Positive(config.TargetClimbRateMps) || !Positive(config.TargetSinkRateMps)) return false;
     if (!IsFiniteGuidance(config.FastDescendAltitudeErrorM)) return false;
+
+    // NPFG static tuning. Only the algorithm's OWN clamps are enforced as hard bounds
+    // (DirectionalGuidance::setPeriod / setDamping / setSwitchDistanceMultiplier /
+    // setPeriodSafetyFactor silently clamp, which is exactly the silent-substitution this contract
+    // exists to prevent). The PX4 parameter metadata ranges are a small-fixed-wing UI range, not a
+    // physical law, and are deliberately not used as validation.
+    if (!AtLeast(config.NpfgPeriodS, kNpfgEpsilon)) return false;
+    if (!InRange(config.NpfgDamping, kNpfgEpsilon, kNpfgDampingMax)) return false;
+    if (!AtLeast(config.NpfgRollTimeConstantS, 0.0)) return false;
+    if (!AtLeast(config.NpfgSwitchDistanceMultiplier, kNpfgSwitchDistanceMultiplierMin)) return false;
+    if (!AtLeast(config.NpfgPeriodSafetyFactor, kNpfgPeriodSafetyFactorMin)) return false;
     return true;
 }
 
@@ -94,6 +105,23 @@ bool IsGuidanceConfigValid(const FGuidanceConfigV2 &config) {
 //   and the fast-descend slew of the altitude time constant.
 void FormationGuidanceCoordinatorV2::RecreateControllers(const FGuidanceConfigV2 &config) {
     Npfg = std::make_unique<MumtPx4::FPx4NpfgAdapter>();
+
+    // NPFG static configuration, mirroring the pinned PX4 caller. FPx4NpfgAdapter fuses the two PX4
+    // modules, so both halves of the contract are applied here: the path law (DirectionalGuidance,
+    // configured by fw_mode_manager) and the heading controller's proportional gain (configured by
+    // fw_lateral_longitudinal_control). No numeric literal is configured here -- every value comes
+    // from FGuidanceConfigV2, which Update() validated before this ran.
+    auto &guidance = Npfg->directionalGuidance();
+    guidance.setPeriod(static_cast<float>(config.NpfgPeriodS));
+    guidance.setDamping(static_cast<float>(config.NpfgDamping));
+    guidance.enablePeriodLB(config.bNpfgEnablePeriodLowerBound);
+    guidance.enablePeriodUB(config.bNpfgEnablePeriodUpperBound);
+    guidance.setRollTimeConst(static_cast<float>(config.NpfgRollTimeConstantS));
+    guidance.setSwitchDistanceMultiplier(static_cast<float>(config.NpfgSwitchDistanceMultiplier));
+    guidance.setPeriodSafetyFactor(static_cast<float>(config.NpfgPeriodSafetyFactor));
+    Npfg->airspeedDirectionController().setPGainFromPeriodAndDamping(
+        static_cast<float>(config.NpfgDamping), static_cast<float>(config.NpfgPeriodS));
+
     Tecs = std::make_unique<MumtPx4::FPx4TecsAdapter>();
     auto &tecs = Tecs->controller();
 

@@ -68,8 +68,52 @@ inline constexpr double kTecsSpeedWeightMin = 0.0, kTecsSpeedWeightMax = 2.0;   
 inline constexpr double kTecsRollToThrottleMin = 0.0, kTecsRollToThrottleMax = 20.0;            // FW_T_RLL2THR
 inline constexpr double kTecsAirspeedStdDevMin = 0.01, kTecsAirspeedStdDevMax = 10.0;           // FW_T_SPD_*_STD
 
+// ---------------------------------------------------------------------------------------------
+// NPFG caller contract.
+//
+// Pinned PX4 v1.17.0 splits the lateral guidance across two modules, and BOTH configure it:
+//   fw_mode_manager/FixedWingModeManager.cpp:100-106     -> DirectionalGuidance (the path law)
+//       setPeriod(NPFG_PERIOD), setDamping(NPFG_DAMPING), enablePeriodLB(NPFG_LB_PERIOD),
+//       enablePeriodUB(NPFG_UB_PERIOD), setRollTimeConst(NPFG_ROLL_TC),
+//       setSwitchDistanceMultiplier(NPFG_SW_DST_MLT), setPeriodSafetyFactor(NPFG_PERIOD_SF)
+//   fw_lateral_longitudinal_control/FwLateralLongitudinalControl.cpp:119 -> the heading controller
+//       setPGainFromPeriodAndDamping(NPFG_DAMPING, NPFG_PERIOD)
+// FPx4NpfgAdapter fuses all three objects (DirectionalGuidance + AirspeedDirectionController +
+// CourseToAirspeedRefMapper), so the caller contract it must satisfy is the union of the two.
+//
+// The coordinator previously configured NONE of them: every value came from a vendored class
+// initializer. Those initializers are placeholders, exactly like the TECS class defaults were.
+//
+// DEFAULTS BELOW PRESERVE CURRENT BEHAVIOUR: each one is the value the vendored class initializer
+// already used, NOT the PX4 parameter default, because this seam is a wiring change and not a tuning
+// change. Where the two differ it is called out per field.
+//
+// VALIDATION: the algorithm's own clamps (math::max / math::constrain inside the setters) are hard
+// requirements and are enforced. The PX4 parameter METADATA ranges are a small-fixed-wing parameter
+// UI range, not a physical law, and are NOT used as hard bounds -- the same distinction the TECS
+// sink-rate contract had to make.
+inline constexpr double kNpfgEpsilon = 1.0e-6;        // DirectionalGuidance::NPFG_EPSILON
+inline constexpr double kNpfgDampingMax = 1.0;        // DirectionalGuidance::setDamping constrains to <= 1
+inline constexpr double kNpfgSwitchDistanceMultiplierMin = 0.1;  // setSwitchDistanceMultiplier clamps
+inline constexpr double kNpfgPeriodSafetyFactorMin = 1.0;        // setPeriodSafetyFactor clamps
+
 struct FGuidanceConfigV2 {
     double RollLimitRad{0.7853981633974483};
+
+    // --- NPFG static tuning (see the caller contract above). Runtime navigation state -- position,
+    // ground velocity, wind, path geometry, airspeed -- is NOT here: it is passed per frame.
+    double NpfgPeriodS{10.0};        // NPFG_PERIOD  [s]  (PX4 param default 10.0; metadata 1..100)
+    // NPFG_DAMPING's PX4 parameter default is 0.7, but the vendored DirectionalGuidance initializer
+    // is 0.7071 (1/sqrt(2)) and that is what this build has always run with. Kept at 0.7071 so this
+    // seam changes wiring, not tuning.
+    double NpfgDamping{0.7071};      // NPFG_DAMPING [-]  (algorithmic hard range: (0, 1])
+    bool bNpfgEnablePeriodLowerBound{true};   // NPFG_LB_PERIOD (PX4 default 1)
+    bool bNpfgEnablePeriodUpperBound{true};   // NPFG_UB_PERIOD (PX4 default 1)
+    // NPFG_ROLL_TC's PX4 parameter default is 0.5 s, but the vendored initializer is 0.0 s and that
+    // is what this build has always run with. Kept at 0.0 for the same reason.
+    double NpfgRollTimeConstantS{0.0};        // NPFG_ROLL_TC [s]
+    double NpfgSwitchDistanceMultiplier{0.32};// NPFG_SW_DST_MLT [-] (algorithmic hard min 0.1)
+    double NpfgPeriodSafetyFactor{1.5};       // NPFG_PERIOD_SF  [-] (algorithmic hard min 1.0)
     double PitchMinRad{-0.5}, PitchMaxRad{0.5};
     double ThrottleMin{0.0}, ThrottleMax{1.0}, ThrottleTrim{0.5};
     double EasMinMps{10.0}, EasMaxMps{80.0};
