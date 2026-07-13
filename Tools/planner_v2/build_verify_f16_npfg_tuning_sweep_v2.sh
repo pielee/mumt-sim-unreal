@@ -11,7 +11,8 @@ OUT=/tmp/mumt_f16_npfg_tuning_sweep_v2
 BINARY="$OUT/verify_f16_npfg_tuning_sweep_v2"
 
 mkdir -p "$OUT"
-rm -f "$OUT"/sweep.* "$OUT"/confirm_*.* "$OUT"/candidates.txt
+rm -f "$OUT"/sweep.* "$OUT"/confirm_*.* "$OUT"/candidates.txt \
+      "$OUT"/refine.* "$OUT"/refine_confirm_*.* "$OUT"/refine_candidates.txt
 
 # The production guidance chain is compiled from source and linked against the actual JSBSim static
 # library: the coordinator (which owns the real PX4 NPFG and TECS adapters) and the F-16 stick
@@ -70,7 +71,44 @@ else
   done
 fi
 
+# ---- 3. focused refinement around the coarse grid edge (period 18..30, damping 0.6..0.8) ---------
+set +e
+"$BINARY" "$JSBSIM_ROOT" refine "$OUT/refine.raw.csv" "$OUT/refine.quantized.csv" \
+  "$OUT/refine.summary" "$OUT/refine_candidates.txt" >"$OUT/refine.stdout" 2>&1
+rc=$?
+set -e
+printf '%d\n' "$rc" >"$OUT/refine.exit"
+if [[ $rc -ne 0 ]]; then
+  cat "$OUT/refine.stdout"
+  exit "$rc"
+fi
+
+# ---- 4. confirm the refined candidates in three independent processes ----------------------------
+if [[ ! -s "$OUT/refine_candidates.txt" ]]; then
+  echo "no refined candidate survived the pre-declared reject gates; nothing to confirm"
+else
+  for run in 1 2 3; do
+    set +e
+    "$BINARY" "$JSBSIM_ROOT" confirm "$OUT/refine_confirm_${run}.raw.csv" \
+      "$OUT/refine_confirm_${run}.quantized.csv" "$OUT/refine_confirm_${run}.summary" \
+      "$OUT/refine_candidates.txt" >"$OUT/refine_confirm_${run}.stdout" 2>&1
+    rc=$?
+    set -e
+    printf '%d\n' "$rc" >"$OUT/refine_confirm_${run}.exit"
+    if [[ $rc -ne 0 ]]; then
+      cat "$OUT/refine_confirm_${run}.stdout"
+      exit "$rc"
+    fi
+  done
+  for run in 2 3; do
+    cmp --silent "$OUT/refine_confirm_1.raw.csv" "$OUT/refine_confirm_${run}.raw.csv"
+    cmp --silent "$OUT/refine_confirm_1.quantized.csv" "$OUT/refine_confirm_${run}.quantized.csv"
+    cmp --silent "$OUT/refine_confirm_1.summary" "$OUT/refine_confirm_${run}.summary"
+  done
+fi
+
 cat "$OUT/sweep.summary"
+cat "$OUT/refine.summary"
 printf 'sweep_raw_sha256=%s\n' "$(sha256sum "$OUT/sweep.raw.csv" | awk '{print $1}')"
 printf 'sweep_quantized_sha256=%s\n' "$(sha256sum "$OUT/sweep.quantized.csv" | awk '{print $1}')"
 if [[ -s "$OUT/candidates.txt" ]]; then
@@ -78,5 +116,13 @@ if [[ -s "$OUT/candidates.txt" ]]; then
   printf 'confirm_quantized_sha256=%s\n' "$(sha256sum "$OUT/confirm_1.quantized.csv" | awk '{print $1}')"
   printf 'confirmation_runs=3 process_exits=%s/%s/%s\n' \
     "$(cat "$OUT/confirm_1.exit")" "$(cat "$OUT/confirm_2.exit")" "$(cat "$OUT/confirm_3.exit")"
+fi
+printf 'refine_raw_sha256=%s\n' "$(sha256sum "$OUT/refine.raw.csv" | awk '{print $1}')"
+printf 'refine_quantized_sha256=%s\n' "$(sha256sum "$OUT/refine.quantized.csv" | awk '{print $1}')"
+if [[ -s "$OUT/refine_candidates.txt" ]]; then
+  printf 'refine_confirm_raw_sha256=%s\n' "$(sha256sum "$OUT/refine_confirm_1.raw.csv" | awk '{print $1}')"
+  printf 'refine_confirm_quantized_sha256=%s\n' "$(sha256sum "$OUT/refine_confirm_1.quantized.csv" | awk '{print $1}')"
+  printf 'refine_confirmation_runs=3 process_exits=%s/%s/%s\n' \
+    "$(cat "$OUT/refine_confirm_1.exit")" "$(cat "$OUT/refine_confirm_2.exit")" "$(cat "$OUT/refine_confirm_3.exit")"
 fi
 printf 'F16_NPFG_TUNING_SWEEP_V2_RESULT=PASS\n'

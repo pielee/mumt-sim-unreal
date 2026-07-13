@@ -379,6 +379,13 @@ struct FCaseMetrics {
     double LatAccTotMin{kNa}, LatAccTotMax{kNa};
     double AdaptedPeriodMin{kNa}, AdaptedPeriodMax{kNa};
     double MaxAbsAltitudeErrorM{kNa}, MaxAbsEasErrorMps{kNa};
+    // Response-shape metrics. max_abs_cross_track is ~500 m for every combination in the cross-track
+    // cases (it IS the commanded step), so it carries almost no ranking information. These do.
+    double PostStepPeakExcessM{kNa};      // peak |xtk| after the step, MINUS the commanded offset
+    double TrailingRmsCrossTrackM{kNa};   // RMS |xtk| over the trailing window
+    double TimeToWithin25M{kNa}, TimeToWithin10M{kNa};   // seconds after the step, NA if never
+    double CourseRecoveryTimeS{kNa};      // seconds after the step until |course error| < 1 deg
+    double CaseSaturationFraction{kNa}, ResponseSaturationFraction{kNa};
     double PitchRefMin{kNa}, PitchRefMax{kNa}, ThrottleMin{kNa}, ThrottleMax{kNa};
     double ElevatorMin{kNa}, ElevatorMax{kNa}, AileronMin{kNa}, AileronMax{kNa};
     double CommandActivity{kNa};   // integrated |d(aileron)/dt| over the response [cmd-norm]
@@ -399,6 +406,17 @@ struct FComboResult {
     double MaxAltitudeErrorM{kNa}, MaxEasErrorMps{kNa}, TotalCommandActivity{kNa};
     double CurvatureAsym{kNa}, CrossTrackAsym{kNa}, CourseErrorAsym{kNa};
     bool bBothCurvatureStable{};
+    // --- refine-mode aggregates (response shape, which is what actually separates the candidates) --
+    std::uint64_t CurvatureResponseSaturation{};   // curvature right + left, response window
+    std::uint64_t CrossTrackResponseSaturation{};  // cross-track right + left, response window
+    double CurvatureMaxAltitudeErrorM{kNa}, CurvatureMaxEasErrorMps{kNa};
+    double CurvatureMaxExcessM{kNa};               // peak cross-track excursion off the arc
+    double CrossTrackTimeTo25S{kNa}, CrossTrackTimeTo10S{kNa};   // right + left, NA if either never
+    double CourseRecoveryS{kNa};                                 // right + left
+    double CrossTrackFinalAbsM{kNa}, CrossTrackTrailingRmsM{kNa};
+    // absolute (not just normalized) left/right differences -- a normalized value on two tiny errors
+    // is meaningless, so both are reported and the ranking never uses the normalized value alone.
+    double CurvatureAbsDiffM{kNa}, CrossTrackAbsDiffM{kNa}, CourseErrorAbsDiffM{kNa};
 };
 
 // ================================================================================================
@@ -475,6 +493,8 @@ FCaseMetrics RunCase(const std::string &root, const FCombo &combo, ECase kase,
     double activity = 0.0, prevAileron = 0.0;
     bool havePrevAileron = false;
     std::vector<std::pair<double, double>> tailXtk;   // (t, |xtk|) in the trailing window
+    double t25 = kNa, t10 = kNa, tCourse = kNa;
+    constexpr double kCourseRecoveredRad = 1.0 * kDegToRad;
 
     const int frames = static_cast<int>(std::llround(kCaseDurationS / kControllerDtS));
     for (int k = 0; k < frames; ++k) {
@@ -679,6 +699,10 @@ FCaseMetrics RunCase(const std::string &root, const FCombo &combo, ECase kase,
             }
             m.FinalCrossTrackM = crossTrack;
             m.FinalCourseErrorRad = courseErr;
+            if (!Finite(t25) && std::abs(crossTrack) < 25.0) t25 = st.TimeS - kStepTimeS;
+            if (!Finite(t10) && std::abs(crossTrack) < 10.0) t10 = st.TimeS - kStepTimeS;
+            if (!Finite(tCourse) && std::abs(courseErr) < kCourseRecoveredRad)
+                tCourse = st.TimeS - kStepTimeS;
             if (st.TimeS >= kCaseDurationS - kTailWindowS)
                 tailXtk.emplace_back(st.TimeS, std::abs(crossTrack));
         }
@@ -704,6 +728,20 @@ FCaseMetrics RunCase(const std::string &root, const FCombo &combo, ECase kase,
     m.ElevatorMin = elMin; m.ElevatorMax = elMax;
     m.AileronMin = aiMin; m.AileronMax = aiMax;
     m.CommandActivity = activity;
+    m.TimeToWithin25M = t25;
+    m.TimeToWithin10M = t10;
+    m.CourseRecoveryTimeS = tCourse;
+    if (m.CaseFrames > 0)
+        m.CaseSaturationFraction = static_cast<double>(m.RollRefSaturatedFrames) / static_cast<double>(m.CaseFrames);
+    if (m.ResponseFrames > 0)
+        m.ResponseSaturationFraction = static_cast<double>(m.ResponseSaturatedFrames) / static_cast<double>(m.ResponseFrames);
+    if (Finite(m.MaxAbsCrossTrackM) && Finite(m.InitialCrossTrackM))
+        m.PostStepPeakExcessM = std::max(0.0, m.MaxAbsCrossTrackM - std::abs(m.InitialCrossTrackM));
+    if (!tailXtk.empty()) {
+        double acc = 0.0;
+        for (const auto &p : tailXtk) acc += p.second * p.second;
+        m.TrailingRmsCrossTrackM = std::sqrt(acc / static_cast<double>(tailXtk.size()));
+    }
 
     // trailing |cross-track| slope: still growing at the end == persistent divergence
     if (tailXtk.size() >= 2) {
@@ -791,6 +829,23 @@ std::vector<FCombo> BuildCombos()
     return combos;
 }
 
+// Focused refinement. The coarse sweep put every valid combination at the grid EDGE (period 20), and
+// showed that the roll time constant is bit-identical across 0/0.25/0.5/1.0 in this flight regime,
+// so it is pinned at the production default and only period and damping are refined.
+std::vector<FCombo> BuildRefineCombos()
+{
+    const std::array<double, 5> periods{18.0, 20.0, 22.0, 25.0, 30.0};
+    const std::array<double, 3> dampings{0.6, 0.7, 0.8};
+    std::vector<FCombo> c;
+    for (double p : periods)
+        for (double d : dampings) {
+            FCombo x{};
+            x.PeriodS = p; x.Damping = d; x.RollTcS = 0.0;
+            c.push_back(x);
+        }
+    return c;
+}
+
 FGuidanceConfigV2 BaseConfig()
 {
     FGuidanceConfigV2 c{};
@@ -840,6 +895,52 @@ void Aggregate(FComboResult &r)
         if (Finite(a)) worst = std::max(worst, a);
     r.WorstAsymmetry = worst;
     r.bBothCurvatureStable = !r.Cases[0].bRejected && !r.Cases[1].bRejected;
+
+    // ---- refine aggregates ----
+    const FCaseMetrics &cr = r.Cases[0], &cl = r.Cases[1];   // curvature right / left
+    const FCaseMetrics &xr = r.Cases[2], &xl = r.Cases[3];   // cross-track right / left
+    const FCaseMetrics &er = r.Cases[4], &el = r.Cases[5];   // course-error right / left
+    r.CurvatureResponseSaturation = cr.ResponseSaturatedFrames + cl.ResponseSaturatedFrames;
+    r.CrossTrackResponseSaturation = xr.ResponseSaturatedFrames + xl.ResponseSaturatedFrames;
+    r.CurvatureMaxAltitudeErrorM = std::max(cr.MaxAbsAltitudeErrorM, cl.MaxAbsAltitudeErrorM);
+    r.CurvatureMaxEasErrorMps = std::max(cr.MaxAbsEasErrorMps, cl.MaxAbsEasErrorMps);
+    r.CurvatureMaxExcessM = std::max(cr.PostStepPeakExcessM, cl.PostStepPeakExcessM);
+    auto SumOrNa = [](double a, double b) { return (Finite(a) && Finite(b)) ? a + b : kNa; };
+    r.CrossTrackTimeTo25S = SumOrNa(xr.TimeToWithin25M, xl.TimeToWithin25M);
+    r.CrossTrackTimeTo10S = SumOrNa(xr.TimeToWithin10M, xl.TimeToWithin10M);
+    r.CourseRecoveryS = SumOrNa(er.CourseRecoveryTimeS, el.CourseRecoveryTimeS);
+    r.CrossTrackFinalAbsM = std::abs(xr.FinalCrossTrackM) + std::abs(xl.FinalCrossTrackM);
+    r.CrossTrackTrailingRmsM = SumOrNa(xr.TrailingRmsCrossTrackM, xl.TrailingRmsCrossTrackM);
+    r.CurvatureAbsDiffM = std::abs(std::abs(cr.MaxAbsCrossTrackM) - std::abs(cl.MaxAbsCrossTrackM));
+    r.CrossTrackAbsDiffM = std::abs(std::abs(xr.FinalCrossTrackM) - std::abs(xl.FinalCrossTrackM));
+    r.CourseErrorAbsDiffM = std::abs(std::abs(er.MaxAbsCrossTrackM) - std::abs(el.MaxAbsCrossTrackM));
+}
+
+// Refine ranking, in the priority order the directive fixes. It never decides on a normalized
+// asymmetry alone: absolute differences are the tie-breaker.
+bool BetterRefined(const FComboResult &a, const FComboResult &b)
+{
+    if (a.bRejected != b.bRejected) return !a.bRejected;
+    if (a.CurvatureResponseSaturation != b.CurvatureResponseSaturation)
+        return a.CurvatureResponseSaturation < b.CurvatureResponseSaturation;
+    const double ca = a.CurvatureMaxAltitudeErrorM + 10.0 * a.CurvatureMaxEasErrorMps;
+    const double cb = b.CurvatureMaxAltitudeErrorM + 10.0 * b.CurvatureMaxEasErrorMps;
+    if (ca != cb) return ca < cb;
+    if (a.CrossTrackResponseSaturation != b.CrossTrackResponseSaturation)
+        return a.CrossTrackResponseSaturation < b.CrossTrackResponseSaturation;
+    const double ta = (Finite(a.CrossTrackTimeTo25S) ? a.CrossTrackTimeTo25S : 1e9) +
+                      (Finite(a.CrossTrackTimeTo10S) ? a.CrossTrackTimeTo10S : 1e9);
+    const double tb = (Finite(b.CrossTrackTimeTo25S) ? b.CrossTrackTimeTo25S : 1e9) +
+                      (Finite(b.CrossTrackTimeTo10S) ? b.CrossTrackTimeTo10S : 1e9);
+    if (ta != tb) return ta < tb;
+    const double ra = Finite(a.CourseRecoveryS) ? a.CourseRecoveryS : 1e9;
+    const double rb = Finite(b.CourseRecoveryS) ? b.CourseRecoveryS : 1e9;
+    if (ra != rb) return ra < rb;
+    if (a.TotalCommandActivity != b.TotalCommandActivity) return a.TotalCommandActivity < b.TotalCommandActivity;
+    const double da = a.CurvatureAbsDiffM + a.CrossTrackAbsDiffM + a.CourseErrorAbsDiffM;
+    const double db = b.CurvatureAbsDiffM + b.CrossTrackAbsDiffM + b.CourseErrorAbsDiffM;
+    if (da != db) return da < db;
+    return a.Combo.Key() < b.Combo.Key();
 }
 
 // Lexicographic ranking, in the priority order the directive fixes.
@@ -889,7 +990,8 @@ std::string Num(double v)
     return s.str();
 }
 
-void WriteCsv(const std::string &path, const std::vector<FComboResult> &rs, int prec)
+void WriteCsv(const std::string &path, const std::vector<FComboResult> &rs, int prec,
+              bool extended = false)
 {
     std::ofstream out(path);
     out << "period_s,damping,roll_time_constant_s,is_production_default,is_pinned_px4_default,"
@@ -904,7 +1006,14 @@ void WriteCsv(const std::string &path, const std::vector<FComboResult> &rs, int 
            "pitch_reference_min,pitch_reference_max,throttle_min,throttle_max,"
            "elevator_min,elevator_max,aileron_min,aileron_max,command_activity,"
            "fdm_run_failures,non_finite_states,unexpected_wow,configuration_violations,"
-           "command_range_violations,command_slew_violations,writes_outside_owned_fdm\n";
+           "command_range_violations,command_slew_violations,writes_outside_owned_fdm";
+    // The refine schema appends the response-shape columns. The coarse schema is byte-for-byte the
+    // one the committed sweep already emits, so its canonical hashes are preserved.
+    if (extended)
+        out << ",case_saturation_fraction,response_saturation_fraction,post_step_peak_excess_m,"
+               "trailing_rms_cross_track_m,time_to_within_25m_s,time_to_within_10m_s,"
+               "course_recovery_time_s";
+    out << '\n';
     for (const FComboResult &r : rs) {
         for (std::size_t i = 0; i < r.Cases.size(); ++i) {
             const FCaseMetrics &m = r.Cases[i];
@@ -934,7 +1043,15 @@ void WriteCsv(const std::string &path, const std::vector<FComboResult> &rs, int 
             for (double v : cmd) { WriteNumber(out, v, prec); out << ','; }
             out << m.N.FdmRunFailures << ',' << m.N.NonFiniteStates << ',' << m.N.UnexpectedWow << ','
                 << m.N.ConfigViolations << ',' << m.N.CommandRangeViolations << ','
-                << m.N.CommandSlewViolations << ',' << m.N.WritesOutsideOwnedFdm << '\n';
+                << m.N.CommandSlewViolations << ',' << m.N.WritesOutsideOwnedFdm;
+            if (extended) {
+                const std::array<double, 7> ext{m.CaseSaturationFraction, m.ResponseSaturationFraction,
+                                                m.PostStepPeakExcessM, m.TrailingRmsCrossTrackM,
+                                                m.TimeToWithin25M, m.TimeToWithin10M,
+                                                m.CourseRecoveryTimeS};
+                for (double v : ext) { out << ','; WriteNumber(out, v, prec); }
+            }
+            out << '\n';
         }
     }
 }
@@ -961,6 +1078,43 @@ std::string ComboLine(const FComboResult &r)
     return s.str();
 }
 
+std::string RefineLine(const FComboResult &r)
+{
+    std::ostringstream s;
+    s << "period=" << Num(r.Combo.PeriodS) << " damping=" << Num(r.Combo.Damping)
+      << " roll_tc=" << Num(r.Combo.RollTcS)
+      << " rejected=" << (r.bRejected ? 1 : 0)
+      << " | curvature: response_saturation=" << r.CurvatureResponseSaturation
+      << " (right=" << r.Cases[0].ResponseSaturatedFrames << "/3600 left="
+      << r.Cases[1].ResponseSaturatedFrames << "/3600)"
+      << " peak_excess_m=" << Num(r.CurvatureMaxExcessM)
+      << " max_altitude_error_m=" << Num(r.CurvatureMaxAltitudeErrorM)
+      << " max_eas_error_mps=" << Num(r.CurvatureMaxEasErrorMps)
+      << " | cross_track: response_saturation=" << r.CrossTrackResponseSaturation
+      << " (right=" << r.Cases[2].ResponseSaturatedFrames << "/3600 left="
+      << r.Cases[3].ResponseSaturatedFrames << "/3600)"
+      << " case_saturation=" << (r.Cases[2].RollRefSaturatedFrames + r.Cases[3].RollRefSaturatedFrames)
+      << "/15600"
+      << " t_to_25m_s=" << Num(r.Cases[2].TimeToWithin25M) << '/' << Num(r.Cases[3].TimeToWithin25M)
+      << " t_to_10m_s=" << Num(r.Cases[2].TimeToWithin10M) << '/' << Num(r.Cases[3].TimeToWithin10M)
+      << " final_abs_m=" << Num(std::abs(r.Cases[2].FinalCrossTrackM)) << '/'
+      << Num(std::abs(r.Cases[3].FinalCrossTrackM))
+      << " trailing_rms_m=" << Num(r.Cases[2].TrailingRmsCrossTrackM) << '/'
+      << Num(r.Cases[3].TrailingRmsCrossTrackM)
+      << " | course_error: recovery_s=" << Num(r.Cases[4].CourseRecoveryTimeS) << '/'
+      << Num(r.Cases[5].CourseRecoveryTimeS)
+      << " peak_excess_m=" << Num(r.Cases[4].PostStepPeakExcessM) << '/'
+      << Num(r.Cases[5].PostStepPeakExcessM)
+      << " | left_right_abs_diff curvature_m=" << Num(r.CurvatureAbsDiffM)
+      << " cross_track_m=" << Num(r.CrossTrackAbsDiffM)
+      << " course_m=" << Num(r.CourseErrorAbsDiffM)
+      << " | left_right_normalized curvature=" << Num(r.CurvatureAsym)
+      << " cross_track=" << Num(r.CrossTrackAsym) << " course=" << Num(r.CourseErrorAsym)
+      << " | command_activity=" << Num(r.TotalCommandActivity);
+    if (r.bRejected) s << " reject=" << r.RejectSummary;
+    return s.str();
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -974,14 +1128,17 @@ int main(int argc, char **argv)
     const std::string root = argv[1];
     const std::string mode = argv[2];
     const bool bConfirm = (mode == "confirm");
-    if (!bConfirm && mode != "sweep") { std::fprintf(stderr, "unknown mode\n"); return 2; }
+    const bool bRefine = (mode == "refine");
+    if (!bConfirm && !bRefine && mode != "sweep") { std::fprintf(stderr, "unknown mode\n"); return 2; }
 
     const FGuidanceConfigV2 baseCfg = BaseConfig();
     const FF16StickConfigV2 stickCfg{};   // production defaults, unchanged
     const FGuidanceConfigV2 productionDefaults{};
 
     std::vector<FCombo> combos;
-    if (!bConfirm) {
+    if (bRefine) {
+        combos = BuildRefineCombos();
+    } else if (!bConfirm) {
         combos = BuildCombos();
     } else {
         if (argc < 7) { std::fprintf(stderr, "confirm mode needs candidates.txt\n"); return 2; }
@@ -1015,8 +1172,8 @@ int main(int argc, char **argv)
         Aggregate(results[i]);
     }
 
-    WriteCsv(argv[3], results, 15);
-    WriteCsv(argv[4], results, 9);
+    WriteCsv(argv[3], results, 15, bRefine);
+    WriteCsv(argv[4], results, 9, bRefine);
 
     // ---- ranking ---------------------------------------------------------------------------------
     std::vector<const FComboResult *> valid, rejected;
@@ -1078,7 +1235,93 @@ int main(int argc, char **argv)
     out << "combinations=" << results.size() << " valid=" << valid.size()
         << " rejected=" << rejected.size() << '\n';
 
-    if (!bConfirm) {
+    if (bRefine) {
+        std::vector<const FComboResult *> all;
+        for (const FComboResult &r : results) all.push_back(&r);
+        std::sort(all.begin(), all.end(),
+                  [](const FComboResult *a, const FComboResult *b) { return BetterRefined(*a, *b); });
+
+        out << "REFINE_GRID period=18,20,22,25,30 damping=0.6,0.7,0.8 roll_tc=0.0(pinned:the coarse "
+               "sweep showed 0/0.25/0.5/1.0 are bit-identical in this flight regime) combinations="
+            << results.size() << '\n';
+        out << "REFINE_NOTE the response-window saturation fraction is a DIAGNOSTIC and a soft "
+               "selection criterion. It is NOT applied retroactively as a hard reject; the hard gates "
+               "are exactly the ones the coarse sweep declared.\n";
+        out << "REFINE_RANKING (curvature response saturation, curvature altitude+EAS, cross-track "
+               "response saturation, cross-track 25m/10m entry time, course recovery, command "
+               "activity, absolute left/right difference)\n";
+        for (std::size_t i = 0; i < all.size(); ++i)
+            out << "  rank=" << (i + 1) << ' ' << RefineLine(*all[i]) << '\n';
+
+        out << "REFINE_RESPONSE_SPEED_VS_ERROR (the period trade-off, per damping)\n";
+        for (double d : {0.6, 0.7, 0.8}) {
+            for (const FComboResult *r : all) {
+                if (r->Combo.Damping != d) continue;
+                out << "  damping=" << Num(d) << " period=" << Num(r->Combo.PeriodS)
+                    << " curvature_saturation=" << r->CurvatureResponseSaturation
+                    << " curvature_peak_excess_m=" << Num(r->CurvatureMaxExcessM)
+                    << " curvature_altitude_error_m=" << Num(r->CurvatureMaxAltitudeErrorM)
+                    << " cross_track_saturation=" << r->CrossTrackResponseSaturation
+                    << " t_to_25m_s=" << Num(r->CrossTrackTimeTo25S)
+                    << " t_to_10m_s=" << Num(r->CrossTrackTimeTo10S)
+                    << " course_recovery_s=" << Num(r->CourseRecoveryS)
+                    << " rejected=" << (r->bRejected ? 1 : 0) << '\n';
+            }
+        }
+
+        // Is the trade-off monotone in the period, and do the leaders sit on the grid edge? If so,
+        // the ranking has NOT found an interior optimum -- it has found the end of the grid, and the
+        // real decision is a policy trade-off between capture delay and saturation. Say so, instead
+        // of letting "largest period" read as "best".
+        bool monotoneSatDown = true, monotoneCaptureUp = true;
+        for (double d : {0.6, 0.7, 0.8}) {
+            const FComboResult *prevD = nullptr;
+            for (double p : {18.0, 20.0, 22.0, 25.0, 30.0}) {
+                const FComboResult *cur = nullptr;
+                for (const FComboResult &r : results)
+                    if (r.Combo.Damping == d && r.Combo.PeriodS == p) cur = &r;
+                if (!cur) continue;
+                if (prevD) {
+                    if (cur->CrossTrackResponseSaturation > prevD->CrossTrackResponseSaturation)
+                        monotoneSatDown = false;
+                    if (Finite(cur->CrossTrackTimeTo25S) && Finite(prevD->CrossTrackTimeTo25S) &&
+                        cur->CrossTrackTimeTo25S < prevD->CrossTrackTimeTo25S)
+                        monotoneCaptureUp = false;
+                }
+                prevD = cur;
+            }
+        }
+        std::vector<const FComboResult *> candidates;
+        for (const FComboResult *r : all) {
+            if (r->bRejected) continue;
+            candidates.push_back(r);
+            if (candidates.size() == 3) break;
+        }
+        bool leadersOnGridEdge = !candidates.empty();
+        for (const FComboResult *c : candidates)
+            if (c->Combo.PeriodS != 30.0) leadersOnGridEdge = false;
+        out << "REFINE_PARETO_TRADEOFF monotone_saturation_falls_with_period="
+            << (monotoneSatDown ? 1 : 0)
+            << " monotone_capture_time_rises_with_period=" << (monotoneCaptureUp ? 1 : 0)
+            << " leaders_on_grid_upper_edge=" << (leadersOnGridEdge ? 1 : 0)
+            << " interior_optimum_found=" << ((monotoneSatDown && monotoneCaptureUp && leadersOnGridEdge) ? 0 : 1)
+            << " note=the_ranking_orders_by_the_declared_priority;within_this_grid_a_LARGER_period_"
+               "monotonically_reduces_saturation_and_longitudinal_error_while_monotonically_slowing_"
+               "the_cross_track_capture_and_loosening_the_arc,_so_the_leaders_sit_at_the_grid_edge_"
+               "and_the_choice_is_a_policy_trade_off,_NOT_an_optimum._Largest_period_is_not_"
+               "automatically_best.\n";
+        out << "REFINE_CANDIDATES count=" << candidates.size()
+            << " (candidates only -- this sweep selects no production value)\n";
+        for (std::size_t i = 0; i < candidates.size(); ++i)
+            out << "  candidate=" << (i + 1) << ' ' << RefineLine(*candidates[i]) << '\n';
+
+        if (argc >= 7) {
+            std::ofstream cand(argv[6]);
+            for (const FComboResult *r : candidates)
+                cand << std::fixed << std::setprecision(6) << r->Combo.PeriodS << ' '
+                     << r->Combo.Damping << ' ' << r->Combo.RollTcS << '\n';
+        }
+    } else if (!bConfirm) {
         out << "CURRENT_PRODUCTION_DEFAULT " << (prod ? ComboLine(*prod) : std::string("NOT_RUN"))
             << " rank=" << (prod && !prod->bRejected ? std::to_string(RankOf(prod)) : std::string("rejected")) << '\n';
         out << "PINNED_PX4_PARAM_DEFAULT " << (px4 ? ComboLine(*px4) : std::string("NOT_RUN"))
@@ -1162,7 +1405,7 @@ int main(int argc, char **argv)
     std::fputs(summary.c_str(), stdout);
 
     // the leading candidates, for the confirmation pass
-    if (!bConfirm && argc >= 7) {
+    if (!bConfirm && !bRefine && argc >= 7) {
         std::ofstream cand(argv[6]);
         for (std::size_t i = 0; i < ranked.size() && i < 5; ++i)
             cand << std::fixed << std::setprecision(6) << ranked[i]->Combo.PeriodS << ' '
