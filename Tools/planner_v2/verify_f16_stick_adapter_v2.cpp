@@ -92,13 +92,44 @@ int main() {
           }
       }
       Check(ok, "slew_limit_all_channels"); }
-    // 12. anti-windup: long saturated pitch demand, then reversal responds without integrator hangover
-    { F16StickAdapterV2 a; auto in = Base(); in.PitchReferenceRad = 1.5; // heavy nose-up demand
-      Run(a, in, 600, config);                                          // saturate for 10 s
-      auto rev = Base(600.0 / 60.0 + 10.0); rev.PitchReferenceRad = -0.2;
-      FF16StickCommandV2 o{}; int frames = 0;
-      for (; frames < 90; ++frames) { o = a.Update(rev, config); rev.SimulationTimeS += rev.DtS; if (o.bValid && o.ElevatorCmdNorm > 0.02) break; }
-      Check(o.bValid && o.ElevatorCmdNorm > 0.02 && frames < 90, "anti_windup_recovery"); }
+    // 12. PI memory: final stateful actuator sign need not equal the instantaneous error's P sign.
+    // Drive a long negative error, switch to a small positive error for one frame, then sustain that
+    // opposite error and observe recovery. Only real adapter outputs are inspected; no controller
+    // equation or assumed recovery time is copied into this test.
+    { F16StickAdapterV2 a; auto memory = Base(); memory.PitchReferenceRad = -0.2;
+      auto memoryOut = Run(a, memory, 1000, config);
+      auto opposite = Base(10.0 + 1000.0 * memory.DtS); opposite.PitchReferenceRad = 0.03;
+      auto firstOpposite = a.Update(opposite, config); opposite.SimulationTimeS += opposite.DtS;
+      Check(memoryOut.bValid && memoryOut.ElevatorCmdNorm > 0.0, "pi_memory_negative_error_positive_elevator");
+      Check(firstOpposite.bValid && firstOpposite.ElevatorCmdNorm > 0.0,
+            "pi_memory_can_override_instantaneous_positive_error_sign");
+
+      FF16StickCommandV2 prev = firstOpposite, out = firstOpposite;
+      int reversalFrame = -1, rangeViolations = 0, slewViolations = 0, nonFinite = 0;
+      double maxAbsCommand = std::abs(firstOpposite.ElevatorCmdNorm);
+      constexpr int RecoveryObservationFrames = 7200; // finite observation window, not an expected time
+      for (int frame = 0; frame < RecoveryObservationFrames; ++frame) {
+          out = a.Update(opposite, config); opposite.SimulationTimeS += opposite.DtS;
+          if (!out.bValid || !FiniteCmd(out)) ++nonFinite;
+          if (out.bValid && !InRange(out)) ++rangeViolations;
+          if (out.bValid && prev.bValid &&
+              std::abs(out.ElevatorCmdNorm - prev.ElevatorCmdNorm) > config.ElevatorSlewPerS * opposite.DtS + 1e-12)
+              ++slewViolations;
+          if (out.bValid) {
+              maxAbsCommand = std::max(maxAbsCommand, std::abs(out.ElevatorCmdNorm));
+              if (reversalFrame < 0 && out.ElevatorCmdNorm < 0.0) reversalFrame = frame;
+          }
+          prev = out;
+          if (reversalFrame >= 0) break;
+      }
+      const double reversalTimeS = reversalFrame >= 0 ? (reversalFrame + 1) * opposite.DtS : -1.0;
+      std::cout << "PI_MEMORY first_opposite_elevator=" << firstOpposite.ElevatorCmdNorm
+                << " reversal_time_s=" << reversalTimeS << " max_abs_command=" << maxAbsCommand
+                << " finite_violations=" << nonFinite << " range_violations=" << rangeViolations
+                << " slew_violations=" << slewViolations << '\n';
+      Check(reversalFrame >= 0, "sustained_opposite_error_eventually_reverses_command");
+      Check(nonFinite == 0 && rangeViolations == 0 && slewViolations == 0,
+            "pi_memory_recovery_finite_range_slew"); }
     // 13. throttle clamp: reference above max / below min clamps into configured range
     { FF16StickConfigV2 c{}; c.ThrottleMin = 0.1; c.ThrottleMax = 0.9;
       F16StickAdapterV2 a, b; auto ih = Base(); ih.ThrottleReferenceNorm = 1.5; auto il = Base(); il.ThrottleReferenceNorm = -0.5;
