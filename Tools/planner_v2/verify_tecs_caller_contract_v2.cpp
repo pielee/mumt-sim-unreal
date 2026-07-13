@@ -22,6 +22,7 @@
 // (d6f12ad1c4f70ad3230afd7d86e971421e02fef4) sets it from FW_T_VERT_ACC (@min 1, @max 10, def 7).
 #include "FormationControlV2/FormationGuidanceCoordinatorV2.h"
 
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -44,7 +45,8 @@ constexpr std::uint32_t kOriginGen = 7;
 FGuidanceCoordinatorInputV2 MakeInput(double timeS, std::uint32_t resetGen, double altitudeM,
                                       double climbRateMps, double targetAltitudeM, double targetEasMps,
                                       double easMps, double currentPitchRad,
-                                      bool targetClimbRateValid = false, double targetClimbRateMps = 0.0) {
+                                      bool targetClimbRateValid = false, double targetClimbRateMps = 0.0,
+                                      double currentRollRad = 0.0) {
     FGuidanceCoordinatorInputV2 in{};
     auto &f = in.Follower;
     f.PositionNE_m = {0.0, 0.0};
@@ -81,6 +83,8 @@ FGuidanceCoordinatorInputV2 MakeInput(double timeS, std::uint32_t resetGen, doub
 
     in.CurrentPitchRad = currentPitchRad;
     in.bCurrentPitchValid = true;
+    in.CurrentRollRad = currentRollRad;   // ACTUAL roll; the coordinator derives the load factor from it
+    in.bCurrentRollValid = true;
     in.SimulationTimeS = timeS;
     in.DtS = kDt;
     in.ResetGeneration = resetGen;
@@ -116,7 +120,7 @@ struct Run {
 Run Fly(const FGuidanceConfigV2 &cfg, double targetAltitudeM, double climbRateMps, double targetEasMps,
         double easMps = kEasMps, int frames = 600,
         bool targetClimbRateValid = false, double targetClimbRateMps = 0.0,
-        double easRampMpsPerS = 0.0) {
+        double easRampMpsPerS = 0.0, double currentRollRad = 0.0) {
     FormationGuidanceCoordinatorV2 g;
     Run r{};
     double prevPitch = 0.0, prevThrottle = 0.0; bool havePrev = false;
@@ -124,7 +128,7 @@ Run Fly(const FGuidanceConfigV2 &cfg, double targetAltitudeM, double climbRateMp
         const double t = 10.0 + k * kDt;
         const double easNow = easMps + easRampMpsPerS * (k * kDt);
         const auto in = MakeInput(t, 1u, kBaseAltM, climbRateMps, targetAltitudeM, targetEasMps,
-                                  easNow, 0.0, targetClimbRateValid, targetClimbRateMps);
+                                  easNow, 0.0, targetClimbRateValid, targetClimbRateMps, currentRollRad);
         const auto o = g.Update(in, cfg);
         if (!o.bCommandReady) continue;                 // frame 0 is the ResetFrame by contract
         ++r.ValidFrames;
@@ -557,10 +561,132 @@ int main() {
         Check(IsGuidanceConfigValid(climb), "aircraft_scale_climb_rate_is_a_valid_config");
     }
 
+    // ============================================================================================
+    // Runtime turn load factor.
+    //
+    // Pinned PX4 v1.17.0, fw_lateral_longitudinal_control/FwLateralLongitudinalControl.cpp,
+    // updateAttitude():
+    //     load_factor = 1.0f / max(cosf(euler_angles.phi()), FLT_EPSILON);   // ACTUAL roll
+    //     _tecs.set_load_factor(load_factor);                                // before _tecs.update()
+    // This is per-frame RUNTIME state, not one of the 19 static configuration setters. Inside
+    // TECSControl it enters exactly one place:
+    //     ste_rate.setpoint += load_factor_correction * (load_factor - 1)
+    // so with load_factor pinned at its class default of 1.0 the whole compensation was identically
+    // zero, no matter what FW_T_RLL2THR was configured to. The observable is the public
+    // TotalEnergyRateSetpoint; no production getter or debug hook is added.
+    // ============================================================================================
+    auto PinnedLoadFactor = [](double rollRad) {
+        return 1.0 / std::max(std::cos(rollRad), static_cast<double>(FLT_EPSILON));
+    };
+    constexpr double kDegToRad = 0.017453292519943295;
+    const Run level = Fly(cfg, kBaseAltM, 0.0, kEasMps);   // actual roll 0
+
+    Check(PinnedLoadFactor(0.0) == 1.0, "zero_bank_load_factor_is_exactly_one");
+    Check(cfg.TecsRollToThrottleCompensation > 0.0, "roll_to_throttle_compensation_gain_is_configured");
+
+    for (double deg : {10.0, 30.0, 45.0}) {
+        const double rad = deg * kDegToRad;
+        const double loadFactor = PinnedLoadFactor(rad);
+        // The compensation TECS adds to the total-energy-rate setpoint, from the pinned formula --
+        // computed here, never a hard-coded decimal.
+        const double expectedDelta = cfg.TecsRollToThrottleCompensation * (loadFactor - 1.0);
+
+        const Run right = Fly(cfg, kBaseAltM, 0.0, kEasMps, kEasMps, 600, false, 0.0, 0.0, +rad);
+        const Run leftB = Fly(cfg, kBaseAltM, 0.0, kEasMps, kEasMps, 600, false, 0.0, 0.0, -rad);
+
+        Check(loadFactor > 1.0, "bank_load_factor_exceeds_one");
+        Check(right.ValidFrames > 500 && leftB.ValidFrames > 500, "banked_frames_are_command_ready");
+        Check(right.NonFiniteFrames == 0 && leftB.NonFiniteFrames == 0, "banked_tecs_output_is_finite");
+        Check(std::abs((right.LastSteRateSp - level.LastSteRateSp) - expectedDelta) < 1.0e-3,
+              "load_factor_effect_matches_the_pinned_formula");
+        Check(std::abs((leftB.LastSteRateSp - level.LastSteRateSp) - expectedDelta) < 1.0e-3,
+              "load_factor_effect_matches_the_pinned_formula_for_negative_roll");
+        // 1/cos is even: equal-magnitude left and right bank must be bit-identical.
+        Check(right.SameSignature(leftB), "load_factor_is_symmetric_in_the_sign_of_roll");
+        // It enters the throttle (total-energy) path only; the pitch path is untouched.
+        Check(right.LastThrottle != level.LastThrottle, "load_factor_moves_the_throttle_reference");
+        Check(right.LastPitch == level.LastPitch, "load_factor_does_not_move_the_pitch_reference");
+    }
+
+    // ---- refreshed every frame; no stale bank survives a return to wings-level ----
+    {
+        FormationGuidanceCoordinatorV2 g;
+        int frame = 0;
+        auto Hold = [&](double rollRad, int frames) {
+            FGuidanceCoordinatorOutputV2 o{};
+            for (int k = 0; k < frames; ++k, ++frame)
+                o = g.Update(MakeInput(10.0 + frame * kDt, 1u, kBaseAltM, 0.0, kBaseAltM, kEasMps,
+                                       kEasMps, 0.0, false, 0.0, rollRad), cfg);
+            return o;
+        };
+        const auto straight0 = Hold(0.0, 200);
+        const auto bank30 = Hold(30.0 * kDegToRad, 200);
+        const auto bank45 = Hold(45.0 * kDegToRad, 200);
+        const auto straight1 = Hold(0.0, 200);
+        Check(straight0.bCommandReady && bank30.bCommandReady && bank45.bCommandReady &&
+                  straight1.bCommandReady, "roll_sequence_stays_command_ready");
+        Check(bank30.TotalEnergyRateSetpoint > straight0.TotalEnergyRateSetpoint,
+              "bank_raises_the_total_energy_rate_setpoint");
+        Check(bank45.TotalEnergyRateSetpoint > bank30.TotalEnergyRateSetpoint,
+              "more_bank_raises_the_total_energy_rate_setpoint_further");
+        Check(std::abs(straight1.TotalEnergyRateSetpoint - straight0.TotalEnergyRateSetpoint) < 1.0e-3,
+              "returning_to_wings_level_removes_the_bank_compensation");
+    }
+
+    // ---- a reset does not carry a high-bank load factor into the next straight frame ----
+    {
+        FormationGuidanceCoordinatorV2 g;
+        for (int k = 0; k < 200; ++k)
+            g.Update(MakeInput(10.0 + k * kDt, 1u, kBaseAltM, 0.0, kBaseAltM, kEasMps, kEasMps, 0.0,
+                               false, 0.0, 45.0 * kDegToRad), cfg);
+        const auto resetFrame = g.Update(MakeInput(15.0, 2u, kBaseAltM, 0.0, kBaseAltM, kEasMps, kEasMps,
+                                                   0.0, false, 0.0, 0.0), cfg);
+        Check(!resetFrame.bCommandReady && resetFrame.FailureReason == EGuidanceFailureV2::ResetFrame,
+              "reset_generation_change_yields_reset_frame_with_roll_input");
+        FGuidanceCoordinatorOutputV2 after{};
+        for (int k = 0; k < 200; ++k)
+            after = g.Update(MakeInput(15.0 + (k + 1) * kDt, 2u, kBaseAltM, 0.0, kBaseAltM, kEasMps,
+                                       kEasMps, 0.0, false, 0.0, 0.0), cfg);
+        Check(std::abs(after.TotalEnergyRateSetpoint - level.LastSteRateSp) < 1.0e-3,
+              "no_stale_high_bank_load_factor_survives_a_reset");
+    }
+
+    // ---- actual roll is a required, finite input on every normal frame ----
+    {
+        struct BadRoll { const char *Name; double Roll; bool Valid; EGuidanceFailureV2 Expected; };
+        const BadRoll badRolls[] = {
+            {"roll_not_valid", 0.0, false, EGuidanceFailureV2::InvalidFollower},
+            {"roll_nan", kNan, true, EGuidanceFailureV2::NonFiniteInput},
+            {"roll_inf", kInf, true, EGuidanceFailureV2::NonFiniteInput},
+        };
+        for (const BadRoll &b : badRolls) {
+            FormationGuidanceCoordinatorV2 g;
+            auto first = MakeInput(10.0, 1u, kBaseAltM, 0.0, kBaseAltM, kEasMps, kEasMps, 0.0);
+            g.Update(first, cfg);                      // consume the expected reset frame
+            auto bad = MakeInput(10.0 + kDt, 1u, kBaseAltM, 0.0, kBaseAltM, kEasMps, kEasMps, 0.0,
+                                 false, 0.0, b.Roll);
+            bad.bCurrentRollValid = b.Valid;
+            const auto o = g.Update(bad, cfg);
+            Check(!o.bCommandReady && o.FailureReason == b.Expected,
+                  "invalid_actual_roll_is_rejected_by_the_production_failure_contract");
+            Check(o.PitchReferenceRad == 0.0 && o.ThrottleReferenceNorm == 0.0,
+                  "rejected_roll_frame_emits_no_command");
+        }
+        // A finite roll on a normal frame is command-ready.
+        FormationGuidanceCoordinatorV2 g;
+        g.Update(MakeInput(10.0, 1u, kBaseAltM, 0.0, kBaseAltM, kEasMps, kEasMps, 0.0), cfg);
+        const auto ok = g.Update(MakeInput(10.0 + kDt, 1u, kBaseAltM, 0.0, kBaseAltM, kEasMps, kEasMps,
+                                           0.0, false, 0.0, 0.3), cfg);
+        Check(ok.bCommandReady && ok.FailureReason == EGuidanceFailureV2::None,
+              "finite_actual_roll_is_command_ready");
+    }
+
     std::printf("TECS_CALLER_CONTRACT_V2 checks=%d failures=%d vertAccelLimit=%.1f (PX4 FW_T_VERT_ACC min=%.1f max=%.1f)\n",
                 Checks, Failures, cfg.TecsVerticalAccelLimitMps2,
                 kTecsVerticalAccelLimitMinMps2, kTecsVerticalAccelLimitMaxMps2);
     std::printf("TECS_CALLER_CONTRACT_V2 configured_setters=19 aircraft_performance_fields=4 "
-                "generic_tuning_fields=15 runtime_state_excluded=load_factor,alt_step,air_density_refresh\n");
+                "generic_tuning_fields=15 runtime_state_contracts=1(load_factor=1/max(cos(actual_roll),"
+                "FLT_EPSILON),applied_before_every_TECS_update) "
+                "runtime_state_still_excluded=alt_step,air_density_refresh\n");
     return Failures ? 1 : 0;
 }

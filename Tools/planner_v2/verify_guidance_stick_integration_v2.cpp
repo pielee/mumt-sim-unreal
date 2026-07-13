@@ -49,7 +49,7 @@ struct Pipeline {
         auto po=pi.bValid?Planner.Update(pi.Input,d):FormationPlannerV2Output{};
         auto dto=PlannerV2OutputAdapter::Build(po,slot,f);
         FGuidanceCoordinatorInputV2 gi{}; gi.Follower=f;gi.Slot=slot;gi.PlannerDto=dto;
-        gi.CurrentPitchRad=pitch;gi.bCurrentPitchValid=true;gi.SimulationTimeS=Time;gi.DtS=dt;
+        gi.CurrentPitchRad=pitch;gi.bCurrentPitchValid=true;gi.CurrentRollRad=roll;gi.bCurrentRollValid=true;gi.SimulationTimeS=Time;gi.DtS=dt;
         gi.ResetGeneration=Reset;gi.OriginGeneration=7;
         if (forceGuidanceInvalid) gi.Follower.bWindValid=false;
         const auto go=Guidance.Update(gi);

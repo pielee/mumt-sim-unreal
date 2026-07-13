@@ -1,6 +1,7 @@
 #include "FormationControlV2/FormationGuidanceCoordinatorV2.h"
 
 #include <algorithm>
+#include <cfloat>   // FLT_EPSILON: the cosine floor the pinned PX4 caller uses for the load factor
 #include <cmath>
 
 namespace FormationControlV2 {
@@ -161,7 +162,7 @@ FGuidanceCoordinatorOutputV2 FormationGuidanceCoordinatorV2::Update(const FGuida
         return Invalid(EGuidanceFailureV2::OriginMismatch, in.ResetGeneration, in.SimulationTimeS);
     if (!in.Follower.bPositionValid || !in.Follower.bGroundVelocityValid || !in.Follower.bEasValid ||
         !in.Follower.bTasValid || !in.Follower.bAltitudeValid || !in.Follower.bClimbRateValid ||
-        !in.Follower.bSimulationTimeValid || !in.bCurrentPitchValid)
+        !in.Follower.bSimulationTimeValid || !in.bCurrentPitchValid || !in.bCurrentRollValid)
         return Invalid(EGuidanceFailureV2::InvalidFollower, in.ResetGeneration, in.SimulationTimeS);
     if (!in.Follower.bWindValid) return Invalid(EGuidanceFailureV2::InvalidWind, in.ResetGeneration, in.SimulationTimeS);
     if (!in.Follower.bRatioValid || !in.PlannerDto.Npfg.bValid || !in.PlannerDto.Tecs.bCommandReady ||
@@ -176,7 +177,8 @@ FGuidanceCoordinatorOutputV2 FormationGuidanceCoordinatorV2::Update(const FGuida
         IsFiniteGuidance(in.PlannerDto.Tecs.TargetEasMps) && IsFiniteGuidance(in.PlannerDto.Tecs.TargetAltitudeAslM) &&
         IsFiniteGuidance(in.Follower.EquivalentAirspeed_mps) && IsFiniteGuidance(in.Follower.TrueAirspeed_mps) &&
         IsFiniteGuidance(in.Follower.EasToTasRatio) && in.Follower.EasToTasRatio > 0.0 &&
-        IsFiniteGuidance(in.CurrentPitchRad) && IsFiniteGuidance(in.Follower.AltitudeAsl_m) &&
+        IsFiniteGuidance(in.CurrentPitchRad) && IsFiniteGuidance(in.CurrentRollRad) &&
+        IsFiniteGuidance(in.Follower.AltitudeAsl_m) &&
         IsFiniteGuidance(in.Follower.ClimbRate_mps);
     if (!finite) return Invalid(EGuidanceFailureV2::NonFiniteInput, in.ResetGeneration, in.SimulationTimeS);
 
@@ -207,6 +209,19 @@ FGuidanceCoordinatorOutputV2 FormationGuidanceCoordinatorV2::Update(const FGuida
     ti.target_sink_rate = static_cast<float>(config.TargetSinkRateMps); ti.forward_airspeed_acceleration = 0.0f;
     ti.altitude_rate = static_cast<float>(in.Follower.ClimbRate_mps);
     ti.altitude_rate_setpoint = in.PlannerDto.Tecs.bTargetClimbRateValid ? static_cast<float>(in.PlannerDto.Tecs.TargetClimbRateMps) : NAN;
+
+    // Turn load factor, per-cycle RUNTIME state -- not configuration, so it does not belong in
+    // RecreateControllers() and is not one of the 19 static setters. This mirrors the pinned PX4
+    // caller exactly (fw_lateral_longitudinal_control/FwLateralLongitudinalControl.cpp,
+    // updateAttitude()): the ACTUAL roll, not the NPFG roll reference, and the same cosine floor.
+    // It must be applied BEFORE Tecs->update(), which is what activates the roll-to-throttle
+    // compensation term load_factor_correction * (load_factor - 1) inside TECSControl. Only reached
+    // on a normal command frame: reset, pause, disabled and invalid frames return earlier, so no
+    // stale bank value can survive into a straight frame.
+    const float actualRollRad = static_cast<float>(in.CurrentRollRad);
+    const float loadFactor = 1.0f / std::max(std::cos(actualRollRad), FLT_EPSILON);
+    Tecs->controller().set_load_factor(loadFactor);
+
     const MumtPx4::TecsOutput to = Tecs->update(ti);
 
     FGuidanceCoordinatorOutputV2 out{};

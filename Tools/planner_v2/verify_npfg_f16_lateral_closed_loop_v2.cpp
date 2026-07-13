@@ -785,6 +785,10 @@ bool RunCase(const std::string &root, int caseIndex, const FCaseDef &def,
 
         in.CurrentPitchRad = state.PitchRad;
         in.bCurrentPitchValid = true;
+        // ACTUAL roll, from the same atomic plant snapshot that feeds the stick adapter. The
+        // production coordinator derives the TECS turn load factor from it (pinned PX4 contract).
+        in.CurrentRollRad = state.RollRad;
+        in.bCurrentRollValid = true;
         in.SimulationTimeS = state.TimeS;
         in.DtS = kControllerDtS;
         in.ResetGeneration = def.ResetGeneration;

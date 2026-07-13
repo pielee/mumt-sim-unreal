@@ -136,6 +136,16 @@ struct FGuidanceCoordinatorInputV2 {
     FPlannerV2OutputAdapterResult PlannerDto{};
     double CurrentPitchRad{};
     bool bCurrentPitchValid{};
+    // ACTUAL aircraft roll [rad], measured from the vehicle attitude / plant state -- NOT the NPFG
+    // roll reference and NOT a commanded bank. The pinned PX4 caller
+    // (fw_lateral_longitudinal_control/FwLateralLongitudinalControl.cpp, updateAttitude()) derives
+    // the TECS turn load factor from exactly this signal:
+    //     load_factor = 1 / max(cos(actual roll), FLT_EPSILON)
+    // and applies it before every TECS update. Without it TECS keeps its class default load_factor
+    // of 1.0, so the roll-to-throttle compensation term, load_factor_correction * (load_factor - 1),
+    // is identically zero and a banked turn gets no energy compensation at all.
+    double CurrentRollRad{};
+    bool bCurrentRollValid{};
     double SimulationTimeS{}, DtS{};
     std::uint32_t ResetGeneration{}, OriginGeneration{};
     bool bControllerEnabled{true}, bShadowEnabled{true}, bPaused{};

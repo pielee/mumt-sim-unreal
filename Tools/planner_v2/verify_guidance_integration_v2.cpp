@@ -41,7 +41,7 @@ struct Pipeline {
         auto pi=PlannerV2InputAdapter::Build({f,slot,Time,dt}); FormationPlannerV2Diagnostics d{};
         auto po=pi.bValid?Planner.Update(pi.Input,d):FormationPlannerV2Output{};
         auto dto=PlannerV2OutputAdapter::Build(po,slot,f); FGuidanceCoordinatorInputV2 gi{};
-        gi.Follower=f;gi.Slot=slot;gi.PlannerDto=dto;gi.CurrentPitchRad=0;gi.bCurrentPitchValid=true;
+        gi.Follower=f;gi.Slot=slot;gi.PlannerDto=dto;gi.CurrentPitchRad=0;gi.bCurrentPitchValid=true;gi.CurrentRollRad=0;gi.bCurrentRollValid=true;
         gi.SimulationTimeS=Time;gi.DtS=dt;gi.ResetGeneration=Reset;gi.OriginGeneration=7;return gi;
     }
     FGuidanceCoordinatorOutputV2 Step(FGuidanceCoordinatorInputV2 in, const FGuidanceConfigV2 &c={}) {
