@@ -17,25 +17,108 @@ bool FiniteVec(Vec2 v) { return v.IsFinite(); }
 FormationGuidanceCoordinatorV2::FormationGuidanceCoordinatorV2() = default;
 FormationGuidanceCoordinatorV2::~FormationGuidanceCoordinatorV2() = default;
 
+namespace {
+bool InRange(double v, double lo, double hi) { return IsFiniteGuidance(v) && v >= lo && v <= hi; }
+bool AtLeast(double v, double lo) { return IsFiniteGuidance(v) && v >= lo; }
+bool Positive(double v) { return IsFiniteGuidance(v) && v > 0.0; }
+} // namespace
+
 bool IsGuidanceConfigValid(const FGuidanceConfigV2 &config) {
-    return IsFiniteGuidance(config.TecsVerticalAccelLimitMps2) &&
-           config.TecsVerticalAccelLimitMps2 >= kTecsVerticalAccelLimitMinMps2 &&
-           config.TecsVerticalAccelLimitMps2 <= kTecsVerticalAccelLimitMaxMps2;
+    // Aircraft performance. These scale the entire TECS energy loop
+    // (STE_rate_max = max_climb_rate * g, STE_rate_min = -min_sink_rate * g), so a zero or
+    // non-finite value silently destroys the airspeed and throttle authority rather than failing.
+    if (!Positive(config.TecsMaxClimbRateMps)) return false;
+    if (!Positive(config.TecsMinSinkRateMps)) return false;
+    if (!InRange(config.TecsMaxSinkRateMps, kTecsMaxSinkRateMinMps, kTecsMaxSinkRateMaxMps)) return false;
+    if (config.TecsMinSinkRateMps > config.TecsMaxSinkRateMps) return false;
+    // The trim airspeed must lie inside the demanded-airspeed envelope the same config declares.
+    if (!Positive(config.EasMinMps) || !Positive(config.EasMaxMps)) return false;
+    if (config.EasMinMps > config.EasMaxMps) return false;
+    if (!Positive(config.TecsEquivalentAirspeedTrimMps)) return false;
+    if (config.TecsEquivalentAirspeedTrimMps < config.EasMinMps ||
+        config.TecsEquivalentAirspeedTrimMps > config.EasMaxMps) return false;
+
+    // Generic controller tuning, bounded by the pinned PX4 parameter ranges.
+    // vert_accel_limit: TECS defaults it to 0, which collapses the pitch slew bound in
+    // TECSControl::_calcPitchControl to [_pitch_setpoint, _pitch_setpoint] -- the pitch setpoint
+    // then never leaves its initial value and PitchReference is frozen at 0 forever. There is no
+    // safe silent fallback, so an out-of-range value is a config error.
+    if (!InRange(config.TecsVerticalAccelLimitMps2, kTecsVerticalAccelLimitMinMps2,
+                 kTecsVerticalAccelLimitMaxMps2)) return false;
+    if (!AtLeast(config.TecsAltitudeErrorTimeConstantS, kTecsAltitudeErrorTimeConstantMinS)) return false;
+    if (!AtLeast(config.TecsAirspeedErrorTimeConstantS, kTecsAirspeedErrorTimeConstantMinS)) return false;
+    if (!InRange(config.TecsPitchIntegratorGain, kTecsPitchIntegratorGainMin, kTecsPitchIntegratorGainMax)) return false;
+    if (!InRange(config.TecsPitchDamping, kTecsPitchDampingMin, kTecsPitchDampingMax)) return false;
+    if (!InRange(config.TecsThrottleIntegratorGain, kTecsThrottleIntegratorGainMin,
+                 kTecsThrottleIntegratorGainMax)) return false;
+    if (!InRange(config.TecsThrottleDamping, kTecsThrottleDampingMin, kTecsThrottleDampingMax)) return false;
+    if (!InRange(config.TecsThrottleSlewRatePerS, kTecsThrottleSlewRateMinPerS,
+                 kTecsThrottleSlewRateMaxPerS)) return false;
+    if (!InRange(config.TecsSteRateTimeConstantS, kTecsSteRateTimeConstantMinS,
+                 kTecsSteRateTimeConstantMaxS)) return false;
+    if (!InRange(config.TecsSebRateFeedForwardGain, kTecsSebRateFeedForwardMin,
+                 kTecsSebRateFeedForwardMax)) return false;
+    if (!InRange(config.TecsAltitudeRateFeedForward, kTecsAltitudeRateFeedForwardMin,
+                 kTecsAltitudeRateFeedForwardMax)) return false;
+    if (!InRange(config.TecsSpeedWeight, kTecsSpeedWeightMin, kTecsSpeedWeightMax)) return false;
+    if (!InRange(config.TecsRollToThrottleCompensation, kTecsRollToThrottleMin,
+                 kTecsRollToThrottleMax)) return false;
+    if (!InRange(config.TecsAirspeedMeasurementStdDevMps, kTecsAirspeedStdDevMin,
+                 kTecsAirspeedStdDevMax)) return false;
+    if (!InRange(config.TecsAirspeedRateMeasurementStdDevMps2, kTecsAirspeedStdDevMin,
+                 kTecsAirspeedStdDevMax)) return false;
+    if (!InRange(config.TecsAirspeedFilterProcessStdDevMps2, kTecsAirspeedStdDevMin,
+                 kTecsAirspeedStdDevMax)) return false;
+
+    // Reference-trajectory rates are a separate quantity from the energy limits above.
+    if (!Positive(config.TargetClimbRateMps) || !Positive(config.TargetSinkRateMps)) return false;
+    if (!IsFiniteGuidance(config.FastDescendAltitudeErrorM)) return false;
+    return true;
 }
 
+// Mirrors the pinned PX4 v1.17.0 caller
+// (fw_lateral_longitudinal_control/FwLateralLongitudinalControl.cpp:91-112,151). Every value comes
+// from FGuidanceConfigV2 -- no numeric literal is configured here, and nothing is left on a hidden
+// TECS class default. The config is validated in Update() before this runs, so no invalid value can
+// reach the controller and there is no fallback path.
+//
+// Deliberately NOT set here (per-frame runtime state, not configuration):
+//   set_load_factor(bank angle), handle_alt_step(), the air-density refresh of max climb / min sink,
+//   and the fast-descend slew of the altitude time constant.
 void FormationGuidanceCoordinatorV2::RecreateControllers(const FGuidanceConfigV2 &config) {
     Npfg = std::make_unique<MumtPx4::FPx4NpfgAdapter>();
     Tecs = std::make_unique<MumtPx4::FPx4TecsAdapter>();
-    Tecs->controller().enable_airspeed(true);
-    Tecs->controller().set_detect_underspeed_enabled(config.bDetectUnderspeed);
-    Tecs->controller().set_fast_descend_altitude_error(static_cast<float>(config.FastDescendAltitudeErrorM));
-    Tecs->controller().set_equivalent_airspeed_min(static_cast<float>(config.EasMinMps));
-    Tecs->controller().set_equivalent_airspeed_max(static_cast<float>(config.EasMaxMps));
-    // TECS defaults vert_accel_limit to 0, which collapses the pitch slew bound in
-    // TECSControl::_calcPitchControl to [_pitch_setpoint, _pitch_setpoint] -- the pitch setpoint
-    // then never leaves its initial value. Callers must set it (PX4 FW_T_VERT_ACC); the value is
-    // validated in Update() before this runs, so no invalid value can reach the controller.
-    Tecs->controller().set_vertical_accel_limit(static_cast<float>(config.TecsVerticalAccelLimitMps2));
+    auto &tecs = Tecs->controller();
+
+    tecs.enable_airspeed(true);
+    tecs.set_detect_underspeed_enabled(config.bDetectUnderspeed);
+
+    // Aircraft performance envelope (PX4: fw_performance_model, absent from the pinned reference).
+    tecs.set_max_climb_rate(static_cast<float>(config.TecsMaxClimbRateMps));
+    tecs.set_min_sink_rate(static_cast<float>(config.TecsMinSinkRateMps));
+    tecs.set_max_sink_rate(static_cast<float>(config.TecsMaxSinkRateMps));
+    tecs.set_equivalent_airspeed_trim(static_cast<float>(config.TecsEquivalentAirspeedTrimMps));
+    tecs.set_equivalent_airspeed_min(static_cast<float>(config.EasMinMps));
+    tecs.set_equivalent_airspeed_max(static_cast<float>(config.EasMaxMps));
+
+    // Generic controller tuning (PX4 parameters).
+    tecs.set_vertical_accel_limit(static_cast<float>(config.TecsVerticalAccelLimitMps2));
+    tecs.set_altitude_error_time_constant(static_cast<float>(config.TecsAltitudeErrorTimeConstantS));
+    tecs.set_airspeed_error_time_constant(static_cast<float>(config.TecsAirspeedErrorTimeConstantS));
+    tecs.set_integrator_gain_pitch(static_cast<float>(config.TecsPitchIntegratorGain));
+    tecs.set_pitch_damping(static_cast<float>(config.TecsPitchDamping));
+    tecs.set_integrator_gain_throttle(static_cast<float>(config.TecsThrottleIntegratorGain));
+    tecs.set_throttle_damp(static_cast<float>(config.TecsThrottleDamping));
+    tecs.set_throttle_slewrate(static_cast<float>(config.TecsThrottleSlewRatePerS));
+    tecs.set_ste_rate_time_const(static_cast<float>(config.TecsSteRateTimeConstantS));
+    tecs.set_seb_rate_ff_gain(static_cast<float>(config.TecsSebRateFeedForwardGain));
+    tecs.set_altitude_rate_ff(static_cast<float>(config.TecsAltitudeRateFeedForward));
+    tecs.set_speed_weight(static_cast<float>(config.TecsSpeedWeight));
+    tecs.set_roll_throttle_compensation(static_cast<float>(config.TecsRollToThrottleCompensation));
+    tecs.set_fast_descend_altitude_error(static_cast<float>(config.FastDescendAltitudeErrorM));
+    tecs.set_airspeed_measurement_std_dev(static_cast<float>(config.TecsAirspeedMeasurementStdDevMps));
+    tecs.set_airspeed_rate_measurement_std_dev(static_cast<float>(config.TecsAirspeedRateMeasurementStdDevMps2));
+    tecs.set_airspeed_filter_process_std_dev(static_cast<float>(config.TecsAirspeedFilterProcessStdDevMps2));
 }
 
 void FormationGuidanceCoordinatorV2::Reset(std::uint32_t generation) {

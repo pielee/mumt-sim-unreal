@@ -18,16 +18,50 @@ enum class EGuidanceFailureV2 : std::uint8_t {
     InvalidConfig
 };
 
-// TECS vertical acceleration limit, from pinned PX4 v1.17.0
-// (d6f12ad1c4f70ad3230afd7d86e971421e02fef4), parameter FW_T_VERT_ACC:
-//   @unit m/s^2  @min 1.0  @max 10.0  default 7.0f
-// TECS itself defaults this member to 0.0f, and TECSControl::_calcPitchControl derives the pitch
-// slew rate from it (pitch_increment = dt * vert_accel_limit / max(tas, eps)). At 0 the slew bound
-// collapses to [_pitch_setpoint, _pitch_setpoint], so the pitch setpoint can never leave its
-// initial value -- which is why an unconfigured TECS reports PitchReference == 0 forever. The
-// caller MUST set it; there is no safe silent fallback, so an out-of-range value is rejected.
+// ---------------------------------------------------------------------------------------------
+// TECS caller contract.
+//
+// The pinned PX4 v1.17.0 caller (d6f12ad1c4f70ad3230afd7d86e971421e02fef4,
+// src/modules/fw_lateral_longitudinal_control/FwLateralLongitudinalControl.cpp:91-112,151) configures
+// the TECS controller through a fixed set of setters before using it. Anything it does not set keeps
+// the TECS *class* default, and those class defaults are placeholders, not a usable configuration:
+// they are the values PX4 itself never runs with. Relying on them silently is the same class of
+// defect as the vert_accel_limit = 0 frozen-pitch bug, so every parameter the upstream caller sets
+// is represented here explicitly and validated.
+//
+// The upstream caller sources them from three different places, and that distinction is preserved:
+//
+//   (a) generic controller tuning  -> a PX4 parameter with an official default and range. Those
+//       defaults are used verbatim below and are cited per field.
+//   (b) aircraft performance       -> PX4 reads these from src/lib/fw_performance_model
+//       (getMaximumClimbRate(rho), getMinimumSinkRate(rho), getCalibratedTrimAirspeed()). That
+//       library is ABSENT from the pinned partial checkout, so no PX4 law can be reproduced and no
+//       F-16 value is asserted here. These fields default to the value the TECS class already used,
+//       which preserves current behaviour exactly while making the dependency explicit and
+//       configurable. Identifying real F-16 values is a separate, deliberate task.
+//   (c) per-frame runtime state    -> load factor (from bank angle), airspeed validity, underspeed
+//       disable, altitude-step handling, and the air-density refresh of (b). These are NOT
+//       configuration and are deliberately not plumbed through this struct.
+// ---------------------------------------------------------------------------------------------
+
+// (a) generic controller tuning -- pinned PX4 parameter ranges.
 inline constexpr double kTecsVerticalAccelLimitMinMps2 = 1.0;   // FW_T_VERT_ACC @min
 inline constexpr double kTecsVerticalAccelLimitMaxMps2 = 10.0;  // FW_T_VERT_ACC @max
+inline constexpr double kTecsMaxSinkRateMinMps = 1.0;           // FW_T_SINK_MAX @min
+inline constexpr double kTecsMaxSinkRateMaxMps = 15.0;          // FW_T_SINK_MAX @max
+inline constexpr double kTecsAltitudeErrorTimeConstantMinS = 2.0;   // FW_T_ALT_TC @min
+inline constexpr double kTecsAirspeedErrorTimeConstantMinS = 2.0;   // FW_T_TAS_TC @min
+inline constexpr double kTecsPitchIntegratorGainMin = 0.0, kTecsPitchIntegratorGainMax = 2.0;   // FW_T_I_GAIN_PIT
+inline constexpr double kTecsPitchDampingMin = 0.0, kTecsPitchDampingMax = 2.0;                 // FW_T_PTCH_DAMP
+inline constexpr double kTecsThrottleIntegratorGainMin = 0.0, kTecsThrottleIntegratorGainMax = 1.0; // FW_T_THR_INTEG
+inline constexpr double kTecsThrottleDampingMin = 0.0, kTecsThrottleDampingMax = 1.0;           // FW_T_THR_DAMPING
+inline constexpr double kTecsThrottleSlewRateMinPerS = 0.0, kTecsThrottleSlewRateMaxPerS = 1.0; // FW_THR_SLEW_MAX
+inline constexpr double kTecsSteRateTimeConstantMinS = 0.0, kTecsSteRateTimeConstantMaxS = 2.0; // FW_T_STE_R_TC
+inline constexpr double kTecsSebRateFeedForwardMin = 0.5, kTecsSebRateFeedForwardMax = 3.0;     // FW_T_SEB_R_FF
+inline constexpr double kTecsAltitudeRateFeedForwardMin = 0.0, kTecsAltitudeRateFeedForwardMax = 1.0; // FW_T_HRATE_FF
+inline constexpr double kTecsSpeedWeightMin = 0.0, kTecsSpeedWeightMax = 2.0;                   // FW_T_SPDWEIGHT
+inline constexpr double kTecsRollToThrottleMin = 0.0, kTecsRollToThrottleMax = 20.0;            // FW_T_RLL2THR
+inline constexpr double kTecsAirspeedStdDevMin = 0.01, kTecsAirspeedStdDevMax = 10.0;           // FW_T_SPD_*_STD
 
 struct FGuidanceConfigV2 {
     double RollLimitRad{0.7853981633974483};
@@ -35,9 +69,49 @@ struct FGuidanceConfigV2 {
     double ThrottleMin{0.0}, ThrottleMax{1.0}, ThrottleTrim{0.5};
     double EasMinMps{10.0}, EasMaxMps{80.0};
     double MinimumGroundSpeedMps{0.0};
+    // Reference-trajectory rates, NOT energy limits: PX4 FW_T_CLMB_R_SP / FW_T_SINK_R_SP feed the
+    // altitude reference generator. They are a different quantity from TecsMaxClimbRateMps /
+    // TecsMaxSinkRateMps below, which bound the specific-total-energy rate, and must never be
+    // aliased onto each other.
     double TargetClimbRateMps{10.0}, TargetSinkRateMps{10.0};
-    double FastDescendAltitudeErrorM{100.0};
-    double TecsVerticalAccelLimitMps2{7.0};   // FW_T_VERT_ACC default
+    double FastDescendAltitudeErrorM{100.0};   // FW_T_F_ALT_ERR [m]
+
+    // --- (b) aircraft performance: PX4 sources these from the absent fw_performance_model ---
+    // Climb rate produced by max allowed throttle [m/s]. Sets TECSControl STE_rate_max = value * g,
+    // which scales the whole throttle/airspeed authority. > 0.
+    double TecsMaxClimbRateMps{5.0};             // preserves the TECS class default
+    // Minimum sink rate at min throttle and trim speed [m/s]. Sets STE_rate_min = -value * g. > 0.
+    double TecsMinSinkRateMps{2.0};              // preserves the TECS class default
+    // Maximum sink rate at min throttle and max speed [m/s]. PX4 FW_T_SINK_MAX (@min 1, @max 15,
+    // default 5.0) -- the one performance value upstream takes from a parameter, not the model.
+    double TecsMaxSinkRateMps{5.0};
+    // Equivalent cruise airspeed [m/s]. PX4: performance_model.getCalibratedTrimAirspeed().
+    // Must satisfy EasMinMps <= this <= EasMaxMps.
+    double TecsEquivalentAirspeedTrimMps{15.0};  // preserves the TECS class default
+
+    // --- (a) generic controller tuning: pinned PX4 parameter defaults, used verbatim ---
+    double TecsVerticalAccelLimitMps2{7.0};          // FW_T_VERT_ACC   [m/s^2] @min 1 @max 10
+    double TecsAltitudeErrorTimeConstantS{5.0};      // FW_T_ALT_TC     [s]     @min 2
+    double TecsAirspeedErrorTimeConstantS{5.0};      // FW_T_TAS_TC     [s]     @min 2
+    double TecsPitchIntegratorGain{0.1};             // FW_T_I_GAIN_PIT [-]     @min 0 @max 2
+    double TecsPitchDamping{0.1};                    // FW_T_PTCH_DAMP  [s]     @min 0 @max 2
+    double TecsThrottleIntegratorGain{0.02};         // FW_T_THR_INTEG  [-]     @min 0 @max 1
+    double TecsThrottleDamping{0.05};                // FW_T_THR_DAMPING[s]     @min 0 @max 1
+    double TecsThrottleSlewRatePerS{0.0};            // FW_THR_SLEW_MAX [1/s]   @min 0 @max 1 (0 = off)
+    double TecsSteRateTimeConstantS{0.4};            // FW_T_STE_R_TC   [s]     @min 0 @max 2
+    double TecsSebRateFeedForwardGain{1.0};          // FW_T_SEB_R_FF   [-]     @min 0.5 @max 3
+    double TecsAltitudeRateFeedForward{0.3};         // FW_T_HRATE_FF   [-]     @min 0 @max 1
+    double TecsSpeedWeight{1.0};                     // FW_T_SPDWEIGHT  [-]     @min 0 @max 2
+    // Gain from normal load factor increase to total energy rate demand. PX4 FW_T_RLL2THR
+    // (@min 0 @max 20, default 15). It multiplies (load_factor - 1), and load factor is per-frame
+    // runtime state that this coordinator does not yet feed, so today the term contributes zero.
+    // The parameter is still configured so the caller contract matches upstream and the missing
+    // runtime path is visible rather than hidden.
+    double TecsRollToThrottleCompensation{15.0};     // FW_T_RLL2THR    [m^2/s^3]
+    double TecsAirspeedMeasurementStdDevMps{0.07};       // FW_T_SPD_STD     [m/s]   @min 0.01 @max 10
+    double TecsAirspeedRateMeasurementStdDevMps2{0.2};   // FW_T_SPD_DEV_STD [m/s^2] @min 0.01 @max 10
+    double TecsAirspeedFilterProcessStdDevMps2{0.2};     // FW_T_SPD_PRC_STD [m/s^2] @min 0.01 @max 10
+
     bool bDetectUnderspeed{true};
 };
 
