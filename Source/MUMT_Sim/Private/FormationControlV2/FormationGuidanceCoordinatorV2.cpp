@@ -17,6 +17,12 @@ bool FiniteVec(Vec2 v) { return v.IsFinite(); }
 FormationGuidanceCoordinatorV2::FormationGuidanceCoordinatorV2() = default;
 FormationGuidanceCoordinatorV2::~FormationGuidanceCoordinatorV2() = default;
 
+bool IsGuidanceConfigValid(const FGuidanceConfigV2 &config) {
+    return IsFiniteGuidance(config.TecsVerticalAccelLimitMps2) &&
+           config.TecsVerticalAccelLimitMps2 >= kTecsVerticalAccelLimitMinMps2 &&
+           config.TecsVerticalAccelLimitMps2 <= kTecsVerticalAccelLimitMaxMps2;
+}
+
 void FormationGuidanceCoordinatorV2::RecreateControllers(const FGuidanceConfigV2 &config) {
     Npfg = std::make_unique<MumtPx4::FPx4NpfgAdapter>();
     Tecs = std::make_unique<MumtPx4::FPx4TecsAdapter>();
@@ -25,6 +31,11 @@ void FormationGuidanceCoordinatorV2::RecreateControllers(const FGuidanceConfigV2
     Tecs->controller().set_fast_descend_altitude_error(static_cast<float>(config.FastDescendAltitudeErrorM));
     Tecs->controller().set_equivalent_airspeed_min(static_cast<float>(config.EasMinMps));
     Tecs->controller().set_equivalent_airspeed_max(static_cast<float>(config.EasMaxMps));
+    // TECS defaults vert_accel_limit to 0, which collapses the pitch slew bound in
+    // TECSControl::_calcPitchControl to [_pitch_setpoint, _pitch_setpoint] -- the pitch setpoint
+    // then never leaves its initial value. Callers must set it (PX4 FW_T_VERT_ACC); the value is
+    // validated in Update() before this runs, so no invalid value can reach the controller.
+    Tecs->controller().set_vertical_accel_limit(static_cast<float>(config.TecsVerticalAccelLimitMps2));
 }
 
 void FormationGuidanceCoordinatorV2::Reset(std::uint32_t generation) {
@@ -36,6 +47,9 @@ FGuidanceCoordinatorOutputV2 FormationGuidanceCoordinatorV2::Update(const FGuida
                                                                     const FGuidanceConfigV2 &config) {
     if (!in.bControllerEnabled) return Invalid(EGuidanceFailureV2::Disabled, in.ResetGeneration, in.SimulationTimeS);
     if (!in.bShadowEnabled) return Invalid(EGuidanceFailureV2::ShadowDisabled, in.ResetGeneration, in.SimulationTimeS);
+    // Rejected BEFORE RecreateControllers, so a controller is never built with an unusable TECS
+    // envelope. No silent fallback: a bad limit is a config error, not something to paper over.
+    if (!IsGuidanceConfigValid(config)) return Invalid(EGuidanceFailureV2::InvalidConfig, in.ResetGeneration, in.SimulationTimeS);
     if (!IsFiniteGuidance(in.SimulationTimeS) || !IsFiniteGuidance(in.DtS) || in.SimulationTimeS < 0.0 || in.DtS < 0.0)
         return Invalid(EGuidanceFailureV2::InvalidTime, in.ResetGeneration);
     if (!bInitialized || in.ResetGeneration != LastResetGeneration) {
