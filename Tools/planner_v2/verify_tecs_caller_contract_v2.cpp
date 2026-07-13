@@ -323,7 +323,9 @@ int main() {
     Check(cfg.TecsAirspeedMeasurementStdDevMps == 0.07, "default_airspeed_std_dev_is_px4_FW_T_SPD_STD");
     Check(cfg.TecsAirspeedRateMeasurementStdDevMps2 == 0.2, "default_airspeed_rate_std_dev_is_px4_FW_T_SPD_DEV_STD");
     Check(cfg.TecsAirspeedFilterProcessStdDevMps2 == 0.2, "default_airspeed_process_std_dev_is_px4_FW_T_SPD_PRC_STD");
-    Check(cfg.TecsMaxSinkRateMps == 5.0, "default_max_sink_rate_is_px4_FW_T_SINK_MAX");
+    // FW_T_SINK_MAX's DEFAULT (5.0) is still the production default -- only its metadata RANGE is no
+    // longer used as an aircraft performance bound.
+    Check(cfg.TecsMaxSinkRateMps == 5.0, "default_max_sink_rate_is_px4_FW_T_SINK_MAX_default");
 
     // ---- (b) aircraft performance: PX4 reads these from the ABSENT fw_performance_model, so the
     // defaults deliberately reproduce the previous TECS class defaults. They are now explicit,
@@ -449,14 +451,21 @@ int main() {
     // ---- every new parameter rejects out-of-range values as InvalidConfig ----
     struct BadField { const char *Name; double FGuidanceConfigV2::*Field; double Value; };
     const double kNan = std::numeric_limits<double>::quiet_NaN();
+    const double kInf = std::numeric_limits<double>::infinity();
     const BadField badFields[] = {
         {"max_climb_zero", &FGuidanceConfigV2::TecsMaxClimbRateMps, 0.0},
         {"max_climb_negative", &FGuidanceConfigV2::TecsMaxClimbRateMps, -1.0},
         {"max_climb_nan", &FGuidanceConfigV2::TecsMaxClimbRateMps, kNan},
         {"min_sink_zero", &FGuidanceConfigV2::TecsMinSinkRateMps, 0.0},
+        {"min_sink_negative", &FGuidanceConfigV2::TecsMinSinkRateMps, -1.0},
+        {"min_sink_nan", &FGuidanceConfigV2::TecsMinSinkRateMps, kNan},
         {"min_sink_above_max_sink", &FGuidanceConfigV2::TecsMinSinkRateMps, 9.0},
-        {"max_sink_below_px4_min", &FGuidanceConfigV2::TecsMaxSinkRateMps, 0.5},
-        {"max_sink_above_px4_max", &FGuidanceConfigV2::TecsMaxSinkRateMps, 20.0},
+        {"max_sink_zero", &FGuidanceConfigV2::TecsMaxSinkRateMps, 0.0},
+        {"max_sink_negative", &FGuidanceConfigV2::TecsMaxSinkRateMps, -1.0},
+        {"max_sink_nan", &FGuidanceConfigV2::TecsMaxSinkRateMps, kNan},
+        {"max_sink_inf", &FGuidanceConfigV2::TecsMaxSinkRateMps, kInf},
+        {"max_climb_inf", &FGuidanceConfigV2::TecsMaxClimbRateMps, kInf},
+        {"min_sink_inf", &FGuidanceConfigV2::TecsMinSinkRateMps, kInf},
         {"eas_trim_below_eas_min", &FGuidanceConfigV2::TecsEquivalentAirspeedTrimMps, 5.0},
         {"eas_trim_above_eas_max", &FGuidanceConfigV2::TecsEquivalentAirspeedTrimMps, 95.0},
         {"eas_trim_nan", &FGuidanceConfigV2::TecsEquivalentAirspeedTrimMps, kNan},
@@ -492,6 +501,60 @@ int main() {
               "coordinator_rejects_out_of_range_parameter_as_InvalidConfig");
         Check(o.PitchReferenceRad == 0.0 && o.ThrottleReferenceNorm == 0.0,
               "rejected_frame_emits_no_command");
+    }
+
+    // ---- aircraft-scale sink performance is configuration, not a PX4 parameter range ----
+    //
+    // The climb/sink performance rates describe the airframe. PX4's FW_T_SINK_MAX metadata range
+    // (1-15 m/s) is the small-fixed-wing range its parameter UI targets, and it is NOT a validation
+    // bound here: an aircraft whose measured sink rate exceeds it must be configurable, never
+    // silently rejected and never silently clamped. The values below are F-16 test-fixture numbers
+    // only; the production defaults are unchanged and assert no airframe.
+    {
+        constexpr double kFixtureMinSinkMps = 53.569103350590687;
+        constexpr double kFixtureMaxSinkMps = 83.108839138474863;
+        FGuidanceConfigV2 c = cfg;
+        c.TecsMinSinkRateMps = kFixtureMinSinkMps;
+        c.TecsMaxSinkRateMps = kFixtureMaxSinkMps;
+        Check(kFixtureMaxSinkMps > 15.0, "fixture_exercises_a_sink_rate_beyond_the_px4_metadata_range");
+        Check(IsGuidanceConfigValid(c), "aircraft_scale_sink_rates_are_a_valid_config");
+
+        FormationGuidanceCoordinatorV2 g;
+        g.Update(MakeInput(10.0, 1u, kBaseAltM, 0.0, kBaseAltM - 100.0, kEasMps, kEasMps, 0.0), c);
+        const auto o = g.Update(MakeInput(10.0 + kDt, 1u, kBaseAltM, 0.0, kBaseAltM - 100.0, kEasMps, kEasMps, 0.0), c);
+        Check(o.bCommandReady && o.FailureReason == EGuidanceFailureV2::None,
+              "aircraft_scale_sink_rates_are_command_ready");
+        Check(std::isfinite(o.PitchReferenceRad) && std::isfinite(o.ThrottleReferenceNorm),
+              "aircraft_scale_sink_rates_produce_finite_commands");
+
+        // Not clamped: an out-of-metadata-range value must actually reach TECS. If the caller (or
+        // the controller) silently clamped it to the PX4 ceiling, these two runs would be identical.
+        // Both configs differ ONLY in max sink, and both keep min sink <= max sink, so the ordering
+        // contract is not what is being exercised here.
+        FGuidanceConfigV2 beyond = cfg;
+        beyond.TecsMinSinkRateMps = 12.0;
+        beyond.TecsMaxSinkRateMps = kFixtureMaxSinkMps;   // 83.1 m/s: far past the PX4 metadata range
+        FGuidanceConfigV2 atCeiling = beyond;
+        atCeiling.TecsMaxSinkRateMps = 15.0;              // the old hard bound
+        Check(IsGuidanceConfigValid(beyond) && IsGuidanceConfigValid(atCeiling),
+              "both_max_sink_comparison_configs_valid");
+        Check(!Fly(beyond, kBaseAltM - 100.0, 0.0, kEasMps).SameSignature(Fly(atCeiling, kBaseAltM - 100.0, 0.0, kEasMps)),
+              "aircraft_scale_max_sink_rate_is_not_silently_clamped_to_the_px4_range");
+
+        // The ordering contract still holds, and it is the only relationship enforced.
+        FGuidanceConfigV2 inverted = c;
+        inverted.TecsMinSinkRateMps = kFixtureMaxSinkMps;
+        inverted.TecsMaxSinkRateMps = kFixtureMinSinkMps;
+        Check(!IsGuidanceConfigValid(inverted), "min_sink_greater_than_max_sink_is_rejected");
+        FormationGuidanceCoordinatorV2 gi;
+        const auto oi = gi.Update(MakeInput(10.0, 1u, kBaseAltM, 0.0, kBaseAltM - 100.0, kEasMps, kEasMps, 0.0), inverted);
+        Check(!oi.bCommandReady && oi.FailureReason == EGuidanceFailureV2::InvalidConfig,
+              "inverted_sink_relationship_rejected_as_InvalidConfig");
+
+        // An aircraft-scale climb rate has always been accepted; assert the symmetry explicitly.
+        FGuidanceConfigV2 climb = c;
+        climb.TecsMaxClimbRateMps = 100.539354597920735;
+        Check(IsGuidanceConfigValid(climb), "aircraft_scale_climb_rate_is_a_valid_config");
     }
 
     std::printf("TECS_CALLER_CONTRACT_V2 checks=%d failures=%d vertAccelLimit=%.1f (PX4 FW_T_VERT_ACC min=%.1f max=%.1f)\n",

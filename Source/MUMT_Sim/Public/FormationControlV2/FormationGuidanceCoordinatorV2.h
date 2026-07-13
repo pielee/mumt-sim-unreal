@@ -45,10 +45,15 @@ enum class EGuidanceFailureV2 : std::uint8_t {
 // ---------------------------------------------------------------------------------------------
 
 // (a) generic controller tuning -- pinned PX4 parameter ranges.
+//
+// These bounds apply ONLY to generic controller tuning, where the PX4 parameter range is the range
+// the control law was designed for. They are deliberately NOT applied to the aircraft performance
+// rates below: PX4's parameter metadata (e.g. FW_T_SINK_MAX @min 1 @max 15 m/s) describes the
+// small-fixed-wing envelope its parameter UI targets, not a physical law, and clamping an airframe's
+// measured climb/sink performance to it would silently reject a valid aircraft instead of
+// configuring it.
 inline constexpr double kTecsVerticalAccelLimitMinMps2 = 1.0;   // FW_T_VERT_ACC @min
 inline constexpr double kTecsVerticalAccelLimitMaxMps2 = 10.0;  // FW_T_VERT_ACC @max
-inline constexpr double kTecsMaxSinkRateMinMps = 1.0;           // FW_T_SINK_MAX @min
-inline constexpr double kTecsMaxSinkRateMaxMps = 15.0;          // FW_T_SINK_MAX @max
 inline constexpr double kTecsAltitudeErrorTimeConstantMinS = 2.0;   // FW_T_ALT_TC @min
 inline constexpr double kTecsAirspeedErrorTimeConstantMinS = 2.0;   // FW_T_TAS_TC @min
 inline constexpr double kTecsPitchIntegratorGainMin = 0.0, kTecsPitchIntegratorGainMax = 2.0;   // FW_T_I_GAIN_PIT
@@ -77,13 +82,19 @@ struct FGuidanceConfigV2 {
     double FastDescendAltitudeErrorM{100.0};   // FW_T_F_ALT_ERR [m]
 
     // --- (b) aircraft performance: PX4 sources these from the absent fw_performance_model ---
+    // These are properties of the airframe, not controller tuning. They are validated as what they
+    // are -- finite, strictly positive, and ordered (min sink <= max sink) -- and carry no numeric
+    // upper bound: any such bound would be an invented limit on the aircraft, and PX4's own
+    // parameter metadata range cannot serve as one (see the note above the tuning bounds).
+    //
     // Climb rate produced by max allowed throttle [m/s]. Sets TECSControl STE_rate_max = value * g,
     // which scales the whole throttle/airspeed authority. > 0.
     double TecsMaxClimbRateMps{5.0};             // preserves the TECS class default
     // Minimum sink rate at min throttle and trim speed [m/s]. Sets STE_rate_min = -value * g. > 0.
     double TecsMinSinkRateMps{2.0};              // preserves the TECS class default
-    // Maximum sink rate at min throttle and max speed [m/s]. PX4 FW_T_SINK_MAX (@min 1, @max 15,
-    // default 5.0) -- the one performance value upstream takes from a parameter, not the model.
+    // Maximum sink rate at min throttle and max speed [m/s]. PX4 reads it from FW_T_SINK_MAX, the
+    // one performance value upstream takes from a parameter rather than the model; that parameter's
+    // metadata range is NOT used as validation here. > 0 and >= TecsMinSinkRateMps.
     double TecsMaxSinkRateMps{5.0};
     // Equivalent cruise airspeed [m/s]. PX4: performance_model.getCalibratedTrimAirspeed().
     // Must satisfy EasMinMps <= this <= EasMaxMps.

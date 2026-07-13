@@ -27,9 +27,15 @@ bool IsGuidanceConfigValid(const FGuidanceConfigV2 &config) {
     // Aircraft performance. These scale the entire TECS energy loop
     // (STE_rate_max = max_climb_rate * g, STE_rate_min = -min_sink_rate * g), so a zero or
     // non-finite value silently destroys the airspeed and throttle authority rather than failing.
+    //
+    // All three rates are validated identically, as the airframe properties they are: finite,
+    // strictly positive, and ordered. No numeric ceiling is imposed. PX4's FW_T_SINK_MAX metadata
+    // range (1-15 m/s) is a small-fixed-wing parameter range, not an aircraft performance limit, and
+    // is deliberately not used here -- an airframe whose measured sink rate exceeds it must be
+    // configurable, not silently rejected or clamped.
     if (!Positive(config.TecsMaxClimbRateMps)) return false;
     if (!Positive(config.TecsMinSinkRateMps)) return false;
-    if (!InRange(config.TecsMaxSinkRateMps, kTecsMaxSinkRateMinMps, kTecsMaxSinkRateMaxMps)) return false;
+    if (!Positive(config.TecsMaxSinkRateMps)) return false;
     if (config.TecsMinSinkRateMps > config.TecsMaxSinkRateMps) return false;
     // The trim airspeed must lie inside the demanded-airspeed envelope the same config declares.
     if (!Positive(config.EasMinMps) || !Positive(config.EasMaxMps)) return false;
