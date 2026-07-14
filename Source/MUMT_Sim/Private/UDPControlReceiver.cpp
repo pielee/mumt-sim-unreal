@@ -18,6 +18,7 @@
 #include "UObject/UnrealType.h"
 #include "WeaponComponent.h"
 #include "InnerLoopAutopilot.h"   // PID 내루프 (GetStick 조준 제어기 대체)
+#include "State/MumtCommandOwnershipTelemetry.h"
 #include "FormationGuidance.h"    // 인엔진 60Hz 유도 (편대 슬롯 / 추격) — Phase 4
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -164,6 +165,17 @@ AUDPControlReceiver::AUDPControlReceiver()
 void AUDPControlReceiver::BeginPlay()
 {
     Super::BeginPlay();
+
+    // Command-ownership telemetry, explicit opt-in only. It exists so the SAME flight scenario can be
+    // run with the instrumentation off and on and the resulting flight compared: if the aircraft flies
+    // identically either way, the telemetry provably does not touch the command stream. Nothing in
+    // production ever passes this switch.
+    if (FParse::Param(FCommandLine::Get(), TEXT("CommandOwnershipTelemetry")))
+    {
+        MumtCommandOwnership::SetEnabled(true);
+        MumtCommandOwnership::ResetSession(TEXT("CommandLineEnabled"));
+        UE_LOG(LogTemp, Warning, TEXT("[CMDOWN] telemetry enabled by -CommandOwnershipTelemetry"));
+    }
 
     // 헤드리스 회귀: -FormationTest [-FormationTestExit] 로 에디터 설정 없이 시험 실행
     if (FParse::Param(FCommandLine::Get(), TEXT("FormationTest")))
@@ -858,6 +870,13 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
     if (JSBSim->EngineCommands.Num() > 0)
         JSBSim->EngineCommands[0].Throttle = ThrottleOut;
 
+    // Ownership telemetry: report the write that just happened. Inert unless a test enabled it.
+    MumtCommandOwnership::NotifyWrite(
+        MumtCommandOwnership::EWriterId::InnerLoopAutopilot, JSBSim,
+        MumtCommandOwnership::Axis_Aileron | MumtCommandOwnership::Axis_Elevator
+            | MumtCommandOwnership::Axis_Rudder | MumtCommandOwnership::Axis_SpeedBrake
+            | MumtCommandOwnership::Axis_Throttle);
+
     // Weapon triggers ride along with the setpoint (Phase 3). Missile edge
     // detection lives in UWeaponComponent; only forward ids > 0 so the msg
     // default (0 = never fired) can't be mistaken for a first shot.
@@ -1191,6 +1210,12 @@ bool AUDPControlReceiver::ApplyControlCommandToPawn(APawn* Pawn, const FRemoteCo
             }
             JSBSim->EngineCommands[0].Throttle = ThrottleCmd;
         }
+
+        // Ownership telemetry: report the write that just happened. Inert unless a test enabled it.
+        MumtCommandOwnership::NotifyWrite(
+            MumtCommandOwnership::EWriterId::ManualUdp, JSBSim,
+            MumtCommandOwnership::Axis_Aileron | MumtCommandOwnership::Axis_Elevator
+                | MumtCommandOwnership::Axis_Rudder | MumtCommandOwnership::Axis_Throttle);
     }
 
     // Weapon triggers (Phase 3) — same semantics as the autopilot path.

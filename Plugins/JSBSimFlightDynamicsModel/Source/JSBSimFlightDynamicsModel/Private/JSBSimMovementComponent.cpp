@@ -681,8 +681,16 @@ void UJSBSimMovementComponent::DeInitializeJSBSim()
   }
 }
 
+UJSBSimMovementComponent::FJSBSimCommandConsumeObserver UJSBSimMovementComponent::CommandConsumeObserver;
+
 void UJSBSimMovementComponent::CopyToJSBSim()
 {
+  // The command block is handed to the observer BEFORE any FCS setter runs and BEFORE Exec->Run(),
+  // by const reference. This is the instant JSBSim consumes the commands: whatever is in `Commands`
+  // here is what flies the aircraft, no matter which writer -- C++, Blueprint, or unregistered --
+  // put it there. Unbound unless a test registers an observer, and it cannot modify what follows.
+  CommandConsumeObserver.ExecuteIfBound(this, Commands, EngineCommands);
+
   // Basic flight controls
   FCS->SetDaCmd(Commands.Aileron);
   FCS->SetRollTrimCmd(Commands.RollTrim);

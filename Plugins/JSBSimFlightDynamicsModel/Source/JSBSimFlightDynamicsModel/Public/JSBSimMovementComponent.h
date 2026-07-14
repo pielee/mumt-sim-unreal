@@ -229,9 +229,25 @@ public:
 	TArray<struct FEngineState> EngineStates;
 
 	// Flight Control Commands and State
-	
+
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Commands")
 	FFlightControlCommands Commands;
+
+	// ---- Command-ownership observation hook (test instrumentation, READ-ONLY) -----------------
+	// CopyToJSBSim() is the ONE place where a command block reaches the FCS: every writer -- the
+	// autopilot, the manual/UDP path, the Falling hardover, and any Blueprint that sets Commands
+	// (it is BlueprintReadWrite) -- can only take effect by being present in `Commands` when this
+	// runs. It therefore is the only point where "what did JSBSim actually consume" is answerable.
+	//
+	// This delegate fires there, immediately BEFORE the first FCS setter, and is handed the command
+	// block by const reference so an observer cannot alter what is consumed. It is unbound by
+	// default, so a build with no observer registered behaves exactly as before.
+	//
+	// It lives in the plugin because the module dependency only runs one way (MUMT_Sim -> this
+	// plugin); the game module registers an observer rather than the plugin calling into it.
+	DECLARE_DELEGATE_ThreeParams(FJSBSimCommandConsumeObserver, const UJSBSimMovementComponent* /*Component*/,
+		const FFlightControlCommands& /*Commands*/, const TArray<struct FEngineCommand>& /*EngineCommands*/);
+	static JSBSIMFLIGHTDYNAMICSMODEL_API FJSBSimCommandConsumeObserver CommandConsumeObserver;
 
 	UPROPERTY(Transient, BlueprintReadOnly, VisibleAnywhere, Category = "State")
 	FAircraftState AircraftState;

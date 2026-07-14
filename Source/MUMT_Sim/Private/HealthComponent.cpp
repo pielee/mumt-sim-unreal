@@ -1,6 +1,7 @@
 #include "HealthComponent.h"
 #include "DrawDebugHelpers.h"
 #include "JSBSimMovementComponent.h"
+#include "State/MumtCommandOwnershipTelemetry.h"
 
 UHealthComponent::UHealthComponent()
 {
@@ -46,6 +47,10 @@ void UHealthComponent::EnterFalling()
             Engine.CutOff   = true;
             Engine.Throttle = 0.0;
         }
+
+        MumtCommandOwnership::NotifyWrite(
+            MumtCommandOwnership::EWriterId::HealthHardover, JSBSim,
+            MumtCommandOwnership::Axis_Throttle | MumtCommandOwnership::Axis_CutOff);
     }
 
     OnStartFalling.Broadcast();
@@ -95,6 +100,12 @@ void UHealthComponent::TickComponent(float DeltaTime, ELevelTick TickType,
     JSBSim->Commands.Aileron  = HardoverAileron;
     JSBSim->Commands.Elevator = HardoverElevator;
     JSBSim->Commands.Rudder   = HardoverRudder;
+
+    // Ownership telemetry: report the write that just happened. Inert unless a test enabled it.
+    MumtCommandOwnership::NotifyWrite(
+        MumtCommandOwnership::EWriterId::HealthHardover, JSBSim,
+        MumtCommandOwnership::Axis_Aileron | MumtCommandOwnership::Axis_Elevator
+            | MumtCommandOwnership::Axis_Rudder);
 
     if (JSBSim->AircraftState.AltitudeAGLFt < CrashAGLThresholdFt)
     {
