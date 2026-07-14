@@ -302,6 +302,10 @@ public:
 		FormationControlV2::FGuidanceCoordinatorInputV2 GI{};
 		GI.Follower = FNav; GI.Slot = Slot; GI.PlannerDto = Dto;
 		GI.CurrentPitchRad = FSt.Pitch_rad; GI.bCurrentPitchValid = FSt.bAttitudeValid;
+		// Roll is as REQUIRED as pitch: the coordinator feeds it to TECS as the turn load factor and
+		// rejects the frame with InvalidFollower if bCurrentRollValid is false. Same authoritative
+		// snapshot and same attitude-valid flag as pitch -- never a separately-sourced roll.
+		GI.CurrentRollRad = FSt.Roll_rad; GI.bCurrentRollValid = FSt.bAttitudeValid;
 		GI.SimulationTimeS = FS.SimTimeSec; GI.DtS = kDtS;
 		// Must be the SAME generation used for the canonical conversion above (kResetGen), otherwise the
 		// coordinator correctly rejects the frame with ResetMismatch. (The per-call SI tracker below is
@@ -332,6 +336,7 @@ public:
 			FormationControlV2::FGuidanceCoordinatorInputV2 LGI{};
 			LGI.Follower = LNav; LGI.Slot = LSlot; LGI.PlannerDto = LDto;
 			LGI.CurrentPitchRad = LSt.Pitch_rad; LGI.bCurrentPitchValid = LSt.bAttitudeValid;
+			LGI.CurrentRollRad = LSt.Roll_rad; LGI.bCurrentRollValid = LSt.bAttitudeValid;
 			LGI.SimulationTimeS = LS.SimTimeSec; LGI.DtS = kDtS;
 			LGI.ResetGeneration = kResetGen; LGI.OriginGeneration = LNav.OriginGeneration;
 			const auto LGO = St->LeaderChain.Guidance.Update(LGI);
