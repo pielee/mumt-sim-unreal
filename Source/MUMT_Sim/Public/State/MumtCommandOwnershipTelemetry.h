@@ -27,6 +27,7 @@
 class UJSBSimMovementComponent;
 struct FFlightControlCommands;
 struct FEngineCommand;
+struct FJSBSimResolvedCommandBlock;
 
 namespace MumtCommandOwnership
 {
@@ -68,9 +69,19 @@ void ResetSession(const FString &ScenarioLabel);
 // recorded is what the writer actually left behind, not what it intended.
 void NotifyWrite(EWriterId Writer, const UJSBSimMovementComponent *Component, uint8 AxisMask);
 
-// Registered as UJSBSimMovementComponent::CommandConsumeObserver while enabled.
+// Registered as UJSBSimMovementComponent::CommandConsumeObserver while enabled. Receives the LEGACY
+// INPUT block -- what the writers left behind. Writer-ordering measurement is based on this and is
+// unaffected by the arbiter.
 void OnConsume(const UJSBSimMovementComponent *Component, const FFlightControlCommands &Commands,
                const TArray<FEngineCommand> &EngineCommands);
+
+// Registered on the multicast CommandResolvedObserver while enabled. Receives what the FCS is ACTUALLY
+// about to consume. Since the arbiter exists, "the legacy block" and "the consumed block" are no longer
+// the same thing, and the log has to say which is which.
+void OnResolvedConsume(const UJSBSimMovementComponent *Component, uint64 ConsumeSequence,
+                       const FFlightControlCommands &LegacyCommands,
+                       const TArray<FEngineCommand> &LegacyEngineCommands,
+                       const FJSBSimResolvedCommandBlock &Resolved);
 
 // Human-readable report, one [CMDOWN] line per fact, for the Automation log.
 TArray<FString> BuildReport();
@@ -90,6 +101,11 @@ struct FCounters
 	int64 OwnershipTransitionCount = 0;      // last-writer identity changed between consumes
 	int64 WritesAfterConsumeSameFrame = 0;   // a write landed in the same frame AFTER the consume ran
 	int32 MaxWritesPerConsume = 0;
+	// Since the arbiter exists, the block the FCS consumes is no longer necessarily the block the
+	// writers produced. This counts the consumes where the two differ -- i.e. where arbitration
+	// actually changed something. In LegacyOrManual mode it must be 0.
+	int64 ResolvedDiffersFromLegacyCount = 0;
+	int64 ResolvedObservations = 0;
 };
 const FCounters &GetCounters();
 

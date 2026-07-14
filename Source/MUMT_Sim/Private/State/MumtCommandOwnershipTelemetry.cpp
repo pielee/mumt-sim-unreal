@@ -145,13 +145,23 @@ bool IsEnabled() { return GEnabled; }
 void SetEnabled(bool bEnable)
 {
 	GEnabled = bEnable;
+	static FDelegateHandle ResolvedHandle;
 	if (bEnable)
 	{
 		UJSBSimMovementComponent::CommandConsumeObserver.BindStatic(&OnConsume);
+		if (!ResolvedHandle.IsValid())
+		{
+			ResolvedHandle = UJSBSimMovementComponent::CommandResolvedObserver.AddStatic(&OnResolvedConsume);
+		}
 	}
 	else
 	{
 		UJSBSimMovementComponent::CommandConsumeObserver.Unbind();
+		if (ResolvedHandle.IsValid())
+		{
+			UJSBSimMovementComponent::CommandResolvedObserver.Remove(ResolvedHandle);
+			ResolvedHandle.Reset();
+		}
 	}
 }
 
@@ -303,6 +313,51 @@ void OnConsume(const UJSBSimMovementComponent *Component, const FFlightControlCo
 	S.WritesSinceConsume.Reset();
 }
 
+void OnResolvedConsume(const UJSBSimMovementComponent *Component, uint64 ConsumeSequence,
+                       const FFlightControlCommands &LegacyCommands,
+                       const TArray<FEngineCommand> &LegacyEngineCommands,
+                       const FJSBSimResolvedCommandBlock &Resolved)
+{
+	if (!GEnabled || Component == nullptr) return;
+
+	FPerComponent &S = GPerComponent.FindOrAdd(Component);
+	if (S.ActorName.IsEmpty())
+	{
+		S.ActorName = Component->GetOwner() ? Component->GetOwner()->GetActorNameOrLabel() : TEXT("<no-owner>");
+	}
+
+	const FSnapshot Legacy = Capture(LegacyCommands, LegacyEngineCommands);
+	const FSnapshot Final = Capture(Resolved.Commands, Resolved.EngineCommands);
+
+	++GCounters.ResolvedObservations;
+
+	// The distinction that now matters: the writers produced `Legacy`, but the FCS consumes `Final`.
+	// Before the arbiter these were the same object; they are not any more, and a log that blurred them
+	// would be actively misleading about what flew the aircraft.
+	if (Legacy != Final)
+	{
+		++GCounters.ResolvedDiffersFromLegacyCount;
+
+		FString Changed;
+		if (Final.Aileron    != Legacy.Aileron)    Changed += TEXT("aileron ");
+		if (Final.Elevator   != Legacy.Elevator)   Changed += TEXT("elevator ");
+		if (Final.Rudder     != Legacy.Rudder)     Changed += TEXT("rudder ");
+		if (Final.SpeedBrake != Legacy.SpeedBrake) Changed += TEXT("speedbrake ");
+		if (Final.Throttle   != Legacy.Throttle)   Changed += TEXT("throttle ");
+		if (Final.bCutOff    != Legacy.bCutOff)    Changed += TEXT("cutoff ");
+
+		LogEvent(FString::Printf(
+			TEXT("[CMDOWN] RESOLVED_DIFFERS seq=%llu actor=%s changed=[%s] legacy={%s} consumed={%s}"),
+			ConsumeSequence, *S.ActorName, *Changed.TrimEnd(), *Legacy.ToString(), *Final.ToString()));
+	}
+	else
+	{
+		LogEvent(FString::Printf(
+			TEXT("[CMDOWN] RESOLVED seq=%llu actor=%s identical_to_legacy=1 consumed={%s}"),
+			ConsumeSequence, *S.ActorName, *Final.ToString()));
+	}
+}
+
 TArray<FString> BuildReport()
 {
 	TArray<FString> Out;
@@ -325,6 +380,10 @@ TArray<FString> BuildReport()
 		     "non_finite_observation_count=%lld range_violation_observation_count=%lld"),
 		C.UnattributedChangeCount, C.WritesAfterConsumeSameFrame, C.OwnershipTransitionCount,
 		C.NonFiniteObservationCount, C.RangeViolationObservationCount));
+	Out.Add(FString::Printf(
+		TEXT("[CMDOWN] RESOLVED resolved_observations=%lld resolved_differs_from_legacy_count=%lld "
+		     "(legacy = what the writers produced; resolved = what the FCS consumed)"),
+		C.ResolvedObservations, C.ResolvedDiffersFromLegacyCount));
 
 	for (const TPair<const UJSBSimMovementComponent *, FPerComponent> &P : GPerComponent)
 	{

@@ -75,6 +75,15 @@ struct FJsbFlightSnapshot
 	double BetaRad             = 0.0; // FGAuxiliary::Getbeta()                 [rad]
 };
 
+// The command block the FDM actually consumes. CopyToJSBSim seeds this from the legacy members and
+// then feeds the FCS and the engines from it, so a resolver can decide the final commands in ONE place
+// without ever touching what the writers left in `Commands` / `EngineCommands`.
+struct FJSBSimResolvedCommandBlock
+{
+	FFlightControlCommands Commands;
+	TArray<FEngineCommand> EngineCommands;
+};
+
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class JSBSIMFLIGHTDYNAMICSMODEL_API UJSBSimMovementComponent : public UActorComponent
 {
@@ -249,6 +258,47 @@ public:
 		const FFlightControlCommands& /*Commands*/, const TArray<struct FEngineCommand>& /*EngineCommands*/);
 	static JSBSIMFLIGHTDYNAMICSMODEL_API FJSBSimCommandConsumeObserver CommandConsumeObserver;
 
+	// ---- Consume-boundary command RESOLVER (the single arbitration point) ---------------------
+	// `Commands` / `EngineCommands` are the LEGACY INPUT BLOCK: whatever the autopilot, the manual/UDP
+	// path, the Falling hardover and the aircraft Blueprints happened to leave there. Measurement
+	// showed that block can be a field-wise MIXTURE of several writers, and that is current behaviour.
+	//
+	// Nothing downstream reads those members any more. CopyToJSBSim takes a full copy, offers the copy
+	// to this resolver, and feeds the FCS and the engines from the COPY. The resolver may write only
+	// the resolved copy -- the legacy members are handed to it as const, so it cannot disturb what the
+	// writers put there, and the observation of writer ordering stays valid.
+	//
+	// Unbound by default: with no resolver, the resolved copy IS the legacy block, byte for byte, and
+	// the aircraft flies exactly as before.
+	//
+	// Generic on purpose. The plugin must not know what FormationControlV2 is (the module dependency
+	// runs one way), so the game module registers the policy.
+	DECLARE_DELEGATE_FiveParams(FJSBSimCommandResolver,
+		const UJSBSimMovementComponent* /*Component*/,
+		uint64 /*ConsumeSequence*/,
+		const FFlightControlCommands& /*LegacyCommands*/,
+		const TArray<struct FEngineCommand>& /*LegacyEngineCommands*/,
+		struct FJSBSimResolvedCommandBlock& /*Resolved (in/out)*/);
+	static JSBSIMFLIGHTDYNAMICSMODEL_API FJSBSimCommandResolver CommandResolver;
+
+	// Fires AFTER the resolver, with both blocks, so a test can prove what the FCS actually consumed
+	// and how it differs from what the writers left behind.
+	//
+	// MULTICAST on purpose: the arbiter audits its own decision here, and the ownership telemetry
+	// records the same event independently. A single-cast delegate would let whichever bound last
+	// silently displace the other -- exactly the kind of "only one writer survives" bug this whole
+	// effort exists to eliminate.
+	DECLARE_MULTICAST_DELEGATE_FiveParams(FJSBSimCommandResolvedObserver,
+		const UJSBSimMovementComponent* /*Component*/,
+		uint64 /*ConsumeSequence*/,
+		const FFlightControlCommands& /*LegacyCommands*/,
+		const TArray<struct FEngineCommand>& /*LegacyEngineCommands*/,
+		const struct FJSBSimResolvedCommandBlock& /*Resolved*/);
+	static JSBSIMFLIGHTDYNAMICSMODEL_API FJSBSimCommandResolvedObserver CommandResolvedObserver;
+
+	// Monotonic per-component consume counter, so a resolver can tell one FDM consume from the next.
+	uint64 CommandConsumeSequence = 0;
+
 	UPROPERTY(Transient, BlueprintReadOnly, VisibleAnywhere, Category = "State")
 	FAircraftState AircraftState;
 
@@ -411,7 +461,9 @@ private:
 	void CopyTankPropertiesFromJSBSim();
 
 	// Engines
-	void ApplyEnginesCommands();
+	// Takes the block explicitly rather than reading the member, so the engines are fed from the SAME
+	// resolved copy the FCS is fed from. Passing the member would silently reintroduce a second source.
+	void ApplyEnginesCommands(const TArray<FEngineCommand>& InEngineCommands);
 	void InitEnginesCommandAndStates();
 	void GetEnginesStates();
 

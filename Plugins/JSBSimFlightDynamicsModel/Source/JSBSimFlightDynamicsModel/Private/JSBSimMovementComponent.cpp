@@ -682,34 +682,57 @@ void UJSBSimMovementComponent::DeInitializeJSBSim()
 }
 
 UJSBSimMovementComponent::FJSBSimCommandConsumeObserver UJSBSimMovementComponent::CommandConsumeObserver;
+UJSBSimMovementComponent::FJSBSimCommandResolver UJSBSimMovementComponent::CommandResolver;
+UJSBSimMovementComponent::FJSBSimCommandResolvedObserver UJSBSimMovementComponent::CommandResolvedObserver;
 
 void UJSBSimMovementComponent::CopyToJSBSim()
 {
-  // The command block is handed to the observer BEFORE any FCS setter runs and BEFORE Exec->Run(),
-  // by const reference. This is the instant JSBSim consumes the commands: whatever is in `Commands`
-  // here is what flies the aircraft, no matter which writer -- C++, Blueprint, or unregistered --
-  // put it there. Unbound unless a test registers an observer, and it cannot modify what follows.
+  ++CommandConsumeSequence;
+
+  // THE LEGACY INPUT BLOCK. `Commands` / `EngineCommands` hold whatever the writers left there this
+  // frame -- the autopilot, the manual/UDP path, the Falling hardover, the Blueprints -- possibly a
+  // field-wise mixture of several of them. That mixture IS current behaviour and is preserved: the
+  // members are never written here, only copied.
+  FJSBSimResolvedCommandBlock Resolved;
+  Resolved.Commands = Commands;
+  Resolved.EngineCommands = EngineCommands;
+
+  // Observation of the legacy input, unchanged from before: still fires before anything is resolved,
+  // so the writer-ordering measurements stay exactly as valid as they were.
   CommandConsumeObserver.ExecuteIfBound(this, Commands, EngineCommands);
 
+  // THE ONE ARBITRATION POINT. Everything that could write a command has already run by now -- this is
+  // the last instant before the FDM consumes -- so a decision made here is the final one. The legacy
+  // block is const; only the resolved copy is mutable. With no resolver bound, the copy stays exactly
+  // as the writers left it.
+  CommandResolver.ExecuteIfBound(this, CommandConsumeSequence, Commands, EngineCommands, Resolved);
+
+  // What the FCS is ACTUALLY about to consume, after arbitration.
+  CommandResolvedObserver.Broadcast(this, CommandConsumeSequence, Commands, EngineCommands, Resolved);
+
+  // From here on NOTHING reads the members: the FCS and the engines are fed from the resolved copy
+  // alone, so there is exactly one source of truth for what flies the aircraft.
+  const FFlightControlCommands& C = Resolved.Commands;
+
   // Basic flight controls
-  FCS->SetDaCmd(Commands.Aileron);
-  FCS->SetRollTrimCmd(Commands.RollTrim);
-  FCS->SetDeCmd(Commands.Elevator);
-  FCS->SetPitchTrimCmd(Commands.PitchTrim);
-  FCS->SetDrCmd(-Commands.Rudder); // Rudder
-  FCS->SetDsCmd(Commands.Rudder); // Steering
-  FCS->SetYawTrimCmd(-Commands.YawTrim);
-  FCS->SetDfCmd(Commands.Flap);
-  FCS->SetDsbCmd(Commands.SpeedBrake);
-  FCS->SetDspCmd(Commands.Spoiler);
+  FCS->SetDaCmd(C.Aileron);
+  FCS->SetRollTrimCmd(C.RollTrim);
+  FCS->SetDeCmd(C.Elevator);
+  FCS->SetPitchTrimCmd(C.PitchTrim);
+  FCS->SetDrCmd(-C.Rudder); // Rudder
+  FCS->SetDsCmd(C.Rudder); // Steering
+  FCS->SetYawTrimCmd(-C.YawTrim);
+  FCS->SetDfCmd(C.Flap);
+  FCS->SetDsbCmd(C.SpeedBrake);
+  FCS->SetDspCmd(C.Spoiler);
 
   // Gears and Brake controls
-  FCS->SetLBrake(FMath::Max(Commands.LeftBrake, Commands.ParkingBrake));
-  FCS->SetRBrake(FMath::Max(Commands.RightBrake, Commands.ParkingBrake));
-  FCS->SetCBrake(FMath::Max(Commands.CenterBrake, Commands.ParkingBrake));
-  FCS->SetGearCmd(Commands.GearDown);
+  FCS->SetLBrake(FMath::Max(C.LeftBrake, C.ParkingBrake));
+  FCS->SetRBrake(FMath::Max(C.RightBrake, C.ParkingBrake));
+  FCS->SetCBrake(FMath::Max(C.CenterBrake, C.ParkingBrake));
+  FCS->SetGearCmd(C.GearDown);
 
-  ApplyEnginesCommands();
+  ApplyEnginesCommands(Resolved.EngineCommands);
 
   // TODO - Update atmosphere
 /* Atmosphere->SetTemperature(temperature->getDoubleValue(), get_Altitude(), FGAtmosphere::eCelsius);
@@ -1072,16 +1095,16 @@ void UJSBSimMovementComponent::InitEnginesCommandAndStates()
   }
 }
 
-void UJSBSimMovementComponent::ApplyEnginesCommands()
+void UJSBSimMovementComponent::ApplyEnginesCommands(const TArray<FEngineCommand>& InEngineCommands)
 {
   // Global to all engines
   Propulsion->SetFuelFreeze(FuelFreeze);
 
-  // For each engine
-  int32 EngineCount = EngineCommands.Num();
+  // For each engine -- from the RESOLVED block, not the member.
+  int32 EngineCount = InEngineCommands.Num();
   for (int32 i = 0; i < EngineCount; i++)
   {
-    FEngineCommand EngineCommand = EngineCommands[i];
+    const FEngineCommand& EngineCommand = InEngineCommands[i];
 
     // Global FCS Commands
     FCS->SetThrottleCmd(i, EngineCommand.Throttle);
