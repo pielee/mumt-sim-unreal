@@ -329,7 +329,10 @@ private:
 // ================================================================================================
 struct FCombo {
     double PeriodS{}, Damping{}, RollTcS{};
-    bool bProductionDefault{};   // 10.0 / 0.7071 / 0.0  -- the value this build ships today
+    // Whatever FGuidanceConfigV2 ships today, read from it and never restated (IsProductionDefault).
+    // These sweeps were run when that was the vendored triple 10.0 / 0.7071 / 0.0; they rejected it,
+    // and it is now 25.0 / 0.7 / 0.0 -- the value they selected.
+    bool bProductionDefault{};
     bool bPinnedPx4Default{};    // 10.0 / 0.7    / 0.5  -- NPFG_PERIOD / NPFG_DAMPING / NPFG_ROLL_TC
     std::string Key() const
     {
@@ -806,6 +809,15 @@ void ApplyRejectGates(FCaseMetrics &m, const FGuidanceConfigV2 &cfg, ECase kase)
 // ================================================================================================
 // Sweep
 // ================================================================================================
+// The production reference is read from FGuidanceConfigV2 rather than restated, so the label can
+// never drift from what the build actually ships. It used to be the vendored initializer triple
+// 10.0 / 0.7071 / 0.0; those coarse+refine sweeps rejected it, and it is now the value they selected.
+bool IsProductionDefault(double p, double d, double r)
+{
+    const FGuidanceConfigV2 k{};
+    return p == k.NpfgPeriodS && d == k.NpfgDamping && r == k.NpfgRollTimeConstantS;
+}
+
 std::vector<FCombo> BuildCombos()
 {
     const std::array<double, 6> periods{6.0, 8.0, 10.0, 12.0, 15.0, 20.0};
@@ -818,14 +830,19 @@ std::vector<FCombo> BuildCombos()
                 FCombo c{};
                 c.PeriodS = p; c.Damping = d; c.RollTcS = r;
                 c.bPinnedPx4Default = (p == 10.0 && d == 0.7 && r == 0.5);
+                c.bProductionDefault = IsProductionDefault(p, d, r);
                 combos.push_back(c);
             }
-    // The value this build ships today is NOT on the grid (damping 0.7071), so it is added as an
-    // explicit reference point and ranked alongside the grid.
-    FCombo prod{};
-    prod.PeriodS = 10.0; prod.Damping = 0.7071; prod.RollTcS = 0.0;
-    prod.bProductionDefault = true;
-    combos.push_back(prod);
+    // The COARSE GRID IS UNCHANGED (period tops out at 20 s), so the shipped value is still off it and
+    // is still appended as an explicit reference point, ranked alongside the grid: 96 + 1 = 97. Only
+    // WHICH value is being referenced has changed.
+    if (std::none_of(combos.begin(), combos.end(), [](const FCombo &c) { return c.bProductionDefault; })) {
+        const FGuidanceConfigV2 k{};
+        FCombo prod{};
+        prod.PeriodS = k.NpfgPeriodS; prod.Damping = k.NpfgDamping; prod.RollTcS = k.NpfgRollTimeConstantS;
+        prod.bProductionDefault = true;
+        combos.push_back(prod);
+    }
     return combos;
 }
 
@@ -841,6 +858,9 @@ std::vector<FCombo> BuildRefineCombos()
         for (double d : dampings) {
             FCombo x{};
             x.PeriodS = p; x.Damping = d; x.RollTcS = 0.0;
+            // The REFINE GRID IS UNCHANGED. The selected policy value happens to lie ON it, so it is
+            // labelled in place -- not appended, which would duplicate a measured point.
+            x.bProductionDefault = IsProductionDefault(p, d, 0.0);
             c.push_back(x);
         }
     return c;
@@ -1083,6 +1103,9 @@ std::string RefineLine(const FComboResult &r)
     std::ostringstream s;
     s << "period=" << Num(r.Combo.PeriodS) << " damping=" << Num(r.Combo.Damping)
       << " roll_tc=" << Num(r.Combo.RollTcS)
+      // The selected policy value lies ON this grid, so it is marked here too. The refine summary
+      // used to carry no such marker at all, because at the time nothing on the grid was shipping.
+      << (r.Combo.bProductionDefault ? " [CURRENT_PRODUCTION_DEFAULT]" : "")
       << " rejected=" << (r.bRejected ? 1 : 0)
       << " | curvature: response_saturation=" << r.CurvatureResponseSaturation
       << " (right=" << r.Cases[0].ResponseSaturatedFrames << "/3600 left="
@@ -1147,7 +1170,7 @@ int main(int argc, char **argv)
         while (in >> p >> d >> r) {
             FCombo c{};
             c.PeriodS = p; c.Damping = d; c.RollTcS = r;
-            c.bProductionDefault = (p == 10.0 && d == 0.7071 && r == 0.0);
+            c.bProductionDefault = IsProductionDefault(p, d, r);
             c.bPinnedPx4Default = (p == 10.0 && d == 0.7 && r == 0.5);
             combos.push_back(c);
         }

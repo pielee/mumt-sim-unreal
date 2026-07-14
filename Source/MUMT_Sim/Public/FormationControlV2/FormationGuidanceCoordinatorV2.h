@@ -81,12 +81,14 @@ inline constexpr double kTecsAirspeedStdDevMin = 0.01, kTecsAirspeedStdDevMax = 
 // FPx4NpfgAdapter fuses all three objects (DirectionalGuidance + AirspeedDirectionController +
 // CourseToAirspeedRefMapper), so the caller contract it must satisfy is the union of the two.
 //
-// The coordinator previously configured NONE of them: every value came from a vendored class
-// initializer. Those initializers are placeholders, exactly like the TECS class defaults were.
+// HISTORICAL AUDIT (bcfdc81): the coordinator once configured NONE of them -- every value came from
+// a vendored class initializer, which are placeholders exactly like the TECS class defaults were.
+// That commit wired all eight setters WITHOUT changing behaviour, by seeding each field with the
+// initializer it was replacing.
 //
-// DEFAULTS BELOW PRESERVE CURRENT BEHAVIOUR: each one is the value the vendored class initializer
-// already used, NOT the PX4 parameter default, because this seam is a wiring change and not a tuning
-// change. Where the two differ it is called out per field.
+// THE PERIOD AND DAMPING DEFAULTS BELOW ARE NO LONGER THOSE PLACEHOLDERS. They are a POLICY chosen
+// from measurement: the committed coarse (96-combination) and focused (15-combination) sweeps against
+// the actual JSBSim F-16 plant. The rest of the NPFG contract still carries the audited defaults.
 //
 // VALIDATION: the algorithm's own clamps (math::max / math::constrain inside the setters) are hard
 // requirements and are enforced. The PX4 parameter METADATA ranges are a small-fixed-wing parameter
@@ -102,15 +104,31 @@ struct FGuidanceConfigV2 {
 
     // --- NPFG static tuning (see the caller contract above). Runtime navigation state -- position,
     // ground velocity, wind, path geometry, airspeed -- is NOT here: it is passed per frame.
-    double NpfgPeriodS{10.0};        // NPFG_PERIOD  [s]  (PX4 param default 10.0; metadata 1..100)
-    // NPFG_DAMPING's PX4 parameter default is 0.7, but the vendored DirectionalGuidance initializer
-    // is 0.7071 (1/sqrt(2)) and that is what this build has always run with. Kept at 0.7071 so this
-    // seam changes wiring, not tuning.
-    double NpfgDamping{0.7071};      // NPFG_DAMPING [-]  (algorithmic hard range: (0, 1])
+    //
+    // PERIOD AND DAMPING ARE A MEASURED POLICY, not a placeholder. The committed F-16 plant sweeps
+    // (96-combination coarse + 15-combination focused, against the actual JSBSim F-16 at 220 m/s)
+    // REJECTED the old 10 s / 0.7071 default outright: on a left 10 km arc it held the 45 deg roll
+    // reference saturated for 2,282 frames while the right-hand mirror of the same arc never saturated
+    // at all, and it tripped the pre-declared gates for persistent cross-track divergence and for
+    // >25% roll-reference saturation, reaching 352 m of altitude error and 24.4 m/s of EAS error.
+    // The pinned PX4 parameter default (10 s / 0.7 / 0.5 s) was rejected the same way.
+    //
+    // At 25 s / 0.7 both arcs hold with ZERO roll-reference saturation, ~34.7 m peak cross-track,
+    // ~20.1 m altitude error and ~0.87 m/s EAS error. This is NOT the sweep's rank-1 -- that was 30 s,
+    // sitting on the grid's upper edge. Within the grid a longer period monotonically reduces
+    // saturation while monotonically slowing cross-track capture and loosening arc tracking, so there
+    // is no interior optimum: the ranking has no peak to find and a larger period is not automatically
+    // better. 25 s is a deliberate balance, chosen off the edge to keep formation-keeping response
+    // from going slack. Damping stays where the loop already effectively was (0.7071 -> 0.7).
+    double NpfgPeriodS{25.0};        // NPFG_PERIOD  [s]  (PX4 param default 10.0; metadata 1..100)
+    double NpfgDamping{0.7};         // NPFG_DAMPING [-]  (algorithmic hard range: (0, 1])
     bool bNpfgEnablePeriodLowerBound{true};   // NPFG_LB_PERIOD (PX4 default 1)
     bool bNpfgEnablePeriodUpperBound{true};   // NPFG_UB_PERIOD (PX4 default 1)
-    // NPFG_ROLL_TC's PX4 parameter default is 0.5 s, but the vendored initializer is 0.0 s and that
-    // is what this build has always run with. Kept at 0.0 for the same reason.
+    // NPFG_ROLL_TC's PX4 parameter default is 0.5 s. It is held at 0.0 because it is the GATE on
+    // DirectionalGuidance::adaptPeriod (`if (en_period_lb_ && roll_time_const_ > NPFG_EPSILON)`), and
+    // the sweeps measured 0.0 / 0.25 / 0.5 / 1.0 to be BIT-IDENTICAL in this flight regime: the period
+    // lower bound never reaches the nominal period and the upper bound is infinite without wind. It
+    // therefore buys nothing here, and turning it on would silently enable an untested adaptation.
     double NpfgRollTimeConstantS{0.0};        // NPFG_ROLL_TC [s]
     double NpfgSwitchDistanceMultiplier{0.32};// NPFG_SW_DST_MLT [-] (algorithmic hard min 0.1)
     double NpfgPeriodSafetyFactor{1.5};       // NPFG_PERIOD_SF  [-] (algorithmic hard min 1.0)

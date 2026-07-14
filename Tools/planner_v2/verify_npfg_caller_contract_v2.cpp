@@ -20,11 +20,17 @@
 // so the contract it must satisfy is the union: eight static setters. The coordinator previously
 // called NONE of them; every value came from a vendored class initializer.
 //
-// The one place the seam cannot be bit-preserving: AirspeedDirectionController's constructor
-// initializes p_gain_ to the literal 0.8885f, which is a ROUNDED form of its own public formula
-//     4 * pi * damping / period  =  4 * pi * 0.7071 / 10  =  0.888568044f
-// Wiring the public setter therefore normalizes that rounding (relative change 7.7e-5). That is a
-// consequence of applying the pinned formula, not a tuning change, and it is asserted here.
+// HISTORICAL AUDIT, kept because it is the reason the seam exists -- NOT a description of today's
+// defaults: when the eight setters were first wired (bcfdc81) each one was seeded with the vendored
+// initializer it replaced, so that commit changed wiring and not tuning. The single place that could
+// not be bit-preserving was AirspeedDirectionController, whose constructor initializes p_gain_ to the
+// literal 0.8885f -- a ROUNDED form of its own public formula, 4*pi*0.7071/10 = 0.888568044f. Calling
+// the public setter normalized that rounding (relative change 7.7e-5).
+//
+// THE PERIOD AND DAMPING DEFAULTS ARE NOW A MEASURED POLICY (25 s / 0.7), selected from the committed
+// F-16 plant sweeps, so p_gain no longer lands anywhere near the constructor literal and is not meant
+// to. What this audit still asserts is the CONTRACT: that the gain comes from the pinned formula
+// applied to the configured period and damping, whatever those are, rather than from a hidden literal.
 //
 // CourseToAirspeedRefMapper has no static setter in the pinned caller, so it gets no config.
 #include "FormationControl/Px4NpfgAdapter.h"
@@ -164,17 +170,23 @@ int main()
     const FGuidanceConfigV2 cfg = BaseConfig();
     Check(IsGuidanceConfigValid(cfg), "test_local_base_config_is_valid");
 
-    // ---- 1. defaults reproduce the CURRENT hidden behaviour (vendored class initializers) --------
-    // These are deliberately NOT the PX4 parameter defaults: NPFG_DAMPING defaults to 0.7 and
-    // NPFG_ROLL_TC to 0.5 upstream, while this build has always run on the vendored initializers
-    // 0.7071 and 0.0. This commit changes wiring, not tuning, so the initializers are preserved.
-    Check(cfg.NpfgPeriodS == 10.0, "default_period_matches_hidden_DirectionalGuidance_initializer");
-    Check(cfg.NpfgDamping == 0.7071, "default_damping_matches_hidden_DirectionalGuidance_initializer");
+    // ---- 1. the defaults are the EXPLICIT F-16 POLICY, not a hidden initializer ------------------
+    // Period and damping are the values selected from the committed F-16 plant sweeps. They are no
+    // longer the vendored DirectionalGuidance initializers (10.0 / 0.7071) that the wiring commit
+    // preserved, and they are not the PX4 parameter defaults (10.0 / 0.7) either: PX4's parameters
+    // are tuned for small fixed-wing airframes, and a 220 m/s F-16 is not one. See the header of
+    // FGuidanceConfigV2 for the measurements behind these two numbers.
+    Check(cfg.NpfgPeriodS == 25.0, "default_period_is_the_measured_f16_policy_value");
+    Check(cfg.NpfgDamping == 0.7, "default_damping_is_the_measured_f16_policy_value");
+    // The rest of the contract still carries the audited vendored initializers: the sweeps found no
+    // reason to move them, and the roll time constant is held at 0.0 deliberately (see below).
     Check(cfg.bNpfgEnablePeriodLowerBound, "default_period_lower_bound_matches_hidden_initializer");
     Check(cfg.bNpfgEnablePeriodUpperBound, "default_period_upper_bound_matches_hidden_initializer");
     Check(cfg.NpfgRollTimeConstantS == 0.0, "default_roll_time_constant_matches_hidden_initializer");
     Check(cfg.NpfgSwitchDistanceMultiplier == 0.32, "default_switch_distance_multiplier_matches_hidden_initializer");
     Check(cfg.NpfgPeriodSafetyFactor == 1.5, "default_period_safety_factor_matches_hidden_initializer");
+    // The policy defaults must be legal on their own terms, not just assignable.
+    Check(IsGuidanceConfigValid(FGuidanceConfigV2{}), "shipped_default_config_is_valid");
 
     // ---- 2. the heading-controller P gain comes from the pinned formula, not the literal ---------
     // AirspeedDirectionController exposes no gain getter, but controlHeading() is linear in p_gain_,
@@ -223,18 +235,34 @@ int main()
         return s;
     };
 
-    FGuidanceConfigV2 cPeriod = cfg;  cPeriod.NpfgPeriodS = 25.0;
+    // The variant must not collide with the default, or "it moved the output" would prove nothing.
+    FGuidanceConfigV2 cPeriod = cfg;  cPeriod.NpfgPeriodS = 12.0;
+    Check(cPeriod.NpfgPeriodS != cfg.NpfgPeriodS, "period_variant_actually_differs_from_the_default");
     const NpfgSig sPeriod = Differs(cPeriod, "period_reaches_npfg");
     FGuidanceConfigV2 cDamp = cfg;    cDamp.NpfgDamping = 0.35;
+    Check(cDamp.NpfgDamping != cfg.NpfgDamping, "damping_variant_actually_differs_from_the_default");
     const NpfgSig sDamp = Differs(cDamp, "damping_reaches_npfg");
 
     // The roll time constant is the GATE on NPFG's whole period-adaptation block:
     //     DirectionalGuidance::adaptPeriod  ->  if (en_period_lb_ && roll_time_const_ > NPFG_EPSILON)
-    // The vendored initializer is 0.0 (PX4's NPFG_ROLL_TC parameter defaults to 0.5), so with the
-    // committed defaults the stability-bound machinery -- the lower bound, the upper bound and the
-    // safety factor -- is entirely inert, and the adapted period is always the nominal period.
-    // Turning it on must therefore move the output, and the other three become observable only then.
-    FGuidanceConfigV2 cRollTc = cfg;  cRollTc.NpfgRollTimeConstantS = 3.0;
+    // The default is 0.0, so the stability-bound machinery -- the lower bound, the upper bound and the
+    // safety factor -- is entirely inert and the adapted period is always the nominal period. Turning
+    // it on must therefore move the output, and the other three become observable only then.
+    //
+    // But merely being non-zero is not enough to be OBSERVABLE, because adaptPeriod only ever raises:
+    //     period = max(period_lb, period_)      period_lb = pi * roll_tc / damping * safety_factor
+    // With no wind the bound must exceed the NOMINAL period to bind at all, which at the F-16 policy
+    // defaults means roll_tc > 25 * 0.7 / (1.5 * pi) = 3.71 s. The old variant was 3.0 s, sized when
+    // the nominal period was 10 s and the bound cleared it comfortably. At 25 s that same 3.0 s no
+    // longer binds, the adapted period stays nominal, and "roll_time_constant_reaches_npfg" FAILS --
+    // loudly, which is how this change was caught. The variant is therefore re-sized against the
+    // current default, and the margin is asserted rather than assumed, so the next period change
+    // cannot quietly turn this check into a no-op.
+    constexpr double kLbRollTcS = 6.0;
+    FGuidanceConfigV2 cRollTc = cfg;  cRollTc.NpfgRollTimeConstantS = kLbRollTcS;
+    const double periodLbS = M_PI * kLbRollTcS / cfg.NpfgDamping * cfg.NpfgPeriodSafetyFactor;
+    Check(periodLbS > cfg.NpfgPeriodS,
+          "roll_time_constant_variant_is_large_enough_that_the_period_lower_bound_binds");
     const NpfgSig sRollTc = Differs(cRollTc, "roll_time_constant_reaches_npfg");
     Check(cfg.NpfgRollTimeConstantS == 0.0,
           "committed_default_roll_time_constant_disables_npfg_period_adaptation");
@@ -262,6 +290,8 @@ int main()
     constexpr double kUbRollTcS = 0.5;          // small enough that period_lb stays below the period
     constexpr double kWindEastMps = 100.0;      // windFactor(220, 100) != 0
     constexpr double kTightCurvature = 2.0e-2;  // 50 m radius: a large air turn rate
+    Check(M_PI * kUbRollTcS / cfg.NpfgDamping * cfg.NpfgPeriodSafetyFactor < cfg.NpfgPeriodS,
+          "upper_bound_variant_keeps_the_lower_bound_below_the_nominal_period");
     FGuidanceConfigV2 cUbOn = cfg;   cUbOn.NpfgRollTimeConstantS = kUbRollTcS;
     FGuidanceConfigV2 cUb = cUbOn;   cUb.bNpfgEnablePeriodUpperBound = false;
     Check(IsGuidanceConfigValid(cUbOn) && IsGuidanceConfigValid(cUb), "upper_bound_variant_config_valid");
@@ -432,11 +462,17 @@ int main()
                 "CourseToAirspeedRefMapper=no_static_setter_in_the_pinned_caller "
                 "runtime_navigation_state=position,ground_velocity,wind,path_geometry,airspeed\n");
     std::printf("NPFG_CALLER_CONTRACT_V2 defaults period=%.4f damping=%.4f period_lb=%d period_ub=%d "
-                "roll_tc=%.4f switch_distance_multiplier=%.4f period_safety_factor=%.4f "
-                "(vendored initializers preserved; PX4 param defaults NPFG_DAMPING=0.7 and "
-                "NPFG_ROLL_TC=0.5 are deliberately NOT adopted in this wiring commit)\n",
+                "roll_tc=%.4f switch_distance_multiplier=%.4f period_safety_factor=%.4f\n",
                 cfg.NpfgPeriodS, cfg.NpfgDamping, cfg.bNpfgEnablePeriodLowerBound ? 1 : 0,
                 cfg.bNpfgEnablePeriodUpperBound ? 1 : 0, cfg.NpfgRollTimeConstantS,
                 cfg.NpfgSwitchDistanceMultiplier, cfg.NpfgPeriodSafetyFactor);
+    std::printf("NPFG_CALLER_CONTRACT_V2 default_provenance "
+                "period=f16_plant_sweep_policy damping=f16_plant_sweep_policy "
+                "roll_tc=vendored_initializer_held_at_zero_gates_period_adaptation "
+                "period_lb=vendored period_ub=vendored switch_distance_multiplier=vendored "
+                "period_safety_factor=vendored "
+                "(the vendored DirectionalGuidance initializers 10.0/0.7071 and the PX4 param "
+                "defaults 10.0/0.7 are BOTH superseded for period and damping; PX4's parameters are "
+                "tuned for small fixed-wing airframes, not a 220 m/s F-16)\n");
     return Failures ? 1 : 0;
 }
