@@ -172,7 +172,7 @@ struct FArbState
 	Arb::FFormationCandidate LastCandidate;
 };
 
-UJSBSimMovementComponent *FindAircraft(UWorld *World, const TCHAR *LabelSubstring, AActor **OutActor = nullptr)
+UJSBSimMovementComponent *FindArbAircraft(UWorld *World, const TCHAR *LabelSubstring, AActor **OutActor = nullptr)
 {
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
@@ -186,7 +186,7 @@ UJSBSimMovementComponent *FindAircraft(UWorld *World, const TCHAR *LabelSubstrin
 	return nullptr;
 }
 
-double GetSimTime(UWorld *World)
+double GetArbSimTime(UWorld *World)
 {
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
@@ -234,7 +234,7 @@ public:
 			St->Udp.Send(TEXT("M_F16"), 0.15, -0.05, 0.0, 0.7);
 		}
 
-		const double SimT = GetSimTime(World);
+		const double SimT = GetArbSimTime(World);
 		if (SimT >= 0.0 && St->FirstSim < 0.0) St->FirstSim = SimT;
 		const double SinceStart = (St->FirstSim >= 0.0 && SimT >= 0.0) ? (SimT - St->FirstSim) : 0.0;
 
@@ -261,7 +261,7 @@ public:
 		if (Scenario == EArbScenario::FallingOverCandidate && !St->bDamaged && Elapsed >= kArbDamageAtS)
 		{
 			AActor *Actor = nullptr;
-			if (UJSBSimMovementComponent *C = FindAircraft(World, TEXT("F16_UAV1"), &Actor))
+			if (UJSBSimMovementComponent *C = FindArbAircraft(World, TEXT("F16_UAV1"), &Actor))
 			{
 				if (UHealthComponent *H = Actor ? Actor->FindComponentByClass<UHealthComponent>() : nullptr)
 				{
@@ -302,7 +302,7 @@ private:
 			Scenario == EArbScenario::Isolation;
 		if (!bNeedsCandidate) return;
 
-		UJSBSimMovementComponent *Target = FindAircraft(World, TEXT("F16_UAV1"));
+		UJSBSimMovementComponent *Target = FindArbAircraft(World, TEXT("F16_UAV1"));
 		if (!Target) return;
 
 		if (!St->bModeSet)
@@ -365,7 +365,7 @@ private:
 		// world is checked rather than assumed -- Finalize can also be reached from an error path.)
 		if (UWorld *W = (GEditor && GEditor->PlayWorld) ? GEditor->PlayWorld : nullptr)
 		{
-			if (UJSBSimMovementComponent *Cmp = FindAircraft(W, TEXT("F16_UAV1")))
+			if (UJSBSimMovementComponent *Cmp = FindArbAircraft(W, TEXT("F16_UAV1")))
 			{
 				Arb::SetModeForTesting(Cmp, Arb::ECommandMode::LegacyOrManual);
 			}
@@ -571,7 +571,7 @@ public:
 			MumtCommandOwnership::ResetSession(TEXT("ProductionDefault"));
 		}
 
-		const double SimT = GetSimTime(World);
+		const double SimT = GetArbSimTime(World);
 		if (SimT >= 0.0 && St->FirstSim < 0.0) St->FirstSim = SimT;
 		const double SinceStart = (St->FirstSim >= 0.0 && SimT >= 0.0) ? (SimT - St->FirstSim) : 0.0;
 
@@ -654,7 +654,7 @@ public:
 			Test->TestTrue(TEXT("LIFE: the resolver is bound by the module"), Arb::IsEnabled());
 		}
 
-		const double SimT = GetSimTime(World);
+		const double SimT = GetArbSimTime(World);
 		if (SimT >= 0.0 && St->FirstSim < 0.0) St->FirstSim = SimT;
 		const double SinceStart = (St->FirstSim >= 0.0 && SimT >= 0.0) ? (SimT - St->FirstSim) : 0.0;
 		if (SinceStart < kArbSettleS) return false;
@@ -665,7 +665,7 @@ public:
 			Test->TestTrue(TEXT("LIFE: aircraft are registered while the world runs"), SizeBefore > 0);
 
 			AActor *Victim = nullptr;
-			UJSBSimMovementComponent *C = FindAircraft(World, TEXT("F16_UAV2"), &Victim);
+			UJSBSimMovementComponent *C = FindArbAircraft(World, TEXT("F16_UAV2"), &Victim);
 			if (!C || !Victim)
 			{
 				Test->AddError(TEXT("[ARBITER] LIFE: no F16_UAV2 to destroy"));

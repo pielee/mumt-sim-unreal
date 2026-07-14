@@ -126,6 +126,29 @@ bool IsCandidateFinite(const FFormationCandidate &K)
 	    && FMath::IsFinite(K.ThrottleNorm) && FMath::IsFinite(K.SpeedBrakeNorm);
 }
 
+#if WITH_DEV_AUTOMATION_TESTS
+double GClockOverrideS = -1.0;   // < 0 == no override; the ONLY way this is ever set is from a test
+#endif
+
+// The arbiter's single notion of "now". In a shipping build this compiles down to FApp::GetCurrentTime()
+// and nothing else: the override does not exist there.
+double NowS()
+{
+#if WITH_DEV_AUTOMATION_TESTS
+	if (GClockOverrideS >= 0.0) return GClockOverrideS;
+#endif
+	return FApp::GetCurrentTime();
+}
+
+// Freshness is asked TWICE about the same candidate -- once when it is submitted and again at the consume
+// boundary where the handoff actually lands -- so it lives in one place. A candidate that was fresh at
+// submission is not thereby fresh forever, and a second question with a different answer is the whole point.
+bool IsCandidateFresh(const FFormationCandidate &K)
+{
+	const double Age = NowS() - K.TimestampS;
+	return K.TimestampS >= 0.0 && Age >= 0.0 && Age <= kCandidateMaxAgeS;
+}
+
 struct FPerAircraft
 {
 	FString ActorName;
@@ -141,6 +164,15 @@ struct FPerAircraft
 	FFlightControlCommands LegacyAtResolve;
 	TArray<FEngineCommand> LegacyEngineAtResolve;
 	bool bResolvePending = false;
+
+	// ---- Phase B ----
+	FResolvedCommandSnapshot LastResolved;   // the 29-field block the FDM actually consumed
+	EPrimeState PrimeState = EPrimeState::IdleLegacy;
+	FPrimeTicket Ticket;
+	uint64 NextPrimeGeneration = 1;          // strictly monotonic per aircraft; 0 means "no ticket"
+	bool bAwaitingHandoffMeasure = false;    // the next Formation consume is the handoff
+	EPrimeFailure LastBoundaryFailure = EPrimeFailure::None;   // why the boundary last refused to hand over
+	FHandoffDelta Handoff;
 
 	FAircraftCounters Counters;
 };
@@ -185,6 +217,7 @@ void LogEvent(const FString &Line)
 // holds a handful of aircraft, so it is free) as well as on world teardown.
 void PurgeDead()
 {
+	check(IsInGameThread());
 	for (auto It = GAircraft.CreateIterator(); It; ++It)
 	{
 		if (!It.Key().IsValid()) It.RemoveCurrent();
@@ -202,6 +235,7 @@ void PurgeDead()
 // so invalidity is checked FIRST and those entries are dropped (they belong to nobody now anyway).
 void OnWorldCleanup(UWorld *World, bool /*bSessionEnded*/, bool /*bCleanupResources*/)
 {
+	check(IsInGameThread());
 	for (auto It = GAircraft.CreateIterator(); It; ++It)
 	{
 		const UJSBSimMovementComponent *Component = It.Key().Get();
@@ -247,6 +281,7 @@ void Resolve(const UJSBSimMovementComponent *Component, uint64 ConsumeSequence,
              const FFlightControlCommands &LegacyCommands, const TArray<FEngineCommand> &LegacyEngineCommands,
              FJSBSimResolvedCommandBlock &Resolved)
 {
+	check(IsInGameThread());   // the consume boundary and the registry are game-thread only
 	if (!GEnabled || Component == nullptr) return;
 
 	FPerAircraft &S = Find(Component);
@@ -272,7 +307,101 @@ void Resolve(const UJSBSimMovementComponent *Component, uint64 ConsumeSequence,
 	{
 		S.LastSource = EResolutionSource::FallingLegacy;
 		S.LastFallback = EFallbackReason::Falling;
+
+		// SAFETY PRE-EMPTS BUMPLESS. A handoff in flight is abandoned outright -- no blend, no delay --
+		// and the ticket is destroyed so it cannot be replayed if the aircraft is somehow revived. The
+		// mode goes back to Legacy too: recovering from a hardover must not silently resume Formation.
+		if (S.PrimeState != EPrimeState::IdleLegacy)
+		{
+			++GCounters.PrimeCancelledByFallingCount;
+			LogEvent(FString::Printf(
+				TEXT("[PRIME] CANCELLED_BY_FALLING actor=%s state=%s generation=%llu"),
+				*S.ActorName, PrimeStateName(S.PrimeState), S.Ticket.Generation));
+			S.PrimeState = EPrimeState::IdleLegacy;
+			S.Ticket = FPrimeTicket{};
+			S.bHaveCandidate = false;
+			S.bAwaitingHandoffMeasure = false;
+			S.Mode = ECommandMode::LegacyOrManual;
+			S.Counters.Mode = S.Mode;
+		}
 		return;
+	}
+
+	// 1b. THE ACTIVATION BOUNDARY.
+	//
+	// ActivateFormationForTesting() only ASKS. The switch itself happens here, at the consume boundary,
+	// because only here can we check the thing that actually matters: is the block the FDM last consumed
+	// still the one the ticket was cut from?
+	//
+	// If ANY Legacy consume slipped in between the prime and the activation landing, the baseline is
+	// stale -- the aircraft is now flying something the candidate was never continuous with -- and
+	// switching would step. Flipping the mode inside Activate() could not see this: the intervening
+	// consume happens after it returns.
+	if (S.PrimeState == EPrimeState::ActivationPending)
+	{
+		const bool bBaselineStillCurrent =
+			S.Ticket.bValid && S.LastResolved.bValid
+			&& S.LastResolved.ConsumeSequence == S.Ticket.BaselineConsumeSequence;
+
+		if (!bBaselineStillCurrent)
+		{
+			++GCounters.InterveningConsumeRejectedCount;
+			S.LastBoundaryFailure = EPrimeFailure::InterveningConsume;
+			LogEvent(FString::Printf(
+				TEXT("[PRIME] INTERVENING_CONSUME actor=%s generation=%llu baseline_seq=%llu last_resolved_seq=%llu "
+				     "-- the aircraft moved on; refusing to hand over to a stale candidate"),
+				*S.ActorName, S.Ticket.Generation, S.Ticket.BaselineConsumeSequence,
+				S.LastResolved.bValid ? S.LastResolved.ConsumeSequence : 0));
+
+			// The ticket and its candidate are dead. Progress requires a NEW prime against the command
+			// the aircraft is actually flying now.
+			S.PrimeState = EPrimeState::IdleLegacy;
+			S.Ticket = FPrimeTicket{};
+			S.bHaveCandidate = false;
+			S.Mode = ECommandMode::LegacyOrManual;
+			S.Counters.Mode = S.Mode;
+			S.LastSource = EResolutionSource::Legacy;
+			S.LastFallback = EFallbackReason::None;
+			return;
+		}
+
+		// The baseline is current -- but is the CANDIDATE? It was fresh when it was submitted; that was
+		// then. Freshness is not a property a candidate keeps: the producer may have died, the frame that
+		// built it may be long gone, and handing the aircraft to a command computed for a state it has
+		// since left is exactly the step this phase exists to prevent. So it is asked again, HERE, at the
+		// only moment that matters -- and this refusal is NOT the same as an intervening consume, so it
+		// does not get to hide behind that counter.
+		if (!S.bHaveCandidate || !IsCandidateFresh(S.Candidate))
+		{
+			++GCounters.ActivationStaleRejectedCount;
+			S.LastBoundaryFailure = EPrimeFailure::StaleCandidate;
+			LogEvent(FString::Printf(
+				TEXT("[PRIME] STALE_AT_BOUNDARY actor=%s generation=%llu candidate_age=%.6f max_age=%.6f "
+				     "-- the candidate rotted between submission and the handoff; staying on Legacy"),
+				*S.ActorName, S.Ticket.Generation,
+				S.bHaveCandidate ? NowS() - S.Candidate.TimestampS : -1.0, kCandidateMaxAgeS));
+
+			S.PrimeState = EPrimeState::IdleLegacy;
+			S.Ticket = FPrimeTicket{};
+			S.bHaveCandidate = false;
+			S.Mode = ECommandMode::LegacyOrManual;
+			S.Counters.Mode = S.Mode;
+			S.LastSource = EResolutionSource::Legacy;
+			S.LastFallback = EFallbackReason::Stale;
+			return;
+		}
+
+		// The baseline is still what the aircraft is flying, and the candidate is still worth flying it
+		// with. Hand over on THIS consume.
+		S.LastBoundaryFailure = EPrimeFailure::None;
+		S.Mode = ECommandMode::FormationControlV2;
+		S.Counters.Mode = S.Mode;
+		S.PrimeState = EPrimeState::ActiveFormation;
+		S.bAwaitingHandoffMeasure = true;
+		++GCounters.ActivationGrantedCount;
+		++GCounters.ModeTransitionCount;
+		LogEvent(FString::Printf(TEXT("[PRIME] ACTIVATED actor=%s generation=%llu at_consume=%llu"),
+			*S.ActorName, S.Ticket.Generation, ConsumeSequence));
 	}
 
 	// 2. Default mode: pass the legacy block through untouched.
@@ -311,8 +440,7 @@ void Resolve(const UJSBSimMovementComponent *Component, uint64 ConsumeSequence,
 		S.LastFallback = EFallbackReason::NonFinite;
 		return;
 	}
-	const double Age = FApp::GetCurrentTime() - K.TimestampS;
-	if (K.TimestampS < 0.0 || Age > kCandidateMaxAgeS || Age < 0.0)
+	if (!IsCandidateFresh(K))
 	{
 		S.LastSource = EResolutionSource::Legacy;
 		S.LastFallback = EFallbackReason::Stale;
@@ -340,6 +468,7 @@ void OnResolved(const UJSBSimMovementComponent *Component, uint64 ConsumeSequenc
                 const FFlightControlCommands &LegacyCommands, const TArray<FEngineCommand> &LegacyEngineCommands,
                 const FJSBSimResolvedCommandBlock &Resolved)
 {
+	check(IsInGameThread());
 	if (!GEnabled || Component == nullptr) return;
 
 	// Once per consume: a destroyed aircraft's entry (and its mode/candidate) leaves the registry here.
@@ -402,6 +531,57 @@ void OnResolved(const UJSBSimMovementComponent *Component, uint64 ConsumeSequenc
 	if (!IsBlockFinite(Resolved))    ++GCounters.ResolvedNonFiniteCount;
 	if (IsBlockOutOfRange(Resolved)) ++GCounters.ResolvedRangeViolationCount;
 
+	// ---- Phase B: the baseline a future handoff must be continuous with -----------------------------
+	// This is the command the FDM ACTUALLY consumed -- not the legacy writer block, which is only an
+	// input and can be a shifting mixture of several writers. All 29 fields are kept.
+	//
+	// THE HANDOFF STEP, measured against the IMMUTABLE TICKET BASELINE -- not against "the previous
+	// consume".
+	//
+	// That distinction is the whole validity of the measurement. Comparing this consume with the previous
+	// one would, whenever nothing intervened, be comparing the block with a copy of itself: a zero would
+	// prove only that the arbiter did not corrupt its own snapshot. The ticket baseline is a frozen copy
+	// taken at RequestPrime and never touched again, so a zero here means the FDM really is consuming the
+	// command it was already flying. (PrimeHandoffDeltaNegativeControl exists to prove this can be
+	// non-zero.)
+	if (S.bAwaitingHandoffMeasure && S.Ticket.bValid && S.Ticket.Baseline.bValid
+		&& S.LastSource == EResolutionSource::Formation)
+	{
+		const FFlightControlCommands &P = S.Ticket.Baseline.Commands;
+		const FFlightControlCommands &N = Resolved.Commands;
+		const double PrevThr = S.Ticket.Baseline.EngineCommands.Num() > 0
+			? S.Ticket.Baseline.EngineCommands[0].Throttle : 0.0;
+		const double NewThr  = Resolved.EngineCommands.Num() > 0 ? Resolved.EngineCommands[0].Throttle : 0.0;
+
+		S.Handoff.Aileron    = N.Aileron - P.Aileron;
+		S.Handoff.Elevator   = N.Elevator - P.Elevator;
+		S.Handoff.Rudder     = N.Rudder - P.Rudder;
+		S.Handoff.SpeedBrake = N.SpeedBrake - P.SpeedBrake;
+		S.Handoff.Throttle   = NewThr - PrevThr;
+		S.Handoff.ConsumeSequence = ConsumeSequence;
+		S.Handoff.bMeasured = true;
+		S.bAwaitingHandoffMeasure = false;
+
+		++GCounters.HandoffsMeasured;
+		const bool bStep = S.Handoff.Aileron != 0.0 || S.Handoff.Elevator != 0.0 || S.Handoff.Rudder != 0.0
+		                || S.Handoff.Throttle != 0.0 || S.Handoff.SpeedBrake != 0.0;
+		if (bStep) ++GCounters.NonZeroHandoffCount;
+
+		LogEvent(FString::Printf(
+			TEXT("[PRIME] HANDOFF actor=%s seq=%llu dAil=%.9f dElv=%.9f dRud=%.9f dThr=%.9f dSpb=%.9f step=%d"),
+			*S.ActorName, ConsumeSequence, S.Handoff.Aileron, S.Handoff.Elevator, S.Handoff.Rudder,
+			S.Handoff.Throttle, S.Handoff.SpeedBrake, bStep ? 1 : 0));
+	}
+
+	S.LastResolved.Commands = Resolved.Commands;
+	S.LastResolved.EngineCommands = Resolved.EngineCommands;
+	S.LastResolved.ConsumeSequence = ConsumeSequence;
+	S.LastResolved.TimestampS = NowS();
+	// Identity comes from the component the RESOLVER was invoked with -- never from a caller's claim.
+	S.LastResolved.Component = Component;
+	S.LastResolved.World = Component->GetWorld();
+	S.LastResolved.bValid = true;
+
 	++GCounters.ResolutionGeneration;
 	S.Counters.LastSource = S.LastSource;
 	S.Counters.Mode = S.Mode;
@@ -463,6 +643,7 @@ int64 GetResolverOwnershipLostCount() { return GOwnershipLost; }
 //     effort exists to eliminate, so it is detected and reported rather than papered over.
 void SetEnabled(bool bEnable)
 {
+	check(IsInGameThread());
 	if (bEnable)
 	{
 		// Somebody else owns the consume boundary. Do not evict them, do not "recover" it silently --
@@ -536,6 +717,7 @@ void SetEnabled(bool bEnable)
 // must never be able to change what the arbiter would decide.
 void ResetSession(const FString &ScenarioLabel)
 {
+	check(IsInGameThread());
 	GScenario = ScenarioLabel;
 	GCounters = FCounters{};
 	GEventLog.Reset();
@@ -551,12 +733,16 @@ void ResetSession(const FString &ScenarioLabel)
 		S.LastObservedSeq = 0;
 		S.LastSource = EResolutionSource::Legacy;
 		S.LastFallback = EFallbackReason::None;
-		// S.Mode, S.Candidate, S.bHaveCandidate, S.ActorName deliberately preserved.
+		// PRESERVED, deliberately: Mode, Candidate, bHaveCandidate, ActorName, and everything Phase B
+		// added -- PrimeState, Ticket, NextPrimeGeneration, LastResolved, bAwaitingHandoffMeasure,
+		// Handoff. A session reset clears the MEASUREMENT; it must never be able to cancel a handoff in
+		// flight or hand back a generation that was already issued.
 	}
 }
 
 void SetModeForTesting(const UJSBSimMovementComponent *Component, ECommandMode Mode)
 {
+	check(IsInGameThread());
 	if (!Component) return;
 	PurgeDead();
 	FPerAircraft &S = Find(Component);
@@ -576,10 +762,294 @@ ECommandMode GetMode(const UJSBSimMovementComponent *Component)
 
 void SetCandidateForTesting(const UJSBSimMovementComponent *Component, const FFormationCandidate &Candidate)
 {
+	check(IsInGameThread());
 	if (!Component) return;
 	FPerAircraft &S = Find(Component);
 	S.Candidate = Candidate;
 	S.bHaveCandidate = true;
+}
+
+// ================================================================================================
+// PRIME / BUMPLESS HANDOFF (Phase B)
+// ================================================================================================
+const TCHAR *PrimeStateName(EPrimeState S)
+{
+	switch (S)
+	{
+	case EPrimeState::PrimePending:         return TEXT("PrimePending");
+	case EPrimeState::PrimedCandidateReady: return TEXT("PrimedCandidateReady");
+	case EPrimeState::ActivationPending:    return TEXT("ActivationPending");
+	case EPrimeState::ActiveFormation:      return TEXT("ActiveFormation");
+	default:                                return TEXT("IdleLegacy");
+	}
+}
+
+const TCHAR *PrimeFailureName(EPrimeFailure F)
+{
+	switch (F)
+	{
+	case EPrimeFailure::NoResolvedSnapshot:  return TEXT("NoResolvedSnapshot");
+	case EPrimeFailure::NonFiniteSnapshot:   return TEXT("NonFiniteSnapshot");
+	case EPrimeFailure::InvalidComponent:    return TEXT("InvalidComponent");
+	case EPrimeFailure::Falling:             return TEXT("Falling");
+	case EPrimeFailure::NoTicket:            return TEXT("NoTicket");
+	case EPrimeFailure::WrongGeneration:     return TEXT("WrongGeneration");
+	case EPrimeFailure::WrongBaseline:       return TEXT("WrongBaseline");
+	case EPrimeFailure::StaleCandidate:      return TEXT("StaleCandidate");
+	case EPrimeFailure::InvalidCandidate:    return TEXT("InvalidCandidate");
+	case EPrimeFailure::NonFiniteCandidate:  return TEXT("NonFiniteCandidate");
+	case EPrimeFailure::OutOfRangeCandidate: return TEXT("OutOfRangeCandidate");
+	case EPrimeFailure::NotPrimed:           return TEXT("NotPrimed");
+	case EPrimeFailure::ResolverNotOwned:    return TEXT("ResolverNotOwned");
+	case EPrimeFailure::InterveningConsume:  return TEXT("InterveningConsume");
+	case EPrimeFailure::GenerationExhausted: return TEXT("GenerationExhausted");
+	case EPrimeFailure::IdentityMismatch:    return TEXT("IdentityMismatch");
+	case EPrimeFailure::UnknownHealth:       return TEXT("UnknownHealth");
+	default:                                 return TEXT("None");
+	}
+}
+
+bool GetLastResolvedSnapshot(const UJSBSimMovementComponent *Component, FResolvedCommandSnapshot &Out)
+{
+	if (!Component) return false;
+	const FPerAircraft *S = GAircraft.Find(TWeakObjectPtr<const UJSBSimMovementComponent>(Component));
+	if (!S || !S->LastResolved.bValid) return false;
+	Out = S->LastResolved;
+	return true;
+}
+
+bool RequestPrime(const UJSBSimMovementComponent *Component, FPrimeTicket &OutTicket, EPrimeFailure &OutFailure)
+{
+	check(IsInGameThread());   // the registry and the consume path are game-thread only
+	++GCounters.PrimeRequestCount;
+	OutTicket = FPrimeTicket{};
+	OutFailure = EPrimeFailure::None;
+
+	auto Reject = [&](EPrimeFailure F) {
+		OutFailure = F;
+		++GCounters.PrimeRejectedCount;
+		return false;
+	};
+
+	// If we do not own the consume boundary, we cannot promise anything about what the FDM will consume,
+	// so we must not hand out a ticket that claims we can.
+	if (!IsEnabled())                   return Reject(EPrimeFailure::ResolverNotOwned);
+	if (!Component || !Component->GetWorld()) return Reject(EPrimeFailure::InvalidComponent);
+
+	FPerAircraft &S = Find(Component);
+	if (!S.LastResolved.bValid)         return Reject(EPrimeFailure::NoResolvedSnapshot);
+
+	// The baseline must belong to THIS aircraft in THIS world. A consume sequence is not an identity --
+	// two aircraft can sit on the same one -- so priming against a snapshot that came from somewhere else
+	// would anchor the handoff to a command this aircraft never flew.
+	if (S.LastResolved.Component.Get() != Component
+		|| S.LastResolved.World.Get() != Component->GetWorld())
+	{
+		return Reject(EPrimeFailure::IdentityMismatch);
+	}
+
+	FJSBSimResolvedCommandBlock AsBlock;
+	AsBlock.Commands = S.LastResolved.Commands;
+	AsBlock.EngineCommands = S.LastResolved.EngineCommands;
+	if (!IsBlockFinite(AsBlock))        return Reject(EPrimeFailure::NonFiniteSnapshot);
+
+	// Safety outranks bumpless: a dead aircraft is not handed over, it is put down. And an aircraft whose
+	// health we cannot establish is not assumed healthy -- priming it would be promising continuity for
+	// something we cannot prove is even flyable.
+	const EHealth H = GetHealth(Component);
+	if (H == EHealth::NotAlive) return Reject(EPrimeFailure::Falling);
+	if (H != EHealth::Alive)    return Reject(EPrimeFailure::UnknownHealth);
+
+	// A NEW generation immediately invalidates the previous ticket and any candidate riding on it.
+	// Monotonic per aircraft and NEVER reused: a wrapped generation would let a replayed candidate from
+	// a superseded prime look current again, which is the exact bug the generation exists to prevent.
+	// So exhaustion FAILS the request rather than wrapping. (uint64 will not reach this in any session
+	// that could physically occur; it is refused rather than hoped about.)
+	if (S.NextPrimeGeneration == TNumericLimits<uint64>::Max())
+	{
+		return Reject(EPrimeFailure::GenerationExhausted);
+	}
+
+	S.Ticket = FPrimeTicket{};
+	S.Ticket.Generation = S.NextPrimeGeneration++;
+	S.Ticket.BaselineConsumeSequence = S.LastResolved.ConsumeSequence;
+	S.Ticket.TimestampS = NowS();
+	S.Ticket.Baseline = S.LastResolved;
+	S.Ticket.bValid = true;
+
+	S.bHaveCandidate = false;               // any earlier candidate is dead the moment a prime is issued
+	S.PrimeState = EPrimeState::PrimePending;
+	// Mode deliberately UNCHANGED: priming is not activating.
+
+	OutTicket = S.Ticket;
+	++GCounters.PrimeGrantedCount;
+	LogEvent(FString::Printf(
+		TEXT("[PRIME] GRANTED actor=%s generation=%llu baseline_seq=%llu ail=%.6f elv=%.6f rud=%.6f thr=%.6f spb=%.6f"),
+		*S.ActorName, S.Ticket.Generation, S.Ticket.BaselineConsumeSequence,
+		S.Ticket.Baseline.Commands.Aileron, S.Ticket.Baseline.Commands.Elevator,
+		S.Ticket.Baseline.Commands.Rudder,
+		S.Ticket.Baseline.EngineCommands.Num() > 0 ? S.Ticket.Baseline.EngineCommands[0].Throttle : 0.0,
+		S.Ticket.Baseline.Commands.SpeedBrake));
+	return true;
+}
+
+bool SubmitPrimedCandidate(const UJSBSimMovementComponent *Component, const FPrimedCandidate &In,
+                           EPrimeFailure &OutFailure)
+{
+	check(IsInGameThread());
+	OutFailure = EPrimeFailure::None;
+
+	auto Reject = [&](EPrimeFailure F) {
+		OutFailure = F;
+		++GCounters.PrimedCandidateRejectedCount;
+		if (F == EPrimeFailure::WrongGeneration) ++GCounters.WrongGenerationRejectedCount;
+		if (F == EPrimeFailure::StaleCandidate)  ++GCounters.StaleTicketRejectedCount;
+		return false;
+	};
+
+	if (!IsEnabled())                   return Reject(EPrimeFailure::ResolverNotOwned);
+	if (!Component || !Component->GetWorld()) return Reject(EPrimeFailure::InvalidComponent);
+
+	FPerAircraft &S = Find(Component);
+	const EHealth H = GetHealth(Component);
+	if (H == EHealth::NotAlive) return Reject(EPrimeFailure::Falling);
+	if (H != EHealth::Alive)    return Reject(EPrimeFailure::UnknownHealth);
+
+	// It must descend from the CURRENT prime. Without these two checks a candidate from a superseded
+	// prime -- anchored to a command the aircraft has long stopped flying -- would look identical to a
+	// fresh one, and the handoff would step.
+	if (!S.Ticket.bValid || S.PrimeState == EPrimeState::IdleLegacy) return Reject(EPrimeFailure::NoTicket);
+	if (In.PrimeGeneration != S.Ticket.Generation)                   return Reject(EPrimeFailure::WrongGeneration);
+	if (In.BaselineConsumeSequence != S.Ticket.BaselineConsumeSequence) return Reject(EPrimeFailure::WrongBaseline);
+
+	const FFormationCandidate &K = In.Candidate;
+	if (!K.bValid || !K.bCommandReady)  return Reject(EPrimeFailure::InvalidCandidate);
+	if (!K.bFinite || !IsCandidateFinite(K)) return Reject(EPrimeFailure::NonFiniteCandidate);
+
+	if (!IsCandidateFresh(K)) return Reject(EPrimeFailure::StaleCandidate);
+
+	// Observed range, same limits the resolver observes. A candidate outside them is refused rather than
+	// clamped -- clamping would silently change what the aircraft flies.
+	auto BadSigned = [](double V) { return V < -1.0 || V > 1.0; };
+	if (BadSigned(K.AileronNorm) || BadSigned(K.ElevatorNorm) || BadSigned(K.RudderNorm)
+		|| K.ThrottleNorm < 0.0 || K.ThrottleNorm > 1.0
+		|| K.SpeedBrakeNorm < 0.0 || K.SpeedBrakeNorm > 1.0)
+	{
+		return Reject(EPrimeFailure::OutOfRangeCandidate);
+	}
+
+	S.Candidate = K;
+	S.bHaveCandidate = true;
+	S.PrimeState = EPrimeState::PrimedCandidateReady;
+	++GCounters.PrimedCandidateAcceptedCount;
+	LogEvent(FString::Printf(TEXT("[PRIME] CANDIDATE_ACCEPTED actor=%s generation=%llu baseline_seq=%llu"),
+		*S.ActorName, In.PrimeGeneration, In.BaselineConsumeSequence));
+	return true;
+}
+
+bool ActivateFormationForTesting(const UJSBSimMovementComponent *Component, EPrimeFailure &OutFailure)
+{
+	check(IsInGameThread());
+	OutFailure = EPrimeFailure::None;
+
+	auto Reject = [&](EPrimeFailure F) {
+		OutFailure = F;
+		++GCounters.ActivationRejectedCount;
+		return false;
+	};
+
+	if (!IsEnabled())                   return Reject(EPrimeFailure::ResolverNotOwned);
+	if (!Component || !Component->GetWorld()) return Reject(EPrimeFailure::InvalidComponent);
+
+	FPerAircraft &S = Find(Component);
+	const EHealth H = GetHealth(Component);
+	if (H == EHealth::NotAlive) return Reject(EPrimeFailure::Falling);
+	if (H != EHealth::Alive)    return Reject(EPrimeFailure::UnknownHealth);
+
+	// The whole point: no prime, no activation. A perfectly valid, fresh candidate is NOT enough -- if it
+	// did not come from a prime, nothing anchors it to what the aircraft is currently flying.
+	if (S.PrimeState != EPrimeState::PrimedCandidateReady) return Reject(EPrimeFailure::NotPrimed);
+
+	// This only ASKS. The mode is NOT changed here.
+	//
+	// The switch happens in Resolve(), at the consume boundary, because only there can we still check
+	// whether the baseline is current -- and an intervening Legacy consume can only be seen from there.
+	// Flipping the mode here would hand over to a candidate anchored to a command the aircraft has
+	// already stopped flying, and the handoff would step.
+	S.PrimeState = EPrimeState::ActivationPending;
+	LogEvent(FString::Printf(
+		TEXT("[PRIME] ACTIVATION_REQUESTED actor=%s generation=%llu baseline_seq=%llu (switch happens at the next consume)"),
+		*S.ActorName, S.Ticket.Generation, S.Ticket.BaselineConsumeSequence));
+	return true;
+}
+
+EPrimeFailure GetLastBoundaryFailure(const UJSBSimMovementComponent *Component)
+{
+	if (!Component) return EPrimeFailure::None;
+	const FPerAircraft *S = GAircraft.Find(TWeakObjectPtr<const UJSBSimMovementComponent>(Component));
+	return S ? S->LastBoundaryFailure : EPrimeFailure::None;
+}
+
+EPrimeState GetPrimeState(const UJSBSimMovementComponent *Component)
+{
+	if (!Component) return EPrimeState::IdleLegacy;
+	const FPerAircraft *S = GAircraft.Find(TWeakObjectPtr<const UJSBSimMovementComponent>(Component));
+	return S ? S->PrimeState : EPrimeState::IdleLegacy;
+}
+
+uint64 GetPrimeGeneration(const UJSBSimMovementComponent *Component)
+{
+	if (!Component) return 0;
+	const FPerAircraft *S = GAircraft.Find(TWeakObjectPtr<const UJSBSimMovementComponent>(Component));
+	return S ? S->Ticket.Generation : 0;
+}
+
+bool HasCandidate(const UJSBSimMovementComponent *Component)
+{
+	if (!Component) return false;
+	const FPerAircraft *S = GAircraft.Find(TWeakObjectPtr<const UJSBSimMovementComponent>(Component));
+	return S && S->bHaveCandidate;
+}
+
+#if WITH_DEV_AUTOMATION_TESTS
+void SetClockOverrideForTesting(double NowSeconds) { check(IsInGameThread()); GClockOverrideS = NowSeconds; }
+void ClearClockOverrideForTesting()                { check(IsInGameThread()); GClockOverrideS = -1.0; }
+
+void InjectResolvedSnapshotForTesting(const UJSBSimMovementComponent *Component,
+                                      const FResolvedCommandSnapshot &Snapshot)
+{
+	check(IsInGameThread());
+	if (!Component) return;
+	FPerAircraft &S = Find(Component);
+	S.LastResolved = Snapshot;
+	// The caller does NOT get to declare whose command this is. Identity is forced from the target, so an
+	// injection can supply values but never forge an owner.
+	S.LastResolved.Component = Component;
+	S.LastResolved.World = Component->GetWorld();
+	S.LastResolved.bValid = true;
+}
+#endif
+
+bool GetTicketBaseline(const UJSBSimMovementComponent *Component, FResolvedCommandSnapshot &Out)
+{
+	if (!Component) return false;
+	const FPerAircraft *S = GAircraft.Find(TWeakObjectPtr<const UJSBSimMovementComponent>(Component));
+	if (!S || !S->Ticket.bValid || !S->Ticket.Baseline.bValid) return false;
+	Out = S->Ticket.Baseline;
+	return true;
+}
+
+bool GetHandoffDelta(const FString &ActorName, FHandoffDelta &Out)
+{
+	for (const TPair<TWeakObjectPtr<const UJSBSimMovementComponent>, FPerAircraft> &P : GAircraft)
+	{
+		if (P.Value.ActorName == ActorName && P.Value.Handoff.bMeasured)
+		{
+			Out = P.Value.Handoff;
+			return true;
+		}
+	}
+	return false;
 }
 
 const FCounters &GetCounters() { return GCounters; }
@@ -629,6 +1099,32 @@ TArray<FString> BuildReport()
 			A.Consumes, A.LegacyResolutions, A.FormationResolutions, A.FallingResolutions,
 			A.LegacyChangedFields, A.StaleFallbacks, A.InvalidFallbacks, A.NonFiniteFallbacks,
 			SourceName(A.LastSource), A.CandidateGeneration));
+	}
+
+	Out.Add(FString::Printf(
+		TEXT("[PRIME] TOTALS requests=%lld granted=%lld rejected=%lld candidates_accepted=%lld "
+		     "candidates_rejected=%lld activations_granted=%lld activations_rejected=%lld"),
+		C.PrimeRequestCount, C.PrimeGrantedCount, C.PrimeRejectedCount,
+		C.PrimedCandidateAcceptedCount, C.PrimedCandidateRejectedCount,
+		C.ActivationGrantedCount, C.ActivationRejectedCount));
+	Out.Add(FString::Printf(
+		TEXT("[PRIME] HANDOFF handoffs_measured=%lld non_zero_handoff_count=%lld "
+		     "cancelled_by_falling=%lld stale_ticket_rejected=%lld wrong_generation_rejected=%lld "
+		     "intervening_consume_rejected=%lld activation_stale_rejected=%lld"),
+		C.HandoffsMeasured, C.NonZeroHandoffCount, C.PrimeCancelledByFallingCount,
+		C.StaleTicketRejectedCount, C.WrongGenerationRejectedCount,
+		C.InterveningConsumeRejectedCount, C.ActivationStaleRejectedCount));
+
+	for (const TPair<TWeakObjectPtr<const UJSBSimMovementComponent>, FPerAircraft> &P : GAircraft)
+	{
+		const FPerAircraft &S = P.Value;
+		Out.Add(FString::Printf(
+			TEXT("[PRIME] AIRCRAFT actor=%s prime_state=%s generation=%llu next_generation=%llu "
+			     "baseline_seq=%llu have_snapshot=%d handoff_measured=%d "
+			     "dAil=%.9f dElv=%.9f dRud=%.9f dThr=%.9f dSpb=%.9f"),
+			*S.ActorName, PrimeStateName(S.PrimeState), S.Ticket.Generation, S.NextPrimeGeneration,
+			S.Ticket.BaselineConsumeSequence, S.LastResolved.bValid ? 1 : 0, S.Handoff.bMeasured ? 1 : 0,
+			S.Handoff.Aileron, S.Handoff.Elevator, S.Handoff.Rudder, S.Handoff.Throttle, S.Handoff.SpeedBrake));
 	}
 
 	Out.Add(FString::Printf(TEXT("[ARBITER] EVENT_LOG lines=%d"), GEventLog.Num()));

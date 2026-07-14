@@ -22,10 +22,12 @@
 #pragma once
 
 #include "CoreMinimal.h"
+// FResolvedCommandSnapshot stores the command blocks BY VALUE (all 29 consumed fields), so the full
+// types are required here -- a forward declaration would only allow pointers.
+#include "FDMTypes.h"
 
 class UJSBSimMovementComponent;
-struct FFlightControlCommands;
-struct FEngineCommand;
+class UWorld;
 struct FJSBSimResolvedCommandBlock;
 
 namespace MumtCommandArbiterV2
@@ -108,9 +110,173 @@ int64 GetResolverOwnershipLostCount();       // it WAS ours and was taken over b
 
 // ---- test-only / dev seam --------------------------------------------------------------------
 // The ONLY way to leave LegacyOrManual. Nothing in production calls these.
+//
+// SetModeForTesting is the RAW seam: it flips the mode with no prime, and exists so the resolver's own
+// policy (falling priority, staleness, finiteness, per-aircraft isolation) can be exercised directly.
+// It is NOT the handoff path -- see the Prime API below, which is.
 void SetModeForTesting(const UJSBSimMovementComponent *Component, ECommandMode Mode);
 ECommandMode GetMode(const UJSBSimMovementComponent *Component);
 void SetCandidateForTesting(const UJSBSimMovementComponent *Component, const FFormationCandidate &Candidate);
+
+// ================================================================================================
+// PRIME / BUMPLESS HANDOFF (Phase B)
+// ================================================================================================
+// The command a handoff must be continuous with is NOT the mutable legacy writer block -- that is an
+// input, and it can be a field-wise mixture of several writers that changes under you. It is the FINAL
+// RESOLVED BLOCK the FDM actually consumed on the last step. That is the only thing the aircraft is
+// genuinely flying, so that is the baseline everything here is anchored to.
+//
+//   Legacy writers -> legacy block -> resolver -> RESOLVED BLOCK -> [prime snapshot] -> prime the
+//   stateful controllers -> first candidate -> validate -> only then activate Formation.
+
+// The full consumed command, all 29 fields. Formation only overwrites five of them today, but the
+// snapshot keeps everything: the Blueprints' trims/flaps/brakes and the engine state are part of what
+// the aircraft is flying, and a snapshot that dropped them would become a second source of truth the
+// moment anything else starts using it.
+struct FResolvedCommandSnapshot
+{
+	FFlightControlCommands Commands;        // 15 consumed flight-control fields
+	TArray<FEngineCommand> EngineCommands;  // 14 consumed fields per engine
+	uint64 ConsumeSequence = 0;             // which FDM consume produced it
+	double TimestampS = -1.0;
+	bool bValid = false;
+
+	// WHOSE command this is. Without it, "the last resolved snapshot" is just a bag of numbers: a
+	// consume sequence proves nothing about identity (two aircraft can be on the same sequence), and a
+	// prime taken against the wrong aircraft's baseline would hand over to a command that was never
+	// flown. Set from the component the resolver was invoked with, never from a caller's claim.
+	TWeakObjectPtr<const UJSBSimMovementComponent> Component;
+	TWeakObjectPtr<const UWorld> World;
+};
+// NOTE: FuelFreeze is NOT part of this snapshot. It is a global on the movement component
+// (Propulsion->SetFuelFreeze) and never travelled through the command block; including it here would
+// invent a command path that does not exist.
+
+// The handoff state machine, kept SEPARATE from ECommandMode. Mode answers "who decides the command";
+// this answers "how far along is the handover". Fusing them would force every mode check to also reason
+// about half-finished transitions.
+enum class EPrimeState : uint8
+{
+	IdleLegacy = 0,        // no prime in flight
+	PrimePending,          // a prime ticket exists; mode is STILL LegacyOrManual
+	PrimedCandidateReady,  // a candidate matching that ticket has been accepted
+	ActivationPending,     // activation ASKED FOR; the switch happens at the next consume boundary
+	ActiveFormation,       // the switch actually happened
+};
+const TCHAR *PrimeStateName(EPrimeState S);
+
+// Why a prime or a primed candidate was refused.
+enum class EPrimeFailure : uint8
+{
+	None = 0,
+	NoResolvedSnapshot,   // nothing has been consumed yet -- there is no baseline to be continuous with
+	NonFiniteSnapshot,
+	InvalidComponent,
+	Falling,              // safety outranks bumpless, always
+	NoTicket,             // a candidate arrived with no prime behind it
+	WrongGeneration,      // a candidate from a superseded prime
+	WrongBaseline,        // a candidate anchored to a different consume than the ticket
+	StaleCandidate,
+	InvalidCandidate,     // !bValid / !bCommandReady
+	NonFiniteCandidate,
+	OutOfRangeCandidate,
+	NotPrimed,            // activation attempted without PrimedCandidateReady
+	ResolverNotOwned,     // we do not own the consume boundary; we must not drive it
+	InterveningConsume,   // the FDM consumed a Legacy block after the baseline was taken
+	GenerationExhausted,
+	IdentityMismatch,
+	// Appended LAST so existing indices stay stable. A prime demands a PROVABLY alive aircraft: an
+	// aircraft with no health component is not "falling", it is unproven -- and an unproven aircraft is
+	// not one we may promise a bumpless handoff for.
+	UnknownHealth,     // the snapshot does not belong to this component / this world
+	Count
+};
+const TCHAR *PrimeFailureName(EPrimeFailure F);
+
+// A candidate that claims to descend from a specific prime. The two extra fields are what make the
+// handoff verifiable: without them, a stale candidate from a superseded prime is indistinguishable
+// from a fresh one.
+struct FPrimedCandidate
+{
+	FFormationCandidate Candidate;
+	uint64 PrimeGeneration = 0;   // 0 is never issued: it means "no ticket"
+	uint64 BaselineConsumeSequence = 0;
+};
+
+// Generations are uint64, strictly monotonic per aircraft, and NEVER reused. 0 is invalid by
+// construction. On the (unreachable) event of exhaustion, RequestPrime FAILS rather than wrapping --
+// a wrapped generation would let a replayed candidate from a superseded prime look current again,
+// which is the exact class of bug the generation exists to prevent.
+struct FPrimeTicket
+{
+	uint64 Generation = 0;
+	uint64 BaselineConsumeSequence = 0;
+	double TimestampS = -1.0;
+	FResolvedCommandSnapshot Baseline;   // the 29-field command the aircraft was flying, IMMUTABLE
+	bool bValid = false;
+};
+
+// The last command the FDM actually consumed for this aircraft. Empty until the first consume.
+bool GetLastResolvedSnapshot(const UJSBSimMovementComponent *Component, FResolvedCommandSnapshot &Out);
+
+// Takes a baseline. Fails if there is nothing consumed to be continuous with, if it is non-finite, if
+// the aircraft is not Alive (safety outranks bumpless), or if we do not own the resolver. On success it
+// issues a NEW generation, which immediately invalidates any earlier ticket and candidate, and leaves
+// the mode at LegacyOrManual -- priming is not activating.
+bool RequestPrime(const UJSBSimMovementComponent *Component, FPrimeTicket &OutTicket, EPrimeFailure &OutFailure);
+
+// Accepts a candidate only if it descends from the CURRENT ticket and passes every check on its own
+// merits. Any doubt leaves the aircraft on Legacy, with the reason counted.
+bool SubmitPrimedCandidate(const UJSBSimMovementComponent *Component, const FPrimedCandidate &Candidate,
+                           EPrimeFailure &OutFailure);
+
+// TEST/DEV ONLY. Refuses unless the aircraft is in PrimedCandidateReady. Nothing in production calls it.
+bool ActivateFormationForTesting(const UJSBSimMovementComponent *Component, EPrimeFailure &OutFailure);
+
+// Why the LAST activation attempt was refused AT THE CONSUME BOUNDARY (not by ActivateFormationForTesting,
+// which only asks). The two refusals there are different failures and must never be confused: the baseline
+// moving on (InterveningConsume) is not the same as the candidate rotting in place (StaleCandidate).
+EPrimeFailure GetLastBoundaryFailure(const UJSBSimMovementComponent *Component);
+
+// TEST/DEV ONLY. Gives an aircraft a resolved snapshot it never actually consumed.
+//
+// It exists for ONE reason: an aircraft in a second, non-ticking world never reaches CopyToJSBSim, so it
+// can never acquire a baseline -- and without a baseline it cannot be primed, which would make it
+// impossible to prove that a world teardown preserves ANOTHER world's prime state. This is an observation
+// scaffold, not a command path: it writes only the arbiter's own snapshot, never Commands/EngineCommands,
+// and nothing in production calls it.
+#if WITH_DEV_AUTOMATION_TESTS
+// The caller's Component/World fields are IGNORED and overwritten from the target component: an
+// injection must not be able to forge an identity.
+// Freezes the arbiter's notion of "now" so candidate staleness can be exercised deterministically. Sleeping
+// until a candidate rots would make the test hostage to the game scheduler; this makes the clock an input.
+// PRODUCTION CLOCK BEHAVIOUR IS UNCHANGED: the override does not exist in a non-test build, and with no
+// override set every call still reads FApp::GetCurrentTime().
+void SetClockOverrideForTesting(double NowSeconds);
+void ClearClockOverrideForTesting();
+
+void InjectResolvedSnapshotForTesting(const UJSBSimMovementComponent *Component,
+                                      const FResolvedCommandSnapshot &Snapshot);
+#endif
+
+EPrimeState GetPrimeState(const UJSBSimMovementComponent *Component);
+uint64 GetPrimeGeneration(const UJSBSimMovementComponent *Component);
+bool HasCandidate(const UJSBSimMovementComponent *Component);
+// The IMMUTABLE baseline the ticket was cut from. The handoff delta is measured against THIS, never
+// against "the previous consume" -- otherwise a delta of zero could just be a value compared with itself.
+bool GetTicketBaseline(const UJSBSimMovementComponent *Component, FResolvedCommandSnapshot &Out);
+
+// The command step across the first Formation consume, per controlled field, measured as
+//     (what the FDM consumed on the first Formation step) - (the IMMUTABLE ticket baseline)
+// NOT as "this consume minus the previous consume": that would compare the block with itself whenever
+// nothing intervened, and a zero would prove nothing.
+struct FHandoffDelta
+{
+	double Aileron = 0.0, Elevator = 0.0, Rudder = 0.0, Throttle = 0.0, SpeedBrake = 0.0;
+	uint64 ConsumeSequence = 0;
+	bool bMeasured = false;
+};
+bool GetHandoffDelta(const FString &ActorName, FHandoffDelta &Out);
 
 // ---- counters --------------------------------------------------------------------------------
 struct FCounters
@@ -133,6 +299,22 @@ struct FCounters
 	int64 MissingResolutionCount = 0;       // a consume sequence that skipped a resolve
 	int64 LegacyBlockMutationCount = 0;     // MUST be 0: the resolver wrote the legacy members
 	uint32 ResolutionGeneration = 0;
+
+	// ---- Phase B: prime / handoff ----
+	int64 PrimeRequestCount = 0;
+	int64 PrimeGrantedCount = 0;
+	int64 PrimeRejectedCount = 0;
+	int64 PrimedCandidateAcceptedCount = 0;
+	int64 PrimedCandidateRejectedCount = 0;
+	int64 ActivationGrantedCount = 0;
+	int64 ActivationRejectedCount = 0;
+	int64 PrimeCancelledByFallingCount = 0;   // safety pre-empted a handoff in flight
+	int64 StaleTicketRejectedCount = 0;
+	int64 WrongGenerationRejectedCount = 0;
+	int64 HandoffsMeasured = 0;
+	int64 NonZeroHandoffCount = 0;            // a step on the first Formation consume
+	int64 InterveningConsumeRejectedCount = 0;// the baseline went stale before activation landed
+	int64 ActivationStaleRejectedCount = 0;   // the CANDIDATE went stale before activation landed
 };
 const FCounters &GetCounters();
 

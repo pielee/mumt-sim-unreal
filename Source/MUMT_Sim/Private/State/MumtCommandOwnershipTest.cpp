@@ -22,6 +22,7 @@
 #if WITH_EDITOR && WITH_DEV_AUTOMATION_TESTS
 
 #include "State/MumtCommandOwnershipTelemetry.h"
+#include "State/MumtCommandArbiterV2.h"
 #include "HealthComponent.h"
 #include "UDPControlReceiver.h"
 #include "JSBSimMovementComponent.h"
@@ -121,6 +122,37 @@ struct FOwnState
 	FString FallingActor;         // scenario D: the aircraft actually damaged
 	int64 AutoWritesAtDamage = 0; // its autopilot write count at the instant of damage
 	bool bSawAnyComponent = false;
+
+	// ---- scenario D: the evidence, captured as VALUE COPIES before the FDM is stopped ----------------
+	//
+	// Why copies: the telemetry and the arbiter keep counting for as long as anything ticks. An assertion
+	// that reads them later is asserting about a different moment than the one it claims to be about, and
+	// the numbers can move underneath it. These are the numbers AT THE INSTANT the evidence was complete,
+	// and they are what the test actually proves.
+	bool bEvidenceComplete = false;      // every piece below was obtained
+	bool bTickDisabled = false;          // ...and ONLY then was the aircraft's FDM stopped
+	bool bFallingEntered = false;        // the health component really says Falling (not merely damaged)
+	int32 FallingLifeState = -1;
+	int64 FallingResolutionsAtEvidence = 0;    // a Falling-resolved command was actually CONSUMED
+	int64 FormationResolutionsAtEvidence = 0;  // ...and Formation never was
+	int64 HardoverWritesAtEvidence = 0;        // the hardover owns the aircraft
+	int64 AutoWritesAtEvidence = 0;            // ...and the autopilot has stopped writing it
+	int64 ManualWritesAtEvidence = 0;          // (the manual writer never targets the UAV at all)
+	double FinalThrottle = -1.0;               // engine 0 in the final resolved block
+	bool bFinalCutOff = false;
+	uint64 EvidenceConsumeSequence = 0;
+	int64 ConsumesAtEvidence = 0;              // resolved consumes on this aircraft when the evidence closed
+
+	// ---- two-phase stop -------------------------------------------------------------------------------
+	// Disabling the tick and finalizing in the same latent Update would assert that the aircraft stopped
+	// without ever letting a frame pass to find out. The claim "it stopped" is only checkable on the NEXT
+	// tick, so the stop is verified there, against the numbers captured before it.
+	bool bAwaitingPostStopVerification = false;
+	bool bPostStopVerified = false;
+	bool bPostStopComponentAlive = false;
+	bool bPostStopTickDisabled = false;
+	int64 PostStopFallingResolutions = -1;
+	int64 PostStopConsumes = -1;
 };
 
 // The simulation clock comes from the aircraft itself, not from wall time -- the same atomic snapshot
@@ -170,6 +202,15 @@ public:
 		}
 
 		++St->Ticks;
+
+		// PHASE 2 of the stop. A frame has now passed since the tick was disabled, so "the aircraft
+		// stopped" is finally a checkable claim rather than an assumption made in the same breath as the
+		// action. If anything moved after the stop, this is where it shows.
+		if (Scenario == EOwnScenario::Falling && St->bAwaitingPostStopVerification && !St->bPostStopVerified)
+		{
+			VerifyFallingAircraftStopped(World);
+			return Finalize();
+		}
 
 		// Manual scenarios: keep a live named command in flight. The receiver drains the socket in its
 		// Tick and applies it in the same Tick.
@@ -232,6 +273,39 @@ public:
 			}
 		}
 
+		// Scenario D ends WHEN IT HAS ITS EVIDENCE, not when a timer runs out.
+		//
+		// The aircraft under test is in a hardover dive. What this scenario has to establish is that the
+		// HealthHardover takes ownership of the damaged aircraft's command block, and that the final
+		// resolved block at the FDM consume boundary carries throttle 0 and cutoff. Once that is in hand,
+		// everything after it is the aircraft falling further towards the ground: it establishes nothing
+		// new, and it eventually drives JSBSim's aerodynamic tables outside their domain (an abort inside
+		// FGTable::GetValue). So once the evidence is complete -- and not one tick before -- the aircraft's
+		// FDM is stopped and the test finishes.
+		//
+		// This is not a shortened timeout and not a retry: no expectation is weakened, and every assertion
+		// below is made on evidence collected while the aircraft was still being flown by the hardover.
+		if (Scenario == EOwnScenario::Falling && St->bDamaged && !St->bEvidenceComplete)
+		{
+			if (TryCollectFallingEvidence(World))
+			{
+				StopFallingAircraftFdm(World);   // ONLY the damaged aircraft, ONLY now
+				St->bAwaitingPostStopVerification = true;
+				return false;                    // end THIS update; the stop is checked on the next one
+			}
+			const bool bOutOfTime = (Elapsed >= kOwnRunSeconds)
+				|| ((NowWall - St->FirstWall) >= kOwnMaxWallSeconds);
+			if (bOutOfTime)
+			{
+				// The hardover never reached the FDM. That is a real failure and must be reported as one,
+				// not quietly finalized as though the scenario had been satisfied.
+				Test->AddError(TEXT("[CMDOWN] D: the Falling evidence never completed -- the hardover "
+				                    "never reached the FDM within the run budget"));
+				return Finalize();
+			}
+			return false;
+		}
+
 		const bool bDone = (Elapsed >= kOwnRunSeconds) || ((NowWall - St->FirstWall) >= kOwnMaxWallSeconds);
 		if (!bDone) return false;
 
@@ -239,6 +313,123 @@ public:
 	}
 
 private:
+	// Returns true ONLY when every required piece of evidence exists AND has been copied out. Any missing
+	// piece means "not yet" -- never "close enough".
+	bool TryCollectFallingEvidence(UWorld *World)
+	{
+		namespace Arb = MumtCommandArbiterV2;
+		using W = MumtCommandOwnership::EWriterId;
+
+		AActor *Actor = nullptr;
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			if (It->GetActorNameOrLabel() == St->FallingActor) { Actor = *It; break; }
+		}
+		if (!Actor) return false;
+
+		UJSBSimMovementComponent *Comp = Actor->FindComponentByClass<UJSBSimMovementComponent>();
+		UHealthComponent *Health = Actor->FindComponentByClass<UHealthComponent>();
+		if (!Comp || !Health) return false;
+
+		// (1) It is FALLING -- the production life state says so. "Damaged" is not the same claim.
+		if (Health->IsAlive()) return false;
+		if (Health->LifeState != EAircraftLifeState::Falling) return false;
+
+		// (2) A Falling-resolved block was actually produced AT THE FDM CONSUME BOUNDARY. The arbiter
+		//     records the resolution there, so a non-zero count means the block was passed into the FCS
+		//     setter path -- not merely that some writer wrote one.
+		Arb::FAircraftCounters AC{};
+		if (!Arb::GetAircraftCounters(St->FallingActor, AC)) return false;
+		if (AC.FallingResolutions <= 0) return false;
+
+		// (3) And the final resolved block at that boundary is the hardover's: engine 0 at throttle 0 with
+		//     cutoff set. This reads the RESOLVED block passed into the FCS setter path, not any writer's
+		//     intent.
+		Arb::FResolvedCommandSnapshot Snap;
+		if (!Arb::GetLastResolvedSnapshot(Comp, Snap)) return false;
+		if (Snap.EngineCommands.Num() <= 0) return false;
+		if (Snap.EngineCommands[0].Throttle != 0.0) return false;
+		if (!Snap.EngineCommands[0].CutOff) return false;
+
+		// (4) OWNERSHIP, per aircraft: HealthHardover is writing this aircraft, the autopilot has stopped
+		//     writing it since the Falling transition, and the manual writer never participates on it at
+		//     all (it aims at the manned leader).
+		//
+		//     This is an ownership observation, NOT a priority proof. That the arbiter would prefer Falling
+		//     over a live Formation candidate is a different claim, established by
+		//     MUMT.ControlV2.ArbiterFallingOverCandidate -- not by these write counts.
+		int64 HardWrites = 0, AutoNow = 0, ManualNow = 0;
+		if (!MumtCommandOwnership::GetWritesForActor(St->FallingActor, W::HealthHardover, HardWrites)) return false;
+		if (!MumtCommandOwnership::GetWritesForActor(St->FallingActor, W::InnerLoopAutopilot, AutoNow)) return false;
+		MumtCommandOwnership::GetWritesForActor(St->FallingActor, W::ManualUdp, ManualNow);
+		if (HardWrites <= 0) return false;
+		if (AutoNow != St->AutoWritesAtDamage) return false;   // still being flown: the hand-over is not done
+
+		// Everything is in hand. COPY IT OUT before anything else can move.
+		St->bFallingEntered = true;
+		St->FallingLifeState = static_cast<int32>(Health->LifeState);
+		St->FallingResolutionsAtEvidence = AC.FallingResolutions;
+		St->FormationResolutionsAtEvidence = AC.FormationResolutions;
+		St->HardoverWritesAtEvidence = HardWrites;
+		St->AutoWritesAtEvidence = AutoNow;
+		St->ManualWritesAtEvidence = ManualNow;
+		St->FinalThrottle = Snap.EngineCommands[0].Throttle;
+		St->bFinalCutOff = Snap.EngineCommands[0].CutOff;
+		St->EvidenceConsumeSequence = Snap.ConsumeSequence;
+		St->ConsumesAtEvidence = AC.Consumes;
+		St->bEvidenceComplete = true;
+		return true;
+	}
+
+	// Stops ONLY the damaged aircraft's flight dynamics, and only after the evidence is complete. Nothing
+	// about production Falling behaviour, the health component, JSBSim or the arbiter changes: this is the
+	// automation declaring it has seen what it came to see.
+	void StopFallingAircraftFdm(UWorld *World)
+	{
+		if (!St->bEvidenceComplete) return;   // belt and braces: never before the evidence
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			if (It->GetActorNameOrLabel() != St->FallingActor) continue;
+			if (UJSBSimMovementComponent *C = It->FindComponentByClass<UJSBSimMovementComponent>())
+			{
+				C->SetComponentTickEnabled(false);
+				St->bTickDisabled = true;
+			}
+			break;
+		}
+	}
+
+	// One tick later: did it actually stop? Asked of the engine, not of our own intention -- the component
+	// is re-found, its tick state is read back, and the counters are compared with the values captured
+	// while it was still flying. bPostStopVerified is set ONLY if every one of those holds.
+	void VerifyFallingAircraftStopped(UWorld *World)
+	{
+		namespace Arb = MumtCommandArbiterV2;
+
+		UJSBSimMovementComponent *Comp = nullptr;
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			if (It->GetActorNameOrLabel() != St->FallingActor) continue;
+			Comp = It->FindComponentByClass<UJSBSimMovementComponent>();
+			break;
+		}
+		St->bPostStopComponentAlive = (Comp != nullptr);
+		if (!Comp) return;   // the aircraft vanished: the stop cannot be verified, and Finalize will say so
+
+		St->bPostStopTickDisabled = !Comp->IsComponentTickEnabled();
+
+		Arb::FAircraftCounters After{};
+		if (!Arb::GetAircraftCounters(St->FallingActor, After)) return;
+		St->PostStopFallingResolutions = After.FallingResolutions;
+		St->PostStopConsumes = After.Consumes;
+
+		St->bPostStopVerified =
+			St->bPostStopComponentAlive
+			&& St->bPostStopTickDisabled
+			&& St->PostStopFallingResolutions == St->FallingResolutionsAtEvidence
+			&& St->PostStopConsumes == St->ConsumesAtEvidence;
+	}
+
 	bool Finalize()
 	{
 		St->Udp.Close();
@@ -308,6 +499,75 @@ private:
 				     "autopilot_writes_at_end=%lld hardover_writes=%lld"),
 				*St->FallingActor, St->AutoWritesAtDamage, AutoAfter, HealthOnTarget);
 			Test->TestTrue(TEXT("D: the fleet-wide hardover writer ran"), Health > 0);
+
+			// ---- the evidence, asserted on the VALUES CAPTURED while the aircraft was still flying -----
+			//
+			// Order matters here as much as content: the test may only have stopped the aircraft AFTER it
+			// had all of this. A run that stopped the FDM first and then went looking for evidence would be
+			// asserting about a corpse.
+			//
+			// SCOPE: this scenario establishes OWNERSHIP of the damaged aircraft's command block, not the
+			// arbiter's Falling PRIORITY. Priority over a live Formation candidate is established by
+			// MUMT.ControlV2.ArbiterFallingOverCandidate.
+			Test->TestTrue(TEXT("D: the evidence was COMPLETE"), St->bEvidenceComplete);
+			Test->TestTrue(TEXT("D: the aircraft really entered Falling (life state, not just damage)"),
+				St->bFallingEntered);
+			Test->TestEqual(TEXT("D: ...and the life state was Falling"),
+				St->FallingLifeState, static_cast<int32>(EAircraftLifeState::Falling));
+
+			// A Falling-resolved block was produced at the FDM consume boundary.
+			Test->TestTrue(TEXT("D: falling_resolution_count > 0 (a Falling-resolved block reached the "
+			                    "FDM consume boundary)"),
+				St->FallingResolutionsAtEvidence > 0);
+			Test->TestEqual(TEXT("D: formation_resolution_count == 0"),
+				St->FormationResolutionsAtEvidence, (int64)0);
+
+			// The final resolved block passed into the FCS setter path.
+			Test->TestEqual(TEXT("D: final_throttle == 0"), St->FinalThrottle, 0.0);
+			Test->TestTrue(TEXT("D: final_cutoff == true"), St->bFinalCutOff);
+
+			// OWNERSHIP of the damaged aircraft -- stated as what was actually measured, and no more.
+			Test->TestTrue(TEXT("D: HealthHardover took ownership of the damaged aircraft"),
+				St->HardoverWritesAtEvidence > 0);
+			Test->TestEqual(TEXT("D: the autopilot stopped writing the damaged aircraft after the Falling "
+			                     "transition"),
+				St->AutoWritesAtEvidence, St->AutoWritesAtDamage);
+			Test->TestEqual(TEXT("D: the manual writer did not participate on the damaged UAV"),
+				St->ManualWritesAtEvidence, (int64)0);
+
+			// THE STOP, verified a tick later rather than assumed in the same breath as the action.
+			Test->TestTrue(TEXT("D: the FDM tick was disabled ONLY after the evidence was complete"),
+				St->bEvidenceComplete && St->bTickDisabled);
+			Test->TestTrue(TEXT("D: the stop was VERIFIED on a later tick (post_stop_verified)"),
+				St->bPostStopVerified);
+			Test->TestTrue(TEXT("D: ...the aircraft still existed when the stop was verified"),
+				St->bPostStopComponentAlive);
+			Test->TestTrue(TEXT("D: ...its FDM tick really is disabled (asked of the component)"),
+				St->bPostStopTickDisabled);
+			Test->TestEqual(TEXT("D: ...and no further Falling resolution occurred after the stop"),
+				St->PostStopFallingResolutions, St->FallingResolutionsAtEvidence);
+			Test->TestEqual(TEXT("D: ...nor any further resolved consume at all"),
+				St->PostStopConsumes, St->ConsumesAtEvidence);
+
+			// One stable line, identical run to run: the invariants this scenario exists to establish.
+			UE_LOG(LogMumtCmdOwnTest, Display,
+				TEXT("[CMDOWN] D_EVIDENCE evidence_complete=%d falling_entered=%d falling_resolved_at_boundary=%d "
+				     "final_throttle=%.6f final_cutoff=%d formation_resolutions=%lld autopilot_stopped=%d "
+				     "manual_writes=%lld hardover_owns=%d tick_disabled_after_evidence=%d post_stop_verified=%d"),
+				St->bEvidenceComplete ? 1 : 0, St->bFallingEntered ? 1 : 0,
+				St->FallingResolutionsAtEvidence > 0 ? 1 : 0,
+				St->FinalThrottle, St->bFinalCutOff ? 1 : 0, St->FormationResolutionsAtEvidence,
+				St->AutoWritesAtEvidence == St->AutoWritesAtDamage ? 1 : 0, St->ManualWritesAtEvidence,
+				St->HardoverWritesAtEvidence > 0 ? 1 : 0,
+				(St->bEvidenceComplete && St->bTickDisabled) ? 1 : 0,
+				St->bPostStopVerified ? 1 : 0);
+			UE_LOG(LogMumtCmdOwnTest, Display,
+				TEXT("[CMDOWN] D_EVIDENCE_DETAIL actor=%s falling_resolutions=%lld hardover_writes=%lld "
+				     "autopilot_writes_at_damage=%lld consume_sequence=%llu consumes_at_evidence=%lld "
+				     "consumes_after_stop=%lld"),
+				*St->FallingActor, St->FallingResolutionsAtEvidence, St->HardoverWritesAtEvidence,
+				St->AutoWritesAtDamage, St->EvidenceConsumeSequence, St->ConsumesAtEvidence,
+				St->PostStopConsumes);
 			break;
 		}
 		}

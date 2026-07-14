@@ -39,7 +39,10 @@ namespace FormationControlV2 {
 
 enum class EF16StickFailureV2 : std::uint8_t {
     None, ResetFrame, Paused, InvalidGuidance, InvalidAttitude, InvalidBodyRates,
-    InvalidAlphaBeta, InvalidTime, AbnormalDt, NonFiniteInput, NonFiniteOutput
+    InvalidAlphaBeta, InvalidTime, AbnormalDt, NonFiniteInput, NonFiniteOutput,
+    // Appended LAST so every existing index stays stable for observers.
+    // A primed latch is armed, but this frame does not belong to the prime it was armed for.
+    PrimeIdentityMismatch
 };
 
 struct FF16StickConfigV2 {
@@ -87,6 +90,13 @@ struct FF16StickInputV2 {
     double SimulationTimeS{}, DtS{};
     bool bPaused{};
     std::uint32_t ResetGeneration{};
+
+    // Prime identity (Phase B). Only meaningful while a baseline latch is armed: the latch is spent
+    // ONLY on the frame it was armed for. A latch is a promise about ONE specific consume of ONE
+    // specific prime; spending it on any other frame would emit a command the aircraft was never
+    // flying, which is a step dressed up as a handoff.
+    std::uint64_t PrimeGeneration{};
+    std::uint64_t PrimeConsumeSequence{};
 };
 
 struct FF16StickCommandV2 {
@@ -105,6 +115,66 @@ public:
     FF16StickCommandV2 Update(const FF16StickInputV2 &, const FF16StickConfigV2 & = {});
     void Reset(std::uint32_t resetGeneration = 0);
 
+    // ---- PRIME (bumpless handoff, Phase B) ---------------------------------------------------
+    // Reset() zeroes the slew memory and the pitch integrator, so the first command after a reset starts
+    // from 0 and the slew limiter drags it toward the target -- a visible step on handover.
+    //
+    // Prime seeds the state FROM THE COMMAND THE FDM IS ALREADY CONSUMING, and it does so in two parts
+    // that are NOT interchangeable:
+    //
+    //   1. STATE SEED (continuity from the second frame onwards)
+    //      * PrevAileron/Elevator/Rudder/Throttle <- the resolved command: the slew limiter starts where
+    //        the aircraft already is and cannot jump.
+    //      * PitchIntegrator <- solved so the pitch loop reproduces that elevator AT ZERO PITCH ERROR:
+    //            elevator = -(Kp*err + I) + D*q,  err = 0  =>  I = D*q - elevator
+    //
+    //   2. ONE-SHOT BASELINE LATCH (exactness on the FIRST frame)
+    //      The seed above is only exact if the guidance happens to command zero pitch error on the very
+    //      first frame. It does not, in general: the guidance is a live controller with its own idea of
+    //      the reference. Seeding alone therefore makes the first command CLOSE, not EQUAL -- the slew
+    //      limiter would smear a residual step out over several frames rather than prevent it.
+    //
+    //      So the first valid Update() after a prime EMITS THE BASELINE EXACTLY and consumes the latch.
+    //      From the second Update() on, the ordinary target / integrator / slew / clamp path runs
+    //      untouched. This is not a filter and not a hold: it is one frame, once, by construction.
+    //
+    // The latch carries the generation and consume sequence it was primed for, so a stale prime cannot
+    // be spent later: a new prime replaces it, and Reset() destroys it.
+    //
+    // This is state initialisation, NOT tuning: no gain, limit, slew rate or trim is touched.
+    // Returns FALSE and changes NOTHING if the prime is not usable. A partially-applied prime would be
+    // worse than none: the slew anchors would move to a command that was never validated, and the latch
+    // would promise a baseline nobody checked.
+    //   * generation 0 / consume sequence 0  -- 0 means "no ticket"; a latch keyed to it can never match
+    //   * non-finite or out-of-range baseline -- it would be handed straight to the FCS
+    //   * non-finite body pitch rate          -- it feeds the integrator seed
+    //   * an unusable CONFIG                  -- non-finite damping gain or integrator limit, a negative
+    //     integrator limit, or an inverted Elevator/Throttle range. The seed is computed FROM the config,
+    //     and the baseline is range-checked AGAINST it, so an unchecked config makes both meaningless.
+    bool PrimeFromResolvedCommand(double resolvedAileron, double resolvedElevator, double resolvedRudder,
+                                  double resolvedThrottle, double bodyPitchRateRadps,
+                                  const FF16StickConfigV2 &config,
+                                  std::uint64_t primeGeneration, std::uint64_t consumeSequence,
+                                  std::uint32_t resetGeneration = 0);
+
+    // Test/diagnostic accessors: what the prime actually left in the state.
+    double PrimedPitchIntegrator() const { return PitchIntegrator; }
+    bool HasPrimedCommands() const { return bHavePrevCommands; }
+    // State snapshot, so a test can prove a latched frame advanced NOTHING.
+    double PrevCommandAileron()  const { return PrevAileron; }
+    double PrevCommandElevator() const { return PrevElevator; }
+    double PrevCommandRudder()   const { return PrevRudder; }
+    double PrevCommandThrottle() const { return PrevThrottle; }
+    // Counts ORDINARY updates (target -> integrator -> slew -> clamp). A latched frame does not count.
+    // Proving "the normal path ran" by watching the integrator move is unreliable: conditional
+    // anti-windup legitimately skips integration under saturation, so a still integrator can mean either
+    // "the latch suppressed it" or "the controller correctly refused to wind up". This counter cannot be
+    // confused between the two.
+    std::uint64_t NormalPathUpdates() const { return NormalPathUpdates_; }
+    bool HasPrimedBaselineLatch() const { return bEmitPrimedBaselineOnce; }
+    std::uint64_t PrimedGeneration() const { return PrimedGeneration_; }
+    std::uint64_t PrimedConsumeSequence() const { return PrimedConsumeSequence_; }
+
 private:
     // Fresh outputs are computed every frame; this state is only the integrator and the
     // slew-limiter anchors. It is cleared on reset/pause-resume/invalid so no previous
@@ -114,6 +184,15 @@ private:
     bool bHavePrevCommands{};
     std::uint32_t LastResetGeneration{};
     bool bInitialized{}, bWasPaused{};
+
+    // One-shot baseline latch (see PrimeFromResolvedCommand). Spent by the first valid Update() after a
+    // prime, destroyed by ClearState() (reset / pause-resume / abnormal dt / invalid input), and
+    // overwritten by a newer prime.
+    bool bEmitPrimedBaselineOnce{};
+    double PrimedBaselineAileron{}, PrimedBaselineElevator{};
+    double PrimedBaselineRudder{}, PrimedBaselineThrottle{};
+    std::uint64_t PrimedGeneration_{}, PrimedConsumeSequence_{};
+    std::uint64_t NormalPathUpdates_{};   // test/diagnostic: ordinary (non-latched) valid updates
 
     void ClearState();
 };

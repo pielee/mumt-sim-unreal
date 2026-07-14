@@ -20,6 +20,14 @@ void F16StickAdapterV2::ClearState()
     PitchIntegrator = 0.0;
     PrevAileron = PrevElevator = PrevRudder = PrevThrottle = 0.0;
     bHavePrevCommands = false;
+
+    // A reset destroys the latch. A baseline captured before a reset describes a command the aircraft
+    // has since stopped flying; spending it afterwards would be a step, not a handoff.
+    bEmitPrimedBaselineOnce = false;
+    PrimedBaselineAileron = PrimedBaselineElevator = PrimedBaselineRudder = PrimedBaselineThrottle = 0.0;
+    PrimedGeneration_ = 0;
+    PrimedConsumeSequence_ = 0;
+    // NormalPathUpdates_ is a diagnostic tally, not control state: it deliberately survives ClearState().
 }
 
 void F16StickAdapterV2::Reset(std::uint32_t resetGeneration)
@@ -28,6 +36,79 @@ void F16StickAdapterV2::Reset(std::uint32_t resetGeneration)
     LastResetGeneration = resetGeneration;
     bInitialized = false;
     bWasPaused = false;
+}
+
+bool F16StickAdapterV2::PrimeFromResolvedCommand(double resolvedAileron, double resolvedElevator,
+                                                 double resolvedRudder, double resolvedThrottle,
+                                                 double bodyPitchRateRadps, const FF16StickConfigV2 &config,
+                                                 std::uint64_t primeGeneration,
+                                                 std::uint64_t consumeSequence,
+                                                 std::uint32_t resetGeneration)
+{
+    // VALIDATE FIRST, MUTATE SECOND. Every check happens before a single field is written, so a rejected
+    // prime leaves the controller EXACTLY as it was -- no half-moved slew anchor, no half-seeded
+    // integrator, no latch armed against a baseline nobody validated.
+    if (primeGeneration == 0 || consumeSequence == 0) return false;   // 0 means "no ticket"
+
+    // THE CONFIG IS AN INPUT TO THE SEED, so it is validated like one. The integrator seed is
+    // Clamp(D*q - elevator, +/-Limit) and the range gates below are read straight off the config: a NaN
+    // gain would poison the integrator, a negative limit would make Clamp(lo > hi) meaningless, and an
+    // inverted Elevator/Throttle range would make every baseline "out of range" -- or, worse, let one
+    // through. Validating the baseline against a config nobody checked is validating nothing.
+    if (!Fin(config.PitchRateDampingGain) || !Fin(config.PitchIntegratorLimit)) return false;
+    if (config.PitchIntegratorLimit < 0.0) return false;
+    if (!Fin(config.ElevatorMin) || !Fin(config.ElevatorMax) || config.ElevatorMin > config.ElevatorMax)
+        return false;
+    if (!Fin(config.ThrottleMin) || !Fin(config.ThrottleMax) || config.ThrottleMin > config.ThrottleMax)
+        return false;
+
+    if (!Fin(resolvedAileron) || !Fin(resolvedElevator) || !Fin(resolvedRudder) || !Fin(resolvedThrottle))
+        return false;
+    if (!Fin(bodyPitchRateRadps)) return false;                       // it feeds the integrator seed
+    if (resolvedAileron < -1.0 || resolvedAileron > 1.0) return false;
+    if (resolvedRudder  < -1.0 || resolvedRudder  > 1.0) return false;
+    if (resolvedElevator < config.ElevatorMin || resolvedElevator > config.ElevatorMax) return false;
+    if (resolvedThrottle < config.ThrottleMin || resolvedThrottle > config.ThrottleMax) return false;
+
+    // The slew memory becomes the command the aircraft is ALREADY flying, so the first frame after the
+    // handoff cannot step: slew() starts from here rather than from 0.
+    PrevAileron  = resolvedAileron;
+    PrevElevator = resolvedElevator;
+    PrevRudder   = resolvedRudder;
+    PrevThrottle = resolvedThrottle;
+    bHavePrevCommands = true;
+
+    // Seed the integrator so the pitch loop REPRODUCES that elevator rather than merely slewing toward
+    // its own idea of it. Update() computes
+    //     elevator = -(PitchErrorToCmdGain * pitchError + PitchIntegrator) + PitchRateDampingGain * q
+    // so at the handoff instant, where the reference is the current attitude (pitchError == 0):
+    //     PitchIntegrator = PitchRateDampingGain * q - elevator
+    const double damping = (config.PitchRateDampingGain != 0.0)
+        ? config.PitchRateDampingGain * bodyPitchRateRadps
+        : 0.0;
+    PitchIntegrator = Clamp(damping - resolvedElevator,
+                            -config.PitchIntegratorLimit, config.PitchIntegratorLimit);
+
+    // ARM THE ONE-SHOT LATCH. The seed above only reproduces the baseline if the guidance happens to
+    // command zero pitch error on the first frame, which in general it does not: it is a live controller
+    // with its own reference. Without the latch the first command is CLOSE, not EQUAL, and the slew
+    // limiter would smear that residual step over the following frames instead of preventing it.
+    //
+    // A new prime overwrites any latch left unspent by an earlier one -- the older baseline is stale by
+    // definition.
+    bEmitPrimedBaselineOnce = true;
+    PrimedBaselineAileron  = resolvedAileron;
+    PrimedBaselineElevator = resolvedElevator;
+    PrimedBaselineRudder   = resolvedRudder;
+    PrimedBaselineThrottle = resolvedThrottle;
+    PrimedGeneration_ = primeGeneration;
+    PrimedConsumeSequence_ = consumeSequence;
+
+    // The next Update() is a continuation, not a first frame.
+    LastResetGeneration = resetGeneration;
+    bInitialized = true;
+    bWasPaused = false;
+    return true;
 }
 
 FF16StickCommandV2 F16StickAdapterV2::Update(const FF16StickInputV2 &in, const FF16StickConfigV2 &config)
@@ -76,6 +157,51 @@ FF16StickCommandV2 F16StickAdapterV2::Update(const FF16StickInputV2 &in, const F
                         (!needBodyRates || (Fin(in.BodyRollRateRadps) && Fin(in.BodyPitchRateRadps) && Fin(in.BodyYawRateRadps))) &&
                         (config.BetaDampingGain == 0.0 || Fin(in.BetaRad));
     if (!finite) { ClearState(); return Neutral(EF16StickFailureV2::NonFiniteInput, in.ResetGeneration, in.SimulationTimeS); }
+
+    // ---------------- one-shot primed baseline (BEFORE any control computation) ----------------
+    // THE LATCHED FRAME ADVANCES NOTHING. It emits the baseline and returns.
+    //
+    // This block sits ahead of the roll/pitch channels on purpose. Running the ordinary path first and
+    // then overwriting the outputs would still have integrated PitchIntegrator, computed a target and
+    // stepped the slew limiter for a frame whose command was never used -- the controller would carry
+    // one frame of state it never actually flew, and the "handoff" would start from a lie.
+    //
+    // Identity is checked, not assumed. A latch is a promise about ONE consume of ONE prime; spending it
+    // on any other frame would emit a command the aircraft was not flying. On a mismatch NOTHING is
+    // touched -- no baseline, no latch consumption, no Prev*, no integrator -- and the frame is refused
+    // explicitly rather than silently producing something plausible.
+    if (bEmitPrimedBaselineOnce) {
+        if (in.PrimeGeneration != PrimedGeneration_ || in.PrimeConsumeSequence != PrimedConsumeSequence_) {
+            return Neutral(EF16StickFailureV2::PrimeIdentityMismatch, in.ResetGeneration, in.SimulationTimeS);
+        }
+
+        FF16StickCommandV2 primed{};
+        primed.AileronCmdNorm  = PrimedBaselineAileron;
+        primed.ElevatorCmdNorm = PrimedBaselineElevator;
+        primed.RudderCmdNorm   = PrimedBaselineRudder;
+        primed.ThrottleCmdNorm = PrimedBaselineThrottle;
+        primed.TimestampS = in.SimulationTimeS;
+        primed.ResetGeneration = in.ResetGeneration;
+
+        if (!Fin(primed.AileronCmdNorm) || !Fin(primed.ElevatorCmdNorm) ||
+            !Fin(primed.RudderCmdNorm)  || !Fin(primed.ThrottleCmdNorm)) {
+            ClearState();
+            return Neutral(EF16StickFailureV2::NonFiniteOutput, in.ResetGeneration, in.SimulationTimeS);
+        }
+
+        // The slew anchors become the baseline. PitchIntegrator keeps the value the prime seeded -- it is
+        // NOT integrated on this frame.
+        PrevAileron  = primed.AileronCmdNorm;
+        PrevElevator = primed.ElevatorCmdNorm;
+        PrevRudder   = primed.RudderCmdNorm;
+        PrevThrottle = primed.ThrottleCmdNorm;
+        bHavePrevCommands = true;
+
+        bEmitPrimedBaselineOnce = false;   // spent exactly once
+        primed.bValid = true;
+        primed.FailureReason = EF16StickFailureV2::None;
+        return primed;
+    }
 
     const double dt = in.DtS;
 
@@ -136,6 +262,7 @@ FF16StickCommandV2 F16StickAdapterV2::Update(const FF16StickInputV2 &in, const F
     PrevAileron = out.AileronCmdNorm; PrevElevator = out.ElevatorCmdNorm;
     PrevRudder = out.RudderCmdNorm;   PrevThrottle = out.ThrottleCmdNorm;
     bHavePrevCommands = true;
+    ++NormalPathUpdates_;   // an ORDINARY frame ran: target, integrator, slew, clamp
     out.bValid = true;
     out.FailureReason = EF16StickFailureV2::None;
     return out;
