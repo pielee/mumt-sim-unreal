@@ -577,6 +577,7 @@ const char *StickFailureName(EF16StickFailureV2 f)
     case EF16StickFailureV2::AbnormalDt: return "AbnormalDt";
     case EF16StickFailureV2::NonFiniteInput: return "NonFiniteInput";
     case EF16StickFailureV2::NonFiniteOutput: return "NonFiniteOutput";
+    case EF16StickFailureV2::PrimeIdentityMismatch: return "PrimeIdentityMismatch";
     }
     return "Unknown";
 }
