@@ -37,6 +37,8 @@ SCENARIOS=(
   "falling|MUMT.ControlV2.FallingPreemptsOperationalFormation"
   "isolation|MUMT.ControlV2.PerAircraftOperationalIsolation"
   "world|MUMT.ControlV2.WorldCleanupOperational"
+  "rejected_keeps_legacy|MUMT.ControlV2.RejectedFormationKeepsLegacyControl"
+  "rejected_while_active|MUMT.ControlV2.RejectedPacketWhileActiveKeepsFormationOwnership"
 )
 
 fail() { echo "COMMAND_FORMATION_OPERATIONAL_V2_RESULT=FAIL"; echo "FAIL: $*" >&2; exit 1; }

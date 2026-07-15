@@ -19,6 +19,7 @@
 #include "Misc/AutomationTest.h"
 #include "FormationControlV2/FormationRuntimeOwnerV2.h"
 #include "State/MumtCommandArbiterV2.h"
+#include "State/MumtCommandOwnershipTelemetry.h"
 #include "HealthComponent.h"
 #include "JSBSimMovementComponent.h"
 #include "Tests/AutomationEditorCommon.h"
@@ -59,6 +60,8 @@ enum class EOpScenario : uint8
 	FallingPreempts,            // 9
 	PerAircraftIsolation,       // 10
 	WorldCleanup,               // 11
+	RejectedFormationKeepsLegacy,       // 12 (Phase F)
+	RejectedPacketWhileActiveKeepsOwn,  // 13 (Phase F)
 };
 
 const TCHAR *OpScenarioName(EOpScenario S)
@@ -76,6 +79,8 @@ const TCHAR *OpScenarioName(EOpScenario S)
 	case EOpScenario::FallingPreempts:          return TEXT("FallingPreempts");
 	case EOpScenario::PerAircraftIsolation:     return TEXT("PerAircraftIsolation");
 	case EOpScenario::WorldCleanup:             return TEXT("WorldCleanup");
+	case EOpScenario::RejectedFormationKeepsLegacy:      return TEXT("RejectedFormationKeepsLegacy");
+	case EOpScenario::RejectedPacketWhileActiveKeepsOwn: return TEXT("RejectedPacketWhileActiveKeepsOwn");
 	default:                                    return TEXT("?");
 	}
 }
@@ -148,6 +153,19 @@ struct FOpUdpSender
 			     "\"command_sequence\":%lld,\"command_timestamp\":%.6f}"),
 			*Aircraft, *Leader, Front, Right, Up, (long long)Seq, Timestamp));
 	}
+	// A control_mode=formation packet that ALSO sets guidance_mode=formation. When the ControlV2 owner
+	// REJECTS it (stale / bad leader / etc.) and RouteControlV2 correctly returns false, the legacy inner-
+	// loop formation keeps flying the follower on this same leader/slot -- so the legacy WRITER keeps
+	// advancing. (While ControlV2 owns the aircraft, the legacy path is skipped and guidance_mode is moot.)
+	void SendFormationWithLegacy(const FString &Aircraft, const FString &Leader,
+	                             double Front, double Right, double Up, int64 Seq, double Timestamp)
+	{
+		SendRaw(FString::Printf(
+			TEXT("{\"aircraft_name\":\"%s\",\"control_mode\":\"formation\",\"guidance_mode\":\"formation\","
+			     "\"leader_name\":\"%s\",\"slot_front_m\":%.3f,\"slot_right_m\":%.3f,\"slot_up_m\":%.3f,"
+			     "\"command_sequence\":%lld,\"command_timestamp\":%.6f}"),
+			*Aircraft, *Leader, Front, Right, Up, (long long)Seq, Timestamp));
+	}
 	void SendLegacy(const FString &Aircraft, int64 Seq, double Timestamp)
 	{
 		SendRaw(FString::Printf(
@@ -202,6 +220,17 @@ struct FOpState
 	int32 OtherOwnerBeforeCount = 0;
 	bool bSawLeaderFallback = false;
 	EFormationRuntimeFallbackV2 RejectReason = EFormationRuntimeFallbackV2::None;
+	// Phase F: legacy-writer positive evidence + Active-ownership preservation
+	bool bOwnEnabled = false;
+	int64 InnerWritesBaseline = 0;
+	int64 InnerWritesAfterInvalid = 0;
+	int64 LegacyResAtBaseline = 0;
+	uint64 GenBeforeInvalid = 0;
+	uint32 CandGenBeforeInvalid = 0;
+	int64 FormationBeforeInvalid = 0;
+	int64 InnerWritesAtActiveMark = 0;
+	bool bSentInvalids = false;
+	int32 InvalidPhase = 0;
 };
 
 // Poll helper: is the follower's owner in Active with the arbiter in Formation?
@@ -210,6 +239,26 @@ bool OpIsActive(UWorld *World, const FString &Follower)
 	UFormationRuntimeOwnerV2 *O = OpFindOwner(World, *Follower);
 	return O && O->GetPhase() == EFormationRuntimePhaseV2::Active
 	         && O->GetActiveMode() == Arb::ECommandMode::FormationControlV2;
+}
+
+// Phase F: the legacy inner-loop writer's per-follower write count. This is POSITIVE evidence -- it only
+// increments when the old ApplyAutopilotToPawn guidance actually runs (i.e. RouteControlV2 did NOT suppress
+// the legacy path for this follower). A suppressed / held writer keeps the count frozen.
+int64 OpInnerWrites(const FString &Follower)
+{
+	int64 W = 0;
+	MumtCommandOwnership::GetWritesForActor(Follower, MumtCommandOwnership::EWriterId::InnerLoopAutopilot, W);
+	return W;
+}
+
+// The follower is airborne with a finite altitude -- it did not fall out of the sky while a rejected command
+// was in flight (the Phase E failure fell to Alt=-27746).
+bool OpFollowerAirborne(UWorld *World, const FString &Follower)
+{
+	UJSBSimMovementComponent *C = OpFindComp(World, *Follower);
+	if (!C) return false;
+	FJsbFlightSnapshot S{};
+	return C->GetJsbFlightSnapshot(S) && S.bValidFrame && FMath::IsFinite(S.AltAslFt) && S.AltAslFt > 100.0;
 }
 
 void CaptureBaselineDev(UWorld *World, FOpState *St)
@@ -267,6 +316,16 @@ public:
 			if (SimT - St->FirstSim < kOpSettleS) return false;
 			St->bSettled = true;
 			Arb::ResetSession(OpScenarioName(Scenario));
+			// Phase F scenarios use the legacy inner-loop writer's per-follower write count as positive
+			// evidence, so the ownership telemetry must be counting from a clean baseline for them.
+			if (Scenario == EOpScenario::RejectedFormationKeepsLegacy
+				|| Scenario == EOpScenario::RejectedPacketWhileActiveKeepsOwn
+				|| Scenario == EOpScenario::DisableImmediateFallback)
+			{
+				MumtCommandOwnership::SetEnabled(true);
+				MumtCommandOwnership::ResetSession(OpScenarioName(Scenario));
+				St->bOwnEnabled = true;
+			}
 			return false;
 		}
 		if ((NowWall - St->FirstWall) > kOpMaxWallSeconds)
@@ -411,6 +470,9 @@ private:
 				St->bReachedActive = true;
 				St->FormationAtMark = Arb::GetCounters().FormationResolutionCount;
 				St->LegacyAtMark = Arb::GetCounters().LegacyResolutionCount;
+				// Legacy writer is SKIPPED while ControlV2 owns the aircraft: latch the (frozen) count so the
+				// Finalize can prove it ADVANCES again once the disable falls back to Legacy.
+				St->InnerWritesAtActiveMark = OpInnerWrites(St->Follower);
 				St->Phase = 2;
 			}
 			if (St->Phase == 2)
@@ -500,6 +562,103 @@ private:
 			if (!St->bReachedActive) St->Udp.SendFormation(St->Follower, St->Leader, -200, 100, 0, St->Seq, Now());
 			if (OpIsActive(World, St->Follower)) St->bReachedActive = true;
 			if (Elapsed < 12.0) return false;
+			return Finalize(World);
+		}
+
+		case EOpScenario::RejectedFormationKeepsLegacy:
+		{
+			// The follower is flown by the LEGACY inner-loop formation (the -FormationTest scripted flight).
+			// A series of REJECTED control_mode=formation commands must NOT suppress that legacy writer -- the
+			// Phase E bug returned true unconditionally and left the follower with no controller (it fell to
+			// Alt=-27746). Each rejected command carries guidance_mode=formation so the legacy formation keeps
+			// flying it; the window ends on a valid leader/slot so the follower is flying cleanly at measure.
+			if (St->Phase == 0)
+			{
+				St->InnerWritesBaseline = OpInnerWrites(St->Follower);
+				St->LegacyResAtBaseline = Arb::GetCounters().LegacyResolutionCount;
+				St->Phase = 1;
+				return false;
+			}
+			if (St->Phase == 1 && Elapsed > 1.5)
+			{
+				// stale timestamp (10 s old): valid leader + slot, so the legacy formation flies it cleanly.
+				St->Udp.SendFormationWithLegacy(St->Follower, St->Leader, -200, 100, 0, 20, Now() - 10.0);
+				St->Phase = 2;
+				return false;
+			}
+			if (St->Phase == 2 && Elapsed > 3.0)
+			{
+				// nonexistent leader (fresh sequence): ControlV2 rejects (NoLeaderSpecified).
+				St->Udp.SendFormationWithLegacy(St->Follower, TEXT("NO_SUCH_LEADER"), -200, 100, 0, 21, Now());
+				St->Phase = 3;
+				return false;
+			}
+			if (St->Phase == 3 && Elapsed > 4.5)
+			{
+				// out-of-range slot (200 km, finite but > kSlotAbsMaxM = 100 km): ControlV2 rejects it
+				// (NonFiniteSlot). It is deliberately finite -- a truly huge slot (1e40) fed to the LEGACY
+				// formation via guidance_mode=formation overflows its own bearing math to inf/nan; this value
+				// keeps the legacy path finite while still exercising ControlV2's range rejection. (The truly
+				// non-finite case is covered in RejectedPacketWhileActive, where the legacy path is skipped.)
+				St->Udp.SendFormationWithLegacy(St->Follower, St->Leader, 200000.0, 100, 0, 22, Now());
+				St->Phase = 4;
+				return false;
+			}
+			if (St->Phase == 4 && Elapsed > 6.0)
+			{
+				// return to a clean valid (still-rejected-as-stale) command so the follower flies cleanly.
+				St->Udp.SendFormationWithLegacy(St->Follower, St->Leader, -200, 100, 0, 23, Now() - 10.0);
+				St->Phase = 5;
+				return false;
+			}
+			if (St->Phase == 5 && Elapsed > 8.0)
+			{
+				St->InnerWritesAfterInvalid = OpInnerWrites(St->Follower);
+				St->bSentInvalids = true;
+				St->Phase = 6;
+			}
+			if (Elapsed < 9.0) return false;
+			return Finalize(World);
+		}
+
+		case EOpScenario::RejectedPacketWhileActiveKeepsOwn:
+		{
+			// Reach Active with a valid enable, then send REJECTED new-sequence packets. ControlV2 must KEEP
+			// ownership: the runtime stays Active, no re-prime, the bad packet's values are NOT applied, the
+			// producer keeps advancing, and the legacy writer does NOT re-enter under the active ControlV2.
+			if (!St->bReachedActive) St->Udp.SendFormation(St->Follower, St->Leader, -200, 100, 0, St->Seq, Now());
+			if (OpIsActive(World, St->Follower) && St->Phase == 0)
+			{
+				St->bReachedActive = true;
+				if (UFormationRuntimeOwnerV2 *O = OpFindOwner(World, *St->Follower))
+				{
+					St->GenBeforeInvalid = O->GetPrimeGeneration();
+					St->CandGenBeforeInvalid = O->GetCandidateGeneration();
+				}
+				St->FormationBeforeInvalid = Arb::GetCounters().FormationResolutionCount;
+				// Legacy writer is skipped while Active: latch the frozen count; it must stay frozen.
+				St->InnerWritesAtActiveMark = OpInnerWrites(St->Follower);
+				St->Phase = 2;
+			}
+			if (St->Phase == 2 && Elapsed > 8.0)
+			{
+				// a NEW sequence but STALE timestamp + a bogus slot -> rejected, ownership kept, slot NOT applied
+				St->Udp.SendFormation(St->Follower, St->Leader, 777, 777, 777, 5, Now() - 10.0);
+				St->Phase = 3;
+			}
+			if (St->Phase == 3 && Elapsed > 10.0)
+			{
+				// another NEW sequence with a truly non-finite slot -> rejected (NonFiniteSlot), ownership
+				// kept. Safe to send 1e40 here: ControlV2 owns the aircraft, so the legacy formation is
+				// skipped and never sees this slot -- only the owner (which rejects it) does.
+				St->Udp.SendRaw(FString::Printf(
+					TEXT("{\"aircraft_name\":\"%s\",\"control_mode\":\"formation\",\"leader_name\":\"%s\","
+					     "\"slot_front_m\":1e40,\"slot_right_m\":777,\"slot_up_m\":777,"
+					     "\"command_sequence\":6,\"command_timestamp\":%.6f}"),
+					*St->Follower, *St->Leader, Now()));
+				St->Phase = 4;
+			}
+			if (Elapsed < 15.0) return false;
 			return Finalize(World);
 		}
 		}
@@ -621,9 +780,17 @@ private:
 				O && O->GetPhase() == EFormationRuntimePhaseV2::Idle);
 			Test->TestTrue(TEXT("7: Legacy resolved after the disable"),
 				C.LegacyResolutionCount > St->LegacyAtMark);
+			// POSITIVE EVIDENCE: the legacy inner-loop WRITER re-engaged after the disable -- its per-follower
+			// write count advanced past the (frozen) value captured while ControlV2 owned the aircraft.
+			if (St->bOwnEnabled)
+				Test->TestTrue(TEXT("7: the legacy writer re-engaged after disable (write count advanced)"),
+					OpInnerWrites(St->Follower) > St->InnerWritesAtActiveMark);
+			Test->TestTrue(TEXT("7: the follower is still airborne after the fallback"),
+				OpFollowerAirborne(World, St->Follower));
 			UE_LOG(LogMumtFormOp, Display,
-				TEXT("[FOP] DISABLE_RESULT formation_at_mark=%lld formation_now=%lld legacy_at_mark=%lld legacy_now=%lld phase=%s mode_legacy=%d"),
+				TEXT("[FOP] DISABLE_RESULT formation_at_mark=%lld formation_now=%lld legacy_at_mark=%lld legacy_now=%lld inner_mark=%lld inner_now=%lld phase=%s mode_legacy=%d"),
 				St->FormationAtMark, C.FormationResolutionCount, St->LegacyAtMark, C.LegacyResolutionCount,
+				St->InnerWritesAtActiveMark, OpInnerWrites(St->Follower),
 				O ? FormationRuntimePhaseName(O->GetPhase()) : TEXT("gone"),
 				(F && Arb::GetMode(F) == Arb::ECommandMode::LegacyOrManual) ? 1 : 0);
 			break;
@@ -707,6 +874,69 @@ private:
 				St->bReachedActive ? 1 : 0, Before, After);
 			break;
 		}
+
+		case EOpScenario::RejectedFormationKeepsLegacy:
+		{
+			Test->TestTrue(TEXT("12: all the rejected commands were sent"), St->bSentInvalids);
+			Test->TestEqual(TEXT("12: Formation NEVER resolved (every command was rejected)"),
+				C.FormationResolutionCount, (int64)0);
+			Test->TestTrue(TEXT("12: the owner never reached Active"),
+				O == nullptr || O->GetPhase() != EFormationRuntimePhaseV2::Active);
+			Test->TestTrue(TEXT("12: the owner is Idle and NOT requesting Formation"),
+				O == nullptr || (O->GetPhase() == EFormationRuntimePhaseV2::Idle && !O->IsFormationRequested()));
+			if (F) Test->TestEqual(TEXT("12: mode stayed LegacyOrManual"),
+				(int32)Arb::GetMode(F), (int32)Arb::ECommandMode::LegacyOrManual);
+			// POSITIVE EVIDENCE: the legacy inner-loop writer kept ADVANCING through every rejected command
+			// (the fix's core guarantee -- the follower is never left with no controller).
+			Test->TestTrue(TEXT("12: the legacy writer kept advancing (NOT suppressed / held)"),
+				St->InnerWritesAfterInvalid > St->InnerWritesBaseline);
+			Test->TestTrue(TEXT("12: Legacy kept resolving at the consume boundary"),
+				C.LegacyResolutionCount > St->LegacyResAtBaseline);
+			Test->TestTrue(TEXT("12: the follower is still airborne (never held into the ground)"),
+				OpFollowerAirborne(World, St->Follower));
+			UE_LOG(LogMumtFormOp, Display,
+				TEXT("[FOP] REJECTED_KEEPS_LEGACY_RESULT formation=%lld inner_baseline=%lld inner_after=%lld "
+				     "legacy_base=%lld legacy_now=%lld phase=%s requested=%d"),
+				C.FormationResolutionCount, St->InnerWritesBaseline, St->InnerWritesAfterInvalid,
+				St->LegacyResAtBaseline, C.LegacyResolutionCount,
+				O ? FormationRuntimePhaseName(O->GetPhase()) : TEXT("no-owner"),
+				(O && O->IsFormationRequested()) ? 1 : 0);
+			break;
+		}
+
+		case EOpScenario::RejectedPacketWhileActiveKeepsOwn:
+		{
+			Test->TestTrue(TEXT("13: reached Active before the invalid packets"), St->bReachedActive);
+			Test->TestTrue(TEXT("13: still Active after the rejected packets (ownership kept)"),
+				O && O->GetPhase() == EFormationRuntimePhaseV2::Active);
+			Test->TestTrue(TEXT("13: NO re-prime (prime generation unchanged)"),
+				O && O->GetPrimeGeneration() == St->GenBeforeInvalid);
+			Test->TestTrue(TEXT("13: the rejected packets were NOT applied (applied sequence unchanged)"),
+				O && O->GetAppliedSequence() == 1);
+			Test->TestTrue(TEXT("13: the producer kept advancing (candidate generation grew)"),
+				O && (uint32)O->GetCandidateGeneration() > St->CandGenBeforeInvalid);
+			Test->TestTrue(TEXT("13: Formation kept resolving through the rejections"),
+				C.FormationResolutionCount > St->FormationBeforeInvalid);
+			// POSITIVE EVIDENCE: the legacy writer did NOT re-enter while ControlV2 owned the aircraft -- its
+			// per-follower write count stayed frozen at the value captured when Active began.
+			Test->TestEqual(TEXT("13: the legacy writer did NOT re-enter (write count frozen while Active)"),
+				OpInnerWrites(St->Follower), St->InnerWritesAtActiveMark);
+			if (F) Test->TestEqual(TEXT("13: mode stayed FormationControlV2"),
+				(int32)Arb::GetMode(F), (int32)Arb::ECommandMode::FormationControlV2);
+			Test->TestTrue(TEXT("13: the follower is still airborne"),
+				OpFollowerAirborne(World, St->Follower));
+			UE_LOG(LogMumtFormOp, Display,
+				TEXT("[FOP] REJECTED_WHILE_ACTIVE_RESULT reached_active=%d phase=%s prime_before=%llu prime_now=%llu "
+				     "applied_seq=%lld candgen_before=%u candgen_now=%u formation_before=%lld formation_now=%lld "
+				     "inner_mark=%lld inner_now=%lld"),
+				St->bReachedActive ? 1 : 0, O ? FormationRuntimePhaseName(O->GetPhase()) : TEXT("gone"),
+				St->GenBeforeInvalid, O ? O->GetPrimeGeneration() : 0,
+				O ? (long long)O->GetAppliedSequence() : -1,
+				St->CandGenBeforeInvalid, O ? O->GetCandidateGeneration() : 0,
+				St->FormationBeforeInvalid, C.FormationResolutionCount,
+				St->InnerWritesAtActiveMark, OpInnerWrites(St->Follower));
+			break;
+		}
 		}
 		return true;
 	}
@@ -744,6 +974,8 @@ FOP_TEST(FMumtOpInvalid,     "MUMT.ControlV2.InvalidOrStaleOperationalCommandRej
 FOP_TEST(FMumtOpFalling,     "MUMT.ControlV2.FallingPreemptsOperationalFormation",EOpScenario::FallingPreempts)
 FOP_TEST(FMumtOpIsolation,   "MUMT.ControlV2.PerAircraftOperationalIsolation",    EOpScenario::PerAircraftIsolation)
 FOP_TEST(FMumtOpWorld,       "MUMT.ControlV2.WorldCleanupOperational",            EOpScenario::WorldCleanup)
+FOP_TEST(FMumtOpRejKeepsLeg, "MUMT.ControlV2.RejectedFormationKeepsLegacyControl", EOpScenario::RejectedFormationKeepsLegacy)
+FOP_TEST(FMumtOpRejActive,   "MUMT.ControlV2.RejectedPacketWhileActiveKeepsFormationOwnership", EOpScenario::RejectedPacketWhileActiveKeepsOwn)
 
 #undef FOP_TEST
 

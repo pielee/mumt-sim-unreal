@@ -74,9 +74,30 @@ The headless `-FormationTest` flight harness rewrites the follower's setpoint ev
 makes it skip a follower that already carries an operational `control_mode: formation` command, so
 `RouteControlV2` can drive it. This affects only the test harness — production never passes `-FormationTest`.
 
+## Rejected commands never suppress the legacy writer (Phase F)
+
+`RouteControlV2`'s bool return means **"skip the legacy inner-loop writer this frame"** — it must NOT mean
+"the packet said `control_mode: formation`". The two are different: a formation packet can be *rejected* (no
+leader / stale / replayed / out-of-range slot). Returning `true` for every formation packet suppressed the
+legacy writer even when ControlV2 declined the command, leaving the follower with no active controller (it
+flew a held command into the ground). The return is now:
+
+```
+return bAccepted || bRuntimeOwnsOrPending;   // NOT: return control_mode == formation
+```
+
+- **Rejected from Idle** → `false`: the owner stays Idle / `!IsFormationRequested`, so the legacy guidance
+  keeps running. The follower is never left un-commanded.
+- **Rejected while pending/active** → `true`: `IsFormationRequested()` (or a Warming/Priming/AwaitingActivation/
+  Active phase) still holds, so one bad packet cannot drop a live handoff or let the legacy writer re-enter
+  under an active ControlV2. The bad packet's values are not applied and there is no re-prime.
+- **Accepted** (valid enable / idempotent hold / slot update / leader change) → `true`, exactly as before.
+- **Explicit disable** → the `control_mode != formation` branch resets the owner and returns `false`: the
+  legacy writer runs the same frame.
+
 ## What is proven, and what is NOT
 
-Proven, by `Tools/planner_v2/run_formation_operational_v2.sh` (11 scenarios, real UDP 5010, real producer,
+Proven, by `Tools/planner_v2/run_formation_operational_v2.sh` (13 scenarios, real UDP 5010, real producer,
 live leader + follower):
 
 - an old packet stays Legacy (backward-compat);
@@ -85,8 +106,13 @@ live leader + follower):
 - the real producer keeps moving the controls (measured elevator/throttle to ~1.0), candidate generation
   advancing — not a fake that re-emits the baseline;
 - repeated enable idempotent; slot update without re-prime; leader change forces a fresh handshake; disable
-  is an immediate Legacy fallback; stale / replayed / non-finite / no-leader commands are refused;
-  Falling preempts; per-aircraft isolation; world teardown leaves no runtime state.
+  is an immediate Legacy fallback (and the legacy **writer** provably re-advances); stale / replayed /
+  non-finite / no-leader commands are refused;
+  Falling preempts; per-aircraft isolation; world teardown leaves no runtime state;
+- **rejected formation commands never suppress the legacy writer**: while a series of rejected commands is in
+  flight the legacy inner-loop writer keeps advancing (positive `InnerLoopAutopilot` write-count evidence) and
+  the follower stays airborne; and a rejected packet while Active keeps ControlV2 ownership (no re-prime, no
+  legacy re-entry, the bad values never applied) while the producer keeps advancing.
 
 **NOT** proven, and not claimed:
 

@@ -750,10 +750,7 @@ bool AUDPControlReceiver::RouteControlV2(APawn* Pawn, const FUavSetpoint& Setpoi
     }
 
     // control_mode == formation: resolve the leader by the SAME label rule the legacy formation uses, and
-    // push the operational request to the owner. The owner decides idempotency / staleness / leader-change;
-    // it does NOT run here. Even if the request is rejected (no leader / stale), this aircraft is a
-    // ControlV2 aircraft, so the legacy guidance is skipped for it (it flies on its default until ControlV2
-    // engages) -- returning true.
+    // push the operational request to the owner. The owner decides idempotency / staleness / leader-change.
     APawn* LeaderPawn = MatchPawnByKey(Pawns, Setpoint.LeaderName);
     UJSBSimMovementComponent* LeaderJSB = LeaderPawn ? FindJSBSimMovementComponent(LeaderPawn) : nullptr;
 
@@ -762,14 +759,32 @@ bool AUDPControlReceiver::RouteControlV2(APawn* Pawn, const FUavSetpoint& Setpoi
         Owner = NewObject<UFormationRuntimeOwnerV2>(Pawn);
         if (Owner) Owner->RegisterComponent();
     }
-    if (Owner)
-    {
-        EFormationRuntimeFallbackV2 Reason = EFormationRuntimeFallbackV2::None;
-        Owner->ApplyOperationalRequest(true, LeaderJSB, Setpoint.LeaderName,
-                                       Setpoint.SlotFrontM, Setpoint.SlotRightM, Setpoint.SlotUpM,
-                                       Setpoint.CommandSequence, Setpoint.CommandTimestamp, Reason);
-    }
-    return true;
+    // No owner could be created -> ControlV2 cannot own this aircraft -> let the legacy writer run.
+    if (!Owner) return false;
+
+    EFormationRuntimeFallbackV2 Reason = EFormationRuntimeFallbackV2::None;
+    const bool bAccepted = Owner->ApplyOperationalRequest(true, LeaderJSB, Setpoint.LeaderName,
+                                   Setpoint.SlotFrontM, Setpoint.SlotRightM, Setpoint.SlotUpM,
+                                   Setpoint.CommandSequence, Setpoint.CommandTimestamp, Reason);
+
+    // The return value means "skip the legacy writer this frame", NOT "the packet said formation". Skipping
+    // the legacy guidance is only safe when ControlV2 actually OWNS (or is taking over) this aircraft.
+    //
+    // A rejected request from an IDLE owner must NOT suppress the legacy writer: a stale / missing-leader /
+    // non-finite / replayed formation command would otherwise leave the follower with no active controller,
+    // flying a held command into the ground (the Phase E crash). It stays Idle + !IsFormationRequested here,
+    // so the expression below is false and the legacy guidance runs.
+    //
+    // A rejected request WHILE ControlV2 is already pending/active keeps ownership: one bad packet must not
+    // drop a live handoff or let the legacy writer re-enter under an active ControlV2. bFormationRequested
+    // stays true across a rejection, so the expression is true and the legacy writer stays skipped.
+    const bool bRuntimeOwnsOrPending =
+        Owner->IsFormationRequested()
+        || Owner->GetPhase() == EFormationRuntimePhaseV2::Warming
+        || Owner->GetPhase() == EFormationRuntimePhaseV2::Priming
+        || Owner->GetPhase() == EFormationRuntimePhaseV2::AwaitingActivation
+        || Owner->GetPhase() == EFormationRuntimePhaseV2::Active;
+    return bAccepted || bRuntimeOwnsOrPending;
 }
 
 void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, const FUavSetpoint& Setpoint,
