@@ -38,6 +38,18 @@ enum class EGuidanceMode : uint8
     Attack,      // target_name pawn 직독 → pursuit heading/alt/speed (FPursuitGuidance)
 };
 
+// Phase D: selects WHICH controller stack owns the aircraft, orthogonal to EGuidanceMode above.
+//   Legacy    — the existing inner-loop path (EGuidanceMode / manual). DEFAULT: an old sender that omits
+//               control_mode is 100% unchanged.
+//   Formation — the FormationControlV2 stack: the per-aircraft runtime owner drives the real
+//               NPFG/TECS/stick producer through the Prime/handoff contract into the command arbiter.
+// Selected by the "control_mode" JSON string; unknown / absent -> Legacy.
+enum class EControlModeV2 : uint8
+{
+    Legacy,
+    Formation,
+};
+
 // High-level autopilot setpoint for one UAV (heading/altitude/speed-or-throttle).
 struct FUavSetpoint
 {
@@ -48,6 +60,10 @@ struct FUavSetpoint
     float TargetSpeedMps = 0.f;   // >0 → autothrottle holds this airspeed
     // ── 유도 모드 (Phase 4: 인엔진 60Hz 유도) ──
     EGuidanceMode Mode = EGuidanceMode::Direct;
+    // ── Phase D: ControlV2 operational selector (backward-compatible; old senders omit these) ──
+    EControlModeV2 ControlMode = EControlModeV2::Legacy;  // "control_mode"
+    int64  CommandSequence  = -1;    // "command_sequence": monotonic per aircraft; <= last is replay
+    double CommandTimestamp = -1.0;  // "command_timestamp": sender seconds; too old on the enable edge = stale
     FString LeaderName;           // formation: 리더 pawn 이름 (setpoint 키와 동일 매칭 규칙)
     FString TargetName;           // attack: 표적 pawn 이름
     float SlotFrontM  = -80.f;    // 슬롯 오프셋 — 리더 트랙 프레임 (+앞/+우/+상)
@@ -96,6 +112,11 @@ private:
     void AutopilotTick();         // called at 60 Hz via FTimerHandle
     void ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, const FUavSetpoint& Setpoint,
                               const TArray<AActor*>& Pawns);   // Pawns: 리더/표적 직독용 현재 pawn 목록
+    // Phase D: routes a ControlV2 operational request to the per-aircraft runtime owner. Returns true when
+    // control_mode==formation (the aircraft is a ControlV2 aircraft this frame -> the legacy guidance is
+    // skipped for it). Returns false for legacy/absent (any owner is told to disable, and the legacy path
+    // runs as before). Does NOT drive the producer itself -- the runtime owner does, on its own tick.
+    bool RouteControlV2(APawn* Pawn, const FUavSetpoint& Setpoint, const TArray<AActor*>& Pawns);
     void UpdateFormationTest(const TArray<AActor*>& Pawns);    // 인엔진 편대 시험 (스크립트 리더)
 
     bool StartUDPSender();

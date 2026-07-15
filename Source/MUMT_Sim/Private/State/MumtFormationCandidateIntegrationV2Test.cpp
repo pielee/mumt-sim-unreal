@@ -92,7 +92,7 @@ UJSBSimMovementComponent *FindAircraft(UWorld *World, const TCHAR *Label, AActor
 	return nullptr;
 }
 
-double GetSimTime(UWorld *World)
+double GetFciSimTime(UWorld *World)
 {
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
@@ -158,7 +158,7 @@ public:
 		UWorld *World = (GEditor && GEditor->PlayWorld) ? GEditor->PlayWorld : nullptr;
 		if (!World) return false;
 
-		const double SimT = GetSimTime(World);
+		const double SimT = GetFciSimTime(World);
 		if (SimT < 0.0) return false;
 		if (St->FirstSim < 0.0) St->FirstSim = SimT;
 

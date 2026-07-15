@@ -11,7 +11,7 @@ namespace
 {
 constexpr double kFtToM = 0.3048;
 
-bool Fin(double V) { return FMath::IsFinite(V); }
+bool PcFin(double V) { return FMath::IsFinite(V); }
 
 // Same raw mapping the airborne shadow chain uses (MumtAirborneShadowTest.cpp ToRaw). Kept local so the
 // producer depends only on the public snapshot getter, not on the test.
@@ -119,8 +119,8 @@ bool FFormationCandidateProducerV2::ComputeChain(const UJSBSimMovementComponent 
 	SI.CurrentRollRad = FSt.Roll_rad; SI.CurrentPitchRad = FSt.Pitch_rad; SI.bAttitudeValid = FSt.bAttitudeValid;
 	SI.BodyRollRateRadps = FS.BodyRollRatePRadps; SI.BodyPitchRateRadps = FS.BodyPitchRateQRadps;
 	SI.BodyYawRateRadps = FS.BodyYawRateRRadps;
-	SI.bBodyRatesValid = Fin(FS.BodyRollRatePRadps) && Fin(FS.BodyPitchRateQRadps) && Fin(FS.BodyYawRateRRadps);
-	SI.AlphaRad = FS.AlphaRad; SI.BetaRad = FS.BetaRad; SI.bAlphaBetaValid = Fin(FS.AlphaRad) && Fin(FS.BetaRad);
+	SI.bBodyRatesValid = PcFin(FS.BodyRollRatePRadps) && PcFin(FS.BodyPitchRateQRadps) && PcFin(FS.BodyYawRateRRadps);
+	SI.AlphaRad = FS.AlphaRad; SI.BetaRad = FS.BetaRad; SI.bAlphaBetaValid = PcFin(FS.AlphaRad) && PcFin(FS.BetaRad);
 	SI.EasMps = FSt.EquivalentAirspeed_mps; SI.TasMps = FSt.TrueAirspeed_mps;
 	SI.bAirspeedValid = FSt.bEasValid && FSt.bTasValid;
 	SI.SimulationTimeS = FS.SimTimeSec; SI.DtS = DtS; SI.bPaused = FSt.bPaused;
@@ -143,7 +143,7 @@ bool FFormationCandidateProducerV2::ComputeChain(const UJSBSimMovementComponent 
 		Out.Result = EProducerResult::ChainNotReady;
 		return false;
 	}
-	if (!Fin(SO.AileronCmdNorm) || !Fin(SO.ElevatorCmdNorm) || !Fin(SO.RudderCmdNorm) || !Fin(SO.ThrottleCmdNorm))
+	if (!PcFin(SO.AileronCmdNorm) || !PcFin(SO.ElevatorCmdNorm) || !PcFin(SO.RudderCmdNorm) || !PcFin(SO.ThrottleCmdNorm))
 	{
 		bChainReady = false;
 		Out.Result = EProducerResult::NonFiniteChainOutput;

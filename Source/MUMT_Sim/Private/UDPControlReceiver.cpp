@@ -7,6 +7,7 @@
 #include "FDMTypes.h"
 #include "GameFramework/Pawn.h"
 #include "HealthComponent.h"
+#include "FormationControlV2/FormationRuntimeOwnerV2.h"
 #include "IPAddress.h"
 #include "JSBSimMovementComponent.h"
 #include "Kismet/GameplayStatics.h"
@@ -414,6 +415,18 @@ void AUDPControlReceiver::ReceiveSetpointData()
                 else if (ModeStr.Equals(TEXT("attack"), ESearchCase::IgnoreCase))
                     SP.Mode = EGuidanceMode::Attack;
             }
+            // ── Phase D: ControlV2 operational selector (backward-compatible; absent → Legacy). Reuses
+            //    leader_name + slot_front/right/up_m below; adds control_mode + command_sequence/timestamp. ──
+            FString CtrlModeStr;
+            if (O->TryGetStringField(TEXT("control_mode"), CtrlModeStr))
+            {
+                // Only "formation" engages ControlV2. "legacy"/""/anything unknown stays Legacy (rejected).
+                if (CtrlModeStr.Equals(TEXT("formation"), ESearchCase::IgnoreCase))
+                    SP.ControlMode = EControlModeV2::Formation;
+            }
+            if (O->TryGetNumberField(TEXT("command_sequence"),  V)) SP.CommandSequence  = (int64)V;
+            if (O->TryGetNumberField(TEXT("command_timestamp"), V)) SP.CommandTimestamp = V;
+
             O->TryGetStringField(TEXT("leader_name"), SP.LeaderName);
             O->TryGetStringField(TEXT("target_name"), SP.TargetName);
             if (O->TryGetNumberField(TEXT("slot_front_m"),  V)) SP.SlotFrontM = (float)V;
@@ -592,7 +605,14 @@ void AUDPControlReceiver::UpdateFormationTest(const TArray<AActor*>& Pawns)
     }
 
     // ── 팔로워: BT와 동일한 게이팅으로 formation 진입 ──
-    if (bTestDriveFollower)
+    // Phase D: the scripted -FormationTest flight is a TEST harness. If an operational ControlV2 command
+    // (control_mode=formation) has been received for this follower, it WINS: leave its setpoint alone so
+    // RouteControlV2 drives it through the real producer instead of the scripted old formation. This only
+    // affects the headless test flight -- production never passes -FormationTest.
+    const FUavSetpoint* OpFolSetpoint = Setpoints.Find(PawnIdName(Fol));
+    const bool bFollowerOwnedByOperationalV2 =
+        OpFolSetpoint && OpFolSetpoint->ControlMode == EControlModeV2::Formation;
+    if (bTestDriveFollower && !bFollowerOwnedByOperationalV2)
     {
         if (!T.bFolFormation && FolClimb >= 150.0 && LdrClimb >= 80.0)
         {
@@ -707,6 +727,51 @@ void AUDPControlReceiver::UpdateFormationTest(const TArray<AActor*>& Pawns)
     }
 }
 
+bool AUDPControlReceiver::RouteControlV2(APawn* Pawn, const FUavSetpoint& Setpoint, const TArray<AActor*>& Pawns)
+{
+    if (!IsValid(Pawn)) return false;
+
+    // The runtime owner is a per-aircraft component. It is created lazily on the first Formation request
+    // and then persists on the actor (toggling active/idle) until the actor is destroyed -- so world
+    // teardown, actor destruction and PIE end clean it up automatically, with no receiver-side map to leak.
+    UFormationRuntimeOwnerV2* Owner = Pawn->FindComponentByClass<UFormationRuntimeOwnerV2>();
+
+    if (Setpoint.ControlMode != EControlModeV2::Formation)
+    {
+        // Legacy / absent: disable any existing owner (immediate fallback, producer reset) and let the
+        // existing inner-loop guidance run unchanged.
+        if (Owner)
+        {
+            EFormationRuntimeFallbackV2 Reason = EFormationRuntimeFallbackV2::None;
+            Owner->ApplyOperationalRequest(false, nullptr, FString(), 0.0, 0.0, 0.0,
+                                           Setpoint.CommandSequence, Setpoint.CommandTimestamp, Reason);
+        }
+        return false;
+    }
+
+    // control_mode == formation: resolve the leader by the SAME label rule the legacy formation uses, and
+    // push the operational request to the owner. The owner decides idempotency / staleness / leader-change;
+    // it does NOT run here. Even if the request is rejected (no leader / stale), this aircraft is a
+    // ControlV2 aircraft, so the legacy guidance is skipped for it (it flies on its default until ControlV2
+    // engages) -- returning true.
+    APawn* LeaderPawn = MatchPawnByKey(Pawns, Setpoint.LeaderName);
+    UJSBSimMovementComponent* LeaderJSB = LeaderPawn ? FindJSBSimMovementComponent(LeaderPawn) : nullptr;
+
+    if (!Owner)
+    {
+        Owner = NewObject<UFormationRuntimeOwnerV2>(Pawn);
+        if (Owner) Owner->RegisterComponent();
+    }
+    if (Owner)
+    {
+        EFormationRuntimeFallbackV2 Reason = EFormationRuntimeFallbackV2::None;
+        Owner->ApplyOperationalRequest(true, LeaderJSB, Setpoint.LeaderName,
+                                       Setpoint.SlotFrontM, Setpoint.SlotRightM, Setpoint.SlotUpM,
+                                       Setpoint.CommandSequence, Setpoint.CommandTimestamp, Reason);
+    }
+    return true;
+}
+
 void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, const FUavSetpoint& Setpoint,
                                                const TArray<AActor*>& Pawns)
 {
@@ -724,6 +789,15 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
             UavControls.Remove(Key);
             return;
         }
+    }
+
+    // ── Phase D: ControlV2 operational routing. When control_mode==formation, the per-aircraft runtime
+    //    owner drives the real NPFG/TECS/stick producer through the Prime/handoff contract, and the legacy
+    //    inner-loop guidance below is skipped for this aircraft. For legacy/absent the owner (if any) is
+    //    disabled and the existing path runs completely unchanged. ──
+    if (RouteControlV2(Pawn, Setpoint, Pawns))
+    {
+        return;
     }
 
     // Per-UAV stick controller + autothrottle, created on first use — their internal
