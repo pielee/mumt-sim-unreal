@@ -201,6 +201,19 @@ struct FPrimedCandidate
 	FFormationCandidate Candidate;
 	uint64 PrimeGeneration = 0;   // 0 is never issued: it means "no ticket"
 	uint64 BaselineConsumeSequence = 0;
+
+	// PHASE C: the FULL 29-field block the real producer wants applied. The producer copies the IMMUTABLE
+	// prime baseline and overwrites only the fields it owns (aileron/elevator/rudder/throttle from the
+	// stick; speed-brake is not produced and stays at baseline), so every non-producer field -- trims,
+	// flaps, brakes, gear, all engine fields but throttle -- carries the BASELINE value, not whatever the
+	// legacy writers happen to be doing on the handoff frame. That is what makes the whole block continuous
+	// with what the aircraft was actually flying.
+	//
+	// When absent (bHasFullBlock == false, the Phase B path), the arbiter overlays ONLY the five controlled
+	// axes onto the live legacy block, exactly as before -- so no Phase B behaviour changes.
+	bool bHasFullBlock = false;
+	FFlightControlCommands FullCommands;
+	TArray<FEngineCommand> FullEngineCommands;
 };
 
 // Generations are uint64, strictly monotonic per aircraft, and NEVER reused. 0 is invalid by
@@ -232,6 +245,19 @@ bool SubmitPrimedCandidate(const UJSBSimMovementComponent *Component, const FPri
 
 // TEST/DEV ONLY. Refuses unless the aircraft is in PrimedCandidateReady. Nothing in production calls it.
 bool ActivateFormationForTesting(const UJSBSimMovementComponent *Component, EPrimeFailure &OutFailure);
+
+// ---- PHASE C: production handoff verbs -------------------------------------------------------------
+// The production twin of ActivateFormationForTesting. It ONLY asks: it sets ActivationPending and the
+// actual switch still happens at the next FDM consume boundary in Resolve(), where the baseline-current
+// and candidate-fresh re-checks live. It is an EXPLICIT request -- nothing here auto-activates Formation,
+// and the default mode stays LegacyOrManual until something calls this. Refuses unless PrimedCandidateReady.
+bool RequestFormationActivation(const UJSBSimMovementComponent *Component, EPrimeFailure &OutFailure);
+
+// Formation -> Legacy is an IMMEDIATE safety fallback, never a bumpless handoff. This drops the aircraft
+// back to LegacyOrManual with no blend: the very next consume resolves the legacy block, and any prime
+// state, ticket and candidate are discarded. Holding or blending a command from a producer we have just
+// decided to stop trusting would be exactly backwards.
+void RequestLegacyFallback(const UJSBSimMovementComponent *Component);
 
 // Why the LAST activation attempt was refused AT THE CONSUME BOUNDARY (not by ActivateFormationForTesting,
 // which only asks). The two refusals there are different failures and must never be confused: the baseline

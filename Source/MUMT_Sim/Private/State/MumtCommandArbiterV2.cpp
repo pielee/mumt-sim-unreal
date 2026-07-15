@@ -156,6 +156,13 @@ struct FPerAircraft
 	FFormationCandidate Candidate;
 	bool bHaveCandidate = false;
 
+	// PHASE C: the accepted candidate's full 29-field block, if it carried one. When present the arbiter
+	// applies all 29 fields in Formation mode (non-producer fields = baseline); when absent it overlays
+	// only the five controlled axes on the live legacy block, exactly as Phase B did.
+	bool bCandidateHasFullBlock = false;
+	FFlightControlCommands CandidateFullCommands;
+	TArray<FEngineCommand> CandidateFullEngineCommands;
+
 	// the decision taken in Resolve, consumed by OnResolved
 	uint64 LastResolveSeq = 0;
 	uint64 LastObservedSeq = 0;
@@ -320,6 +327,7 @@ void Resolve(const UJSBSimMovementComponent *Component, uint64 ConsumeSequence,
 			S.PrimeState = EPrimeState::IdleLegacy;
 			S.Ticket = FPrimeTicket{};
 			S.bHaveCandidate = false;
+			S.bCandidateHasFullBlock = false;
 			S.bAwaitingHandoffMeasure = false;
 			S.Mode = ECommandMode::LegacyOrManual;
 			S.Counters.Mode = S.Mode;
@@ -358,6 +366,7 @@ void Resolve(const UJSBSimMovementComponent *Component, uint64 ConsumeSequence,
 			S.PrimeState = EPrimeState::IdleLegacy;
 			S.Ticket = FPrimeTicket{};
 			S.bHaveCandidate = false;
+			S.bCandidateHasFullBlock = false;
 			S.Mode = ECommandMode::LegacyOrManual;
 			S.Counters.Mode = S.Mode;
 			S.LastSource = EResolutionSource::Legacy;
@@ -384,6 +393,7 @@ void Resolve(const UJSBSimMovementComponent *Component, uint64 ConsumeSequence,
 			S.PrimeState = EPrimeState::IdleLegacy;
 			S.Ticket = FPrimeTicket{};
 			S.bHaveCandidate = false;
+			S.bCandidateHasFullBlock = false;
 			S.Mode = ECommandMode::LegacyOrManual;
 			S.Counters.Mode = S.Mode;
 			S.LastSource = EResolutionSource::Legacy;
@@ -447,16 +457,36 @@ void Resolve(const UJSBSimMovementComponent *Component, uint64 ConsumeSequence,
 		return;
 	}
 
-	// 5. Accepted. ONLY the axes the Formation chain owns are overwritten; everything else -- trims,
-	//    flaps, brakes, gear, the Blueprints' fields -- keeps its legacy value. Formation does not get
-	//    to silently zero a field just because it has no opinion about it.
-	Resolved.Commands.Aileron = K.AileronNorm;
-	Resolved.Commands.Elevator = K.ElevatorNorm;
-	Resolved.Commands.Rudder = K.RudderNorm;
-	Resolved.Commands.SpeedBrake = K.SpeedBrakeNorm;
-	if (Resolved.EngineCommands.Num() > 0)
+	// 5. Accepted.
+	if (S.bCandidateHasFullBlock)
 	{
-		Resolved.EngineCommands[0].Throttle = K.ThrottleNorm;
+		// PHASE C: apply the producer's FULL 29-field block. The producer built it by copying the immutable
+		// prime baseline and overwriting only the fields it owns, so the non-producer fields already carry
+		// the baseline value. Applying the whole block makes every field continuous with what the aircraft
+		// was flying at the handoff -- not a mixture of producer axes and one-more-frame of legacy writers.
+		//
+		// The block is applied wholesale, but only to fields the FDM actually consumes: the engine array is
+		// clamped to what the aircraft has, so a candidate can never invent an engine.
+		Resolved.Commands = S.CandidateFullCommands;
+		const int32 N = FMath::Min(Resolved.EngineCommands.Num(), S.CandidateFullEngineCommands.Num());
+		for (int32 i = 0; i < N; ++i)
+		{
+			Resolved.EngineCommands[i] = S.CandidateFullEngineCommands[i];
+		}
+	}
+	else
+	{
+		// PHASE B path: overlay ONLY the axes the Formation chain owns; everything else -- trims, flaps,
+		// brakes, gear, the Blueprints' fields -- keeps its legacy value. Formation does not get to silently
+		// zero a field just because it has no opinion about it.
+		Resolved.Commands.Aileron = K.AileronNorm;
+		Resolved.Commands.Elevator = K.ElevatorNorm;
+		Resolved.Commands.Rudder = K.RudderNorm;
+		Resolved.Commands.SpeedBrake = K.SpeedBrakeNorm;
+		if (Resolved.EngineCommands.Num() > 0)
+		{
+			Resolved.EngineCommands[0].Throttle = K.ThrottleNorm;
+		}
 	}
 	S.LastSource = EResolutionSource::Formation;
 	S.LastFallback = EFallbackReason::None;
@@ -878,6 +908,7 @@ bool RequestPrime(const UJSBSimMovementComponent *Component, FPrimeTicket &OutTi
 	S.Ticket.bValid = true;
 
 	S.bHaveCandidate = false;               // any earlier candidate is dead the moment a prime is issued
+	S.bCandidateHasFullBlock = false;
 	S.PrimeState = EPrimeState::PrimePending;
 	// Mode deliberately UNCHANGED: priming is not activating.
 
@@ -938,16 +969,54 @@ bool SubmitPrimedCandidate(const UJSBSimMovementComponent *Component, const FPri
 		return Reject(EPrimeFailure::OutOfRangeCandidate);
 	}
 
+	// PHASE C: if the candidate carries a full 29-field block, it is held to the SAME finite/range bar the
+	// resolver observes on every consume -- a full block is handed wholesale to the FCS, so an un-checked
+	// field would reach the aircraft. It is validated here, before acceptance, and refused (not clamped)
+	// on any violation.
+	if (In.bHasFullBlock)
+	{
+		FJSBSimResolvedCommandBlock FullBlock;
+		FullBlock.Commands = In.FullCommands;
+		FullBlock.EngineCommands = In.FullEngineCommands;
+		if (!IsBlockFinite(FullBlock))    return Reject(EPrimeFailure::NonFiniteCandidate);
+		if (IsBlockOutOfRange(FullBlock)) return Reject(EPrimeFailure::OutOfRangeCandidate);
+	}
+
 	S.Candidate = K;
 	S.bHaveCandidate = true;
-	S.PrimeState = EPrimeState::PrimedCandidateReady;
+	// Set the full-block state on EVERY accept (including to false) so a newer 5-field candidate can never
+	// inherit a stale full block from a previous submission.
+	S.bCandidateHasFullBlock = In.bHasFullBlock;
+	if (In.bHasFullBlock)
+	{
+		S.CandidateFullCommands = In.FullCommands;
+		S.CandidateFullEngineCommands = In.FullEngineCommands;
+	}
+	else
+	{
+		S.CandidateFullCommands = FFlightControlCommands{};
+		S.CandidateFullEngineCommands.Reset();
+	}
+	// PHASE C: an aircraft ALREADY in ActiveFormation stays there when the producer submits its next
+	// candidate -- an ongoing update is not a fresh handoff and must not drop back to PrimedCandidateReady
+	// (which would make the state machine claim the handover had not happened yet). The Phase B first
+	// submit, from PrimePending, still advances to PrimedCandidateReady exactly as before.
+	if (S.PrimeState != EPrimeState::ActiveFormation)
+	{
+		S.PrimeState = EPrimeState::PrimedCandidateReady;
+	}
 	++GCounters.PrimedCandidateAcceptedCount;
-	LogEvent(FString::Printf(TEXT("[PRIME] CANDIDATE_ACCEPTED actor=%s generation=%llu baseline_seq=%llu"),
-		*S.ActorName, In.PrimeGeneration, In.BaselineConsumeSequence));
+	LogEvent(FString::Printf(TEXT("[PRIME] CANDIDATE_ACCEPTED actor=%s generation=%llu baseline_seq=%llu full_block=%d"),
+		*S.ActorName, In.PrimeGeneration, In.BaselineConsumeSequence, In.bHasFullBlock ? 1 : 0));
 	return true;
 }
 
-bool ActivateFormationForTesting(const UJSBSimMovementComponent *Component, EPrimeFailure &OutFailure)
+// Shared by the test door (ActivateFormationForTesting) and the production door
+// (RequestFormationActivation). Both only ASK: the mode is NOT changed here. The switch happens in
+// Resolve(), at the consume boundary, because only there can we still check whether the baseline is
+// current -- an intervening Legacy consume can only be seen from there. Flipping the mode here would hand
+// over to a candidate anchored to a command the aircraft has already stopped flying, and it would step.
+bool RequestActivationInternal(const UJSBSimMovementComponent *Component, EPrimeFailure &OutFailure)
 {
 	check(IsInGameThread());
 	OutFailure = EPrimeFailure::None;
@@ -970,17 +1039,49 @@ bool ActivateFormationForTesting(const UJSBSimMovementComponent *Component, EPri
 	// did not come from a prime, nothing anchors it to what the aircraft is currently flying.
 	if (S.PrimeState != EPrimeState::PrimedCandidateReady) return Reject(EPrimeFailure::NotPrimed);
 
-	// This only ASKS. The mode is NOT changed here.
-	//
-	// The switch happens in Resolve(), at the consume boundary, because only there can we still check
-	// whether the baseline is current -- and an intervening Legacy consume can only be seen from there.
-	// Flipping the mode here would hand over to a candidate anchored to a command the aircraft has
-	// already stopped flying, and the handoff would step.
 	S.PrimeState = EPrimeState::ActivationPending;
 	LogEvent(FString::Printf(
 		TEXT("[PRIME] ACTIVATION_REQUESTED actor=%s generation=%llu baseline_seq=%llu (switch happens at the next consume)"),
 		*S.ActorName, S.Ticket.Generation, S.Ticket.BaselineConsumeSequence));
 	return true;
+}
+
+bool ActivateFormationForTesting(const UJSBSimMovementComponent *Component, EPrimeFailure &OutFailure)
+{
+	return RequestActivationInternal(Component, OutFailure);
+}
+
+// PHASE C production door. Identical policy to the test door -- it only asks; the boundary re-checks and
+// switches. Kept as a separate, production-named verb so the handoff path is not spelled "...ForTesting".
+bool RequestFormationActivation(const UJSBSimMovementComponent *Component, EPrimeFailure &OutFailure)
+{
+	return RequestActivationInternal(Component, OutFailure);
+}
+
+// PHASE C production door: the immediate Formation -> Legacy safety fallback. No blend, no delay -- the
+// mode drops to LegacyOrManual now, so the very next consume resolves the legacy block, and all prime
+// state is discarded so nothing can silently resume Formation on a stale ticket.
+void RequestLegacyFallback(const UJSBSimMovementComponent *Component)
+{
+	check(IsInGameThread());
+	if (!Component) return;
+	FPerAircraft *S = GAircraft.Find(TWeakObjectPtr<const UJSBSimMovementComponent>(Component));
+	if (!S) return;
+
+	const bool bWasFormation = S->Mode == ECommandMode::FormationControlV2
+		|| S->PrimeState != EPrimeState::IdleLegacy;
+	S->Mode = ECommandMode::LegacyOrManual;
+	S->Counters.Mode = S->Mode;
+	S->PrimeState = EPrimeState::IdleLegacy;
+	S->Ticket = FPrimeTicket{};
+	S->bHaveCandidate = false;
+	S->bCandidateHasFullBlock = false;
+	S->bAwaitingHandoffMeasure = false;
+	if (bWasFormation)
+	{
+		++GCounters.ModeTransitionCount;
+		LogEvent(FString::Printf(TEXT("[PRIME] LEGACY_FALLBACK actor=%s (immediate, no blend)"), *S->ActorName));
+	}
 }
 
 EPrimeFailure GetLastBoundaryFailure(const UJSBSimMovementComponent *Component)
