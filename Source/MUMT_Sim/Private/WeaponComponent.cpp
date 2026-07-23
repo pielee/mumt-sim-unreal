@@ -11,12 +11,41 @@ UWeaponComponent::UWeaponComponent()
 void UWeaponComponent::SetGunFiring(bool bFiring)
 {
     const bool bNewState = bFiring && (bUnlimitedGunAmmo || GunAmmo > 0);
+    // [SGF] TEMP diagnostic — remove after debugging the joystick gun. Logs only on a real change,
+    // so a per-tick tug-of-war between two callers shows up as rapid alternating owner=... new=1/0.
+    if (bNewState != bGunFiring)
+    {
+        // bound=0 이면 BP 쪽 이벤트가 델리게이트에 안 묶인 것 — 방송해도 받을 사람이 없다.
+        UE_LOG(LogTemp, Warning, TEXT("[SGF] owner=%s req=%d -> new=%d (was %d) bound=%d"),
+            GetOwner() ? *GetOwner()->GetName() : TEXT("?"), bFiring ? 1 : 0, bNewState ? 1 : 0, bGunFiring ? 1 : 0,
+            OnGunFiringChanged.IsBound() ? 1 : 0);
+    }
     if (bNewState == bGunFiring)
     {
         return;
     }
     bGunFiring = bNewState;
     OnGunFiringChanged.Broadcast(bGunFiring);
+
+    // 델리게이트 바인딩이 등록되지 않는 BP 인스턴스 폴백: 소유자 BP에
+    // HandleGunFiringChanged(bool) 커스텀 이벤트가 있으면 이름으로 직접 호출한다.
+    // (ke 콘솔 명령과 동일한 ProcessEvent 경로 — 바인딩 상태와 무관하게 동작)
+    if (!OnGunFiringChanged.IsBound())
+    {
+        if (AActor* Owner = GetOwner())
+        {
+            static const FName HookName(TEXT("HandleGunFiringChanged"));
+            if (UFunction* Hook = Owner->FindFunction(HookName))
+            {
+                struct { bool bFiringParam; } Params{ bGunFiring };
+                Owner->ProcessEvent(Hook, &Params);
+            }
+            else
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[SGF] fallback hook missing on %s"), *Owner->GetName());
+            }
+        }
+    }
 }
 
 bool UWeaponComponent::FireMissile()
@@ -143,9 +172,9 @@ UHealthComponent* UWeaponComponent::FindNearestTargetInCone(float RangeM, float 
         {
             continue;
         }
-        if (TargetHealth->Team == MyHealth->Team)
+        if (!UHealthComponent::AreHostile(MyHealth->Team, TargetHealth->Team))
         {
-            continue;
+            continue;   // 아군 진영끼리(Manned·FriendlyUAV 상호 포함)는 표적에서 제외
         }
 
         const FVector ToTarget = Target->GetActorLocation() - MuzzleLoc;

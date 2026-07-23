@@ -22,6 +22,20 @@ void UHealthComponent::ApplyDamage(float Amount, AActor* DamageInstigator)
         return;
     }
 
+    // 아군 사격 면제: 가해자 팀을 알 수 있으면 적대 관계일 때만 대미지.
+    // 가해자 정보가 없는 대미지(환경 요인 등)는 그대로 적용.
+    if (DamageInstigator)
+    {
+        if (const UHealthComponent* InstigatorHealth =
+                DamageInstigator->FindComponentByClass<UHealthComponent>())
+        {
+            if (!AreHostile(Team, InstigatorHealth->Team))
+            {
+                return;
+            }
+        }
+    }
+
     CurrentHP = FMath::Max(0.f, CurrentHP - Amount);
 
     if (CurrentHP <= 0.f)

@@ -65,6 +65,10 @@ public:
     UFUNCTION(BlueprintPure, Category = "MUMT|Health")
     bool IsAlive() const { return LifeState == EAircraftLifeState::Alive; }
 
+    // 적대 관계 판정: 한쪽만 Enemy일 때만 서로 공격 가능.
+    // Manned와 FriendlyUAV는 같은 진영으로 묶인다 (아군 사격 면제).
+    static bool AreHostile(ETeam A, ETeam B) { return (A == ETeam::Enemy) != (B == ETeam::Enemy); }
+
     UPROPERTY(BlueprintAssignable, Category = "MUMT|Health")
     FOnStartFalling OnStartFalling;
 
