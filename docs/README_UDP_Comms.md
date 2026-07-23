@@ -1,5 +1,12 @@
 # UDP Communication Structure (external commands ↔ Unreal)
 
+> **⚠️ 2026-07-11 이후 부분 구식(스냅샷 문서)**: 포트 구성(5005/5006/5010)과 이름 라우팅은
+> 유효하나, `control_sender.py`는 **삭제됨**, 5010 setpoint는 **프로토콜 v2**(capture/maintain
+> tolerance, minimum_separation, maximum_closing_speed, sequence_id/timestamp/protocol_version
+> 추가; use_waypoint/target_x/y/z 삭제; NaN·낡은 seq 폐기), 5006 상태 배치에는 per-aircraft
+> `guidance` 오브젝트(오차·captured/maintained·separation_warning 등)가 추가됐다.
+> 최신 구조는 [README_Autopilot.md](README_Autopilot.md) 참조.
+>
 > Scope: the full UDP link that carries commands INTO Unreal and aircraft state OUT of Unreal —
 > every socket, port, direction, rate, and message format, on all four endpoints.
 > All facts confirmed from source: `UDPControlReceiver.cpp/.h`, `bridge_node.py`, `control_sender.py`,

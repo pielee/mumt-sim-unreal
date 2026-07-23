@@ -1,10 +1,12 @@
-// V1/V2: FFormationGuidance + FInnerLoopAutopilot 폐루프 검증 (JSBSim F-16 2기).
-// 리더도 동일 내루프로 조종(스크립트 명령), 팔로워는 유도→내루프 60Hz.
-// 게이트: 직선<10m / 3°/s<30m / 5°/s+상승<60m / 재정착<30m / |φ|≤65°.
+// V1/V2: 새 3계층 제어 스택 폐루프 검증 (JSBSim F-16 2기).
+//   FormationGuidance(슬롯·오차) → FixedWingGuidance(Reference) → F16CommandController(cmd-norm)
+// 리더는 direct 명령(StepDirect)으로 조종, 팔로워는 편대 체인 60Hz.
+// 게이트: 구 스택(InnerLoop+일체형 유도) 기준선과 동일 — 수치 재현이 회귀 조건.
 #include "FGFDMExec.h"
 #include "simgear/misc/sg_path.hxx"
-#include "InnerLoopAutopilot.h"
 #include "FormationGuidance.h"
+#include "FixedWingGuidance.h"
+#include "F16CommandController.h"
 
 #include <cstdio>
 #include <cmath>
@@ -18,7 +20,9 @@ static const double D2R = 3.14159265358979323846 / 180.0;
 struct Bird
 {
     JSBSim::FGFDMExec* fdm = nullptr;
-    FInnerLoopAutopilot inner;
+    FFixedWingGuidance   guide;   // Reference 생성 (course→roll, alt→pitch, speed)
+    FF16CommandController ctl;    // Reference → fcs/*-cmd-norm
+    FFlightReference     lastRef; // CSV 기록용
 
     bool init(const char* root, double n0, double e0, double altM, double hdg, double vMps)
     {
@@ -65,16 +69,30 @@ struct Bird
     double Psi()   { return get("attitude/psi-deg"); }
     double Pdps()  { return get("velocities/p-rad_sec") / D2R; }
     double Qdps()  { return get("velocities/q-rad_sec") / D2R; }
+    double Rdps()  { return get("velocities/r-rad_sec") / D2R; }
 
-    void drive(double hdgCmd, double altCmd, double spdCmd, double rff, double dt)
+    // Reference → cmd-norm → JSBSim FCS. 최종 명령 경로는 이 함수 하나뿐이다.
+    // 주의: 하네스의 Pdps/Qdps/Rdps는 body rate(deg/s) — UE 경로는 오일러 변화율을
+    // 전달하므로 방식 B(BodyRate 댐핑)에서만 두 환경의 감쇠가 미세하게 다르다.
+    FF16ControlCommand apply(const FFlightReference& ref, double dt)
     {
-        const FInnerLoopOutput o = inner.Step(hdgCmd, altCmd, spdCmd, rff,
-            Phi(), Theta(), Psi(), AltM(), Tas(), Climb(), Pdps(), Qdps(), 0.6, dt);
-        fdm->SetPropertyValue("fcs/aileron-cmd-norm",  o.Aileron);
-        fdm->SetPropertyValue("fcs/elevator-cmd-norm", o.Elevator);
-        fdm->SetPropertyValue("fcs/rudder-cmd-norm",   o.Rudder);
-        fdm->SetPropertyValue("fcs/throttle-cmd-norm", o.Throttle);
-        fdm->SetPropertyValue("fcs/speedbrake-cmd-norm", o.SpeedBrake);
+        lastRef = ref;
+        const FF16ControlCommand o = ctl.Step(
+            ref.RollRefDeg, ref.PitchRefDeg, ref.AirspeedRefMps, ref.ThrottleRefNorm,
+            Phi(), Theta(), Pdps(), Qdps(), Rdps(), Tas(), 0.6, dt);
+        fdm->SetPropertyValue("fcs/aileron-cmd-norm",    o.AileronCmdNorm);
+        fdm->SetPropertyValue("fcs/elevator-cmd-norm",   o.ElevatorCmdNorm);
+        fdm->SetPropertyValue("fcs/rudder-cmd-norm",     o.RudderCmdNorm);
+        fdm->SetPropertyValue("fcs/throttle-cmd-norm",   o.ThrottleCmdNorm);
+        fdm->SetPropertyValue("fcs/speedbrake-cmd-norm", o.SpeedbrakeCmdNorm);
+        return o;
+    }
+
+    // direct 명령 (리더 스크립트/단일기 시험용) — course 피드백용 ground velocity 전달 [§3]
+    FF16ControlCommand drive(double hdgCmd, double altCmd, double spdCmd, double rff, double dt)
+    {
+        FDirectCmd c; c.CourseDeg = hdgCmd; c.AltM = altCmd; c.SpeedMps = spdCmd; c.RollFfDeg = rff;
+        return apply(guide.StepDirect(c, Vn(), Ve(), Phi(), Theta(), Psi(), AltM(), Tas(), Climb(), dt), dt);
     }
 };
 
@@ -83,14 +101,24 @@ struct Window { const char* name; double t0, t1, gateM; double maxE = 0, sumE = 
 int main(int argc, char** argv)
 {
     const char* root = argv[1];
+    // A/B 감쇠 비교 [§5]: argv[2] = "A"(기본, PID D항) | "B"(레이트 댐핑, Kd=0)
+    const bool bModeB = (argc > 2 && argv[2][0] == 'B');
 
     // 리더: 원점, 동쪽 220 m/s. 팔로워: 슬롯(뒤80·우100 → N-100,E-80)에서 뒤 400m·측방 200m 벗어난 곳.
     Bird L, F;
     if (!L.init(root, 0, 0, 1000, 90, 220)) return 1;
     if (!F.init(root, -300, -480, 1000, 90, 220)) return 1;
+    if (bModeB)
+    {
+        L.ctl.DampingMode = EDampingMode::BodyRate;
+        F.ctl.DampingMode = EDampingMode::BodyRate;
+        printf("[댐핑 방식 B: PID Kd=0 + body-rate 감쇠]\n");
+    }
 
-    FFormationGuidance guid;                       // UE 기본 파라미터 그대로
-    F.inner.BankLimitDeg = 62.0;                   // UE Formation 모드와 동일 (65°+ 지속뱅크 = 모델 밖, PIE 실측)
+    FFormationGuidance form;                       // 슬롯·오차 계층 (UE 기본 파라미터 그대로)
+    form.CaptureTolM  = 30.0;                      // 캡처/유지 판정 확인용
+    form.MaintainTolM = 50.0;
+    F.guide.BankLimitDeg = 62.0;                   // UE Formation 모드와 동일 (65°+ 지속뱅크 = 모델 밖)
     const double FRONT = -80, RIGHT = 100, UP = 0;
 
     // 리더 스크립트 상태
@@ -102,18 +130,22 @@ int main(int argc, char** argv)
         {"A 직선(캡처후)  [45,55)",   45, 55, 12},
         {"B 3°/s@220    [70,95)",   70, 95, 30},
         {"T 감속+5°/s진입 [95,138)",  95, 138, 1e9},
-        {"C 4.2°/s+상승정착[138,150)",138, 150, 35},  // 뱅크캡62 안전 트레이드오프: 27m 정상(캡70때 12m). 슬롯거리 128m 대비 수용
+        {"C 4.2°/s+상승정착[138,150)",138, 150, 35},  // 뱅크캡62 안전 트레이드오프: 27m 정상(캡70때 12m)
         {"R 롤아웃+감속   [150,174)", 150, 174, 1e9},
         {"D 정상 직선    [174,185)", 174, 185, 15},
     };
     double maxDAltC = 0;                           // C 창 수직오차 게이트(<30m)
     double maxPhiF = 0, maxPhiT = -1;
     double maxECapture = 0;                        // [0,15) 초기 캡처 참고용
+    double tCaptured = -1;                         // bCaptured 최초 참 시각 (판정 로직 검증)
+    bool   maintainedAtD = false;                  // D 창에서 bMaintained 확인
     FILE* csv = fopen("formation_run.csv", "w");
-    fprintf(csv, "t,eSlot,eAlong,eCross,dAlt,phiF,phiL,vF,vL,omega\n");
+    fprintf(csv, "t,eSlot,eAlong,eCross,eVert,dAlt,phiF,phiL,vF,vL,omega,rollRef,pitchRef,vRef,ail,elv,thr,captured,maintained,sep,crsF,yawF,thrFF,thrCorr\n");
 
     const double DT = 1.0 / 120.0;
     const int STEPS = (int)(185.0 / DT);
+    FFormationTarget T;                            // 마지막 유도 출력 (계측용)
+    FF16ControlCommand lastCmd;
     for (int i = 0; i < STEPS; ++i)
     {
         const double t = i * DT;
@@ -130,11 +162,16 @@ int main(int argc, char** argv)
             const double rffL = std::atan2(rateL * D2R * L.Tas(), 9.80665) / D2R;
             L.drive(hdgL, altL, vL, rffL, 1.0 / 60.0);
 
-            const FGuidanceCmd c = guid.Step(
+            // 편대 체인: 슬롯·오차 → Reference → cmd-norm
+            T = form.Step(
                 L.N(), L.E(), L.AltM(), L.Vn(), L.Ve(), L.Climb(),
-                F.N(), F.E(), F.Vn(), F.Ve(),
-                FRONT, RIGHT, UP, 120, 335, 0, 1.0 / 60.0);
-            F.drive(c.HeadingDeg, c.AltM, c.SpeedMps, c.RollFfDeg, 1.0 / 60.0);
+                F.N(), F.E(), F.AltM(), F.Vn(), F.Ve(),
+                FRONT, RIGHT, UP, 1.0 / 60.0);
+            const FFlightReference ref = F.guide.StepFormation(
+                T, F.N(), F.E(), F.Vn(), F.Ve(),
+                F.Phi(), F.Theta(), F.Psi(), F.AltM(), F.Tas(), F.Climb(),
+                120, 335, 0, /*MaxClosingMps=*/0, 1.0 / 60.0);
+            lastCmd = F.apply(ref, 1.0 / 60.0);
         }
 
         L.fdm->Run();
@@ -155,16 +192,23 @@ int main(int argc, char** argv)
         if (t >= 140 && t < 150 && std::fabs(dAlt) > maxDAltC) maxDAltC = std::fabs(dAlt);  // 수직은 수평보다 ~2s 늦게 정착
         const double aphi = std::fabs(F.Phi());
         if (t > 5 && aphi > maxPhiF) { maxPhiF = aphi; maxPhiT = t; }
+        if (tCaptured < 0 && T.bCaptured) tCaptured = t;
+        if (t >= 174 && T.bMaintained) maintainedAtD = true;
 
         if (i % 12 == 0)
-            fprintf(csv, "%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f\n",
-                t, e, guid.LastEAlongM, guid.LastECrossM, dAlt,
-                F.Phi(), L.Phi(), F.Tas(), L.Tas(), guid.OmegaFilt / D2R);
+            fprintf(csv, "%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f,%.1f,%.1f,%.1f,%.3f,%.3f,%.3f,%d,%d,%.1f,%.1f,%.1f,%.3f,%.3f\n",
+                t, e, form.LastEAlongM, form.LastECrossM, T.EVertM, dAlt,
+                F.Phi(), L.Phi(), F.Tas(), L.Tas(), form.OmegaFilt / D2R,
+                F.lastRef.RollRefDeg, F.lastRef.PitchRefDeg, F.lastRef.AirspeedRefMps,
+                lastCmd.AileronCmdNorm, lastCmd.ElevatorCmdNorm, lastCmd.ThrottleCmdNorm,
+                T.bCaptured ? 1 : 0, T.bMaintained ? 1 : 0, T.SeparationM,
+                F.guide.LastCurrentCourseDeg, F.Psi(),
+                F.ctl.LastThrottleFF, F.ctl.LastThrottleCorr);
     }
     fclose(csv);
 
     int fail = 0;
-    printf("\n══ V1 편대 폐루프 결과 ══\n");
+    printf("\n══ V1 편대 폐루프 결과 (3계층 스택) ══\n");
     printf("  초기 캡처 최대 슬롯오차(참고): %.0f m\n", maxECapture);
     for (Window& w : win)
     {
@@ -181,6 +225,12 @@ int main(int argc, char** argv)
     printf("  |φ|max(팔로워, t>5s)      = %.1f° (t=%.0fs)  gate≤64°  %s\n",
            maxPhiF, maxPhiT, phiOk ? "PASS" : "★FAIL");
     if (!phiOk) ++fail;
+    const bool capOk = tCaptured > 0.0 && tCaptured < 60.0;
+    printf("  bCaptured 판정 시각        = %.1fs  gate<60s  %s\n", tCaptured, capOk ? "PASS" : "★FAIL");
+    if (!capOk) ++fail;
+    const bool mntOk = maintainedAtD;
+    printf("  D창 bMaintained            = %s  gate=true  %s\n", mntOk ? "true" : "false", mntOk ? "PASS" : "★FAIL");
+    if (!mntOk) ++fail;
     printf("%s (FAIL=%d)\n", fail ? "★★ 게이트 불통과" : "══ 전체 PASS ══", fail);
     return fail ? 1 : 0;
 }

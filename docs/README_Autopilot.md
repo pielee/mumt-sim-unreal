@@ -1,290 +1,119 @@
-# BVRGym Autopilot (the outer-loop / low-level flight controller)
+# UAV Flight Control — 3계층 스택 (FormationGuidance → FixedWingGuidance → F16CommandController)
 
-> Scope: the C++ autopilot that turns a navigation setpoint (heading / altitude / speed) into
-> control-surface and throttle commands (aileron / elevator / throttle) that the JSBSim flight model flies.
-> Confirmed from source: `BVRGymAutopilot.h` / `BVRGymAutopilot.cpp` and its call site in
-> `UDPControlReceiver.cpp` (`ApplyAutopilotToPawn`).
+> Scope: 무인기(F16_UAV*)를 조종하는 C++ 제어 스택. BT의 고수준 명령(모드·슬롯·한계값)을
+> JSBSim FCS 명령(fcs/*-cmd-norm)으로 변환한다.
+> 2026-07-11 전면 교체: 구 BVRGym `FAircraftAutopilot` → GetStick(`Controller_CY`) →
+> `InnerLoopAutopilot`+일체형 `FFormationGuidance` 계보를 제거하고 아래 3계층으로 재편.
+> 검증: `Tools/build_verify_formation.sh`(JSBSim 스탠드얼론 폐루프) + `Tools/run_formation_test.sh`
+> (헤드리스 인엔진 회귀) — 구 스택 기준선 수치를 그대로 재현(전 게이트 PASS).
 >
-> - Date: 2026-06-28 (git `25c5459`; the hard-turn hysteresis re-arm clamp in `BVRGymAutopilot.cpp` is an
->   uncommitted working-tree change)
-> - Related: [README_UDP_Comms.md](README_UDP_Comms.md) (setpoint input), [README_F16_Actor.md](README_F16_Actor.md), [README_JSBSim.md](README_JSBSim.md)
+> Related: [README_UDP_Comms.md](README_UDP_Comms.md), [README_JSBSim_IO.md](README_JSBSim_IO.md),
+> [README_Joystick_Manned.md](README_Joystick_Manned.md)
 
 ---
 
-## 0. TL;DR & where it lives
-
-- **What it is:** a small, self-contained C++ PID autopilot **ported from the Python BVRGym project**
-  (`autopilot.py`, `control.py`, `navigation.py`, `f16_config.py`). It is the controller that actually "flies the
-  stick": given a target heading/altitude/speed, it outputs normalized aileron/elevator commands plus a throttle
-  command from its speed-hold (autothrottle) loop.
-- **Source files (this is the location):**
-  - **`Source/MUMT_Sim/Public/BVRGymAutopilot.h`** — declarations (`FPID`, `FAutopilotNavParams`, `FAutopilotOutput`, `FAircraftAutopilot`)
-  - **`Source/MUMT_Sim/Private/BVRGymAutopilot.cpp`** — the control-law implementation
-  - Part of the **`MUMT_Sim` runtime module** (game C++, not a plugin).
-- **Runtime location:** it is **not** a standalone Actor or Component. It exists only as **member objects**
-  inside **`AUDPControlReceiver`** (the level Actor that listens on UDP). So at runtime the autopilot lives
-  *inside the UDP receiver actor*, sitting between the JSON setpoint input (port 5010) and each aircraft's
-  `UJSBSimMovementComponent`. There is **one `FAircraftAutopilot` instance per UAV**, held in
-  `TMap<FString, FAircraftAutopilot> Autopilots` keyed by aircraft name (`FindOrAdd` on first setpoint), so
-  every UAV keeps its **own** PID / hysteresis state and they never interfere.
+## 0. 전체 데이터 흐름
 
 ```
-  UDP 5010 setpoint ─► AUDPControlReceiver { TMap<name,FUavSetpoint>       Setpoints,  ─► UJSBSimMovementComponent.Commands
-   {aircraft_name,...}                       TMap<name,FAircraftAutopilot> Autopilots }    (per matched pawn)
-                          (60 Hz AutopilotTick — loops over every setpoint, drives each named pawn)
+교수님 BT XML (py_bt_ros)
+  ↓ bt_nodes.py Custom Node (SetLeader / SetFormationSlot / EnableFormationFollow / Check*)
+ROS /aircraft/setpoint (custom_msgs/AircraftSetpoint — 고수준 명령: 모드·슬롯·톨러런스·한계)
+  ↓ mumt_ros_bridge bridge_node.py (JSON 직렬화 + seq/timestamp 자동 스탬프 + NaN 검증)
+UDP 5010 → AUDPControlReceiver::ReceiveSetpointData (NaN/낡은 seq 폐기, 이름 라우팅)
+  ↓ 60 Hz AutopilotTick → ApplyAutopilotToPawn (모드 분기)
+[1] FFormationGuidance   (FormationGuidance.h)   — 리더 직독 → 슬롯 위치/속도/가속도,
+  ↓ FFormationTarget       along/cross/vertical/상대속도 오차, 캡처·유지 판정, 안전거리
+[2] FFixedWingGuidance   (FixedWingGuidance.h)   — 벡터필드 횡 + REJOIN, 고도→FPA/pitch,
+  ↓ FFlightReference       속도법칙(+폐속도·안전거리 제한), course→roll(슬루·뱅크 제한)
+[3] FF16CommandController (F16CommandController.h) — roll/pitch/airspeed reference → PID →
+  ↓ FF16ControlCommand     aileron/elevator/rudder/throttle/speedbrake cmd-norm
+UJSBSimMovementComponent Commands/EngineCommands  (Commands.Aileron = AileronCmdNorm, ...)
+  ↓ CopyToJSBSim: FCS->SetDaCmd/SetDeCmd/SetDrCmd(-)/SetThrottleCmd/SetDsbCmd
+f16.xml <flight_control> FCS (조종면 위치·레이트 루프·G/AOA 리미터·요-SAS는 여기)
+  ↓
+JSBSim FDM (120 Hz) → AircraftState → Unreal Actor 갱신 + UDP 5006 상태 배치
+  └─ 상태 피드백: 5006 배치의 per-aircraft "guidance" 오브젝트(e_along/e_cross/e_vert/
+     captured/maintained/separation/rejoin/refs) → BT CheckFormationCaptured/Maintained
 ```
 
----
+- 무인기의 **JSBSim 명령 기록 지점은 `ApplyAutopilotToPawn` 한 곳**뿐이다 (유인기 조이스틱은
+  별도 경로 `ApplyControlCommandToPawn` — 5005 raw command, 보존).
+- Direct 모드(heading/alt/speed 그대로)와 Attack 모드(FPursuitGuidance → StepDirect)도
+  같은 [2]→[3] 체인을 지난다 — 구 시나리오 완전 호환.
+- 세 헤더 모두 의존성 없음(std 수학만): JSBSim 스탠드얼론 하네스(`Tools/verify_formation.cpp`)에서
+  UE 없이 단독 폐루프 검증 가능.
 
-## 1. Where it sits in the control stack (answering "low-level controller location")
+## 1. 계층별 입·출력
 
-There are **three** control layers. The BVRGym autopilot is the **middle** one:
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ LAYER 1 — Mission / high-level   "what to do"                                   │
-│   Heading / Altitude / Throttle SETPOINT                                        │
-│   source today: UDP 5010 binary packet (from ROS bridge or a script),          │
-│                 or the debug UPROPERTYs. (Target diagram: the BT / Mission      │
-│                 Autonomy would produce this.)                                   │
-└───────────────────────────────┬────────────────────────────────────────────────┘
-                                 ▼ ActiveHeadingDeg / ActiveAltitudeM / ActiveThrottle
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ LAYER 2 — BVRGym Autopilot  ◄── THIS DOCUMENT  (outer-loop, "fly the stick")    │
-│   FAircraftAutopilot::GetControlInput(diffHeading, diffAlt, phi, theta,          │
-│                                       curSpeed, tgtSpeed)                        │
-│     → {AileronCmd, ElevatorCmd, 0, ThrottleCmd}   (normalized; throttle 0..1)    │
-└───────────────────────────────┬────────────────────────────────────────────────┘
-                                 ▼ JSBSim->Commands.Aileron/Elevator + EngineCommands[0].Throttle
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ LAYER 3 — JSBSim FCS (inner loop, inside the plugin)   "move the surfaces"      │
-│   FGFCS channels: actuators / gains / filters → actual surface deflections,     │
-│   then aero forces. (See README_JSBSim.md)                                      │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
-So:
-- **Relative to the mission/BT layer**, this IS the low-level controller — it's the thing that converts a navigation
-  goal into raw stick commands.
-- **Relative to JSBSim's FCS**, it is an *outer loop* — it commands normalized aileron/elevator, and JSBSim's internal
-  FCS is the truly innermost surface controller.
-
-In the target architecture this autopilot is effectively the **"Action-level Autonomy"** block — already implemented,
-but embedded in UE C++ rather than provided as an open-source ROS action layer.
-
----
-
-## 2. Types (structure)
-
-| Type | Kind | Purpose |
+| 계층 | 입력 | 출력 |
 |---|---|---|
-| `FPID` | `USTRUCT(BlueprintType)` | One PID channel: `Kp,Ki,Kd,IntegMin,IntegMax` + runtime `Derivator/Integrator`. `Update()`/`Reset()`/`SetGains()` |
-| `FAutopilotNavParams` | `USTRUCT(BlueprintType)` | Navigation/mode thresholds & limits (act-spaces, RollMax, TanRef, dive/climb limits, …) |
-| `FAutopilotOutput` | plain struct | `{Aileron, Elevator, Rudder, Throttle}` (Rudder always 0; Throttle `<0` = speed-hold off) |
-| `FAircraftAutopilot` | plain C++ class (`MUMT_SIM_API`) | Holds the 4 PIDs (Roll/RollSec/Pitch/Throttle) + NavParams; `GetControlInput()` is the entry point |
+| [1] FFormationGuidance | 리더 위치/속도(참벡터)/상승률, 자기 위치/속도/고도, 슬롯 오프셋(front/right/up), dt | FFormationTarget: 슬롯 pos/vel(ω×r)/acc(ω×(ω×r)), track·ω, e_along/e_cross/e_vert, 상대속도 오차, 폐속도, 3D 슬롯거리, 리더 3D 거리, captured/maintained/sep_breach |
+| [2] FFixedWingGuidance | FFormationTarget(또는 FDirectCmd), 자기 상태(φ/θ/ψ/alt/TAS/climb/pos/vel), min/max 속도, min 고도, max 폐속도, dt | FFlightReference: course/roll(+ff)/alt/FPA/pitch/airspeed reference (+throttle ff 자리) |
+| [3] FF16CommandController | FFlightReference의 roll/pitch/airspeed ref + φ/θ/p/q/r/TAS, 개루프 스로틀 폴백, dt | FF16ControlCommand: aileron/elevator/rudder/throttle/speedbrake **cmd-norm** |
 
-Because `FPID`/`FAutopilotNavParams` are `BlueprintType` USTRUCTs, the gains are exposed as `UPROPERTY` configs on
-`AUDPControlReceiver` and can be **edited live in the Details panel (PIE)** without recompiling.
+제한값 적용 위치([2]): 뱅크 ±60°(편대/추격은 62°), roll ref 슬루 40°/s, θ +25/−20°,
+상승 80·강하 60 m/s, 속도 [min,max], REJOIN 폐속도 테이퍼(거리/8s), maximum_closing_speed,
+minimum_separation 침범 시 부족량 비례 감속(2 m/s per m).
 
----
+## 2. 제어 법칙 계보 (검증 이력 보존 — 수치 변경 금지)
 
-## 3. The control law in detail
+전부 JSBSim F-16 폐루프(V1 하네스)와 PIE로 검증된 값을 구 스택에서 그대로 이관:
+- 횡: 벡터필드 χc = χ_slot + 70°·(2/π)·atan(0.004·(e_cross + 2.5·ė_cross)), REJOIN(>800m 진입/<400m 복귀)
+- 종 속도: V = |v_slot| + clamp(0.25·e_along + 0.80·ė_along, ±150)
+- roll_ff = atan(ωV/g)·1.2(요-SAS 보정)·cross게이팅(바닥 0.25), ±54°
+- ω 추정: track 미분 + LPF τ=0.25s + 데드밴드 0.3°/s, 리더 <50m/s는 홀드
+- 수직: slot_alt + 리더상승률×8s 선행보상; course→roll Kp=2.5
+- [3] PID: Roll(0.04,0,Kd 0.012) / Pitch(0.06,0.008,Kd 0.03)+뱅크보상 / Speed PI(0.08,0.020)
+- 러더: 0 (bank-to-turn + f16.xml 요-SAS 내장 — 외부 중복 댐핑 금지)
 
-### 3.1 `FPID::Update` — the PID convention (BVRGym style)
-```cpp
-float FPID::Update(float CurrentValue) {
-    const float Error = 0.f - CurrentValue;                 // SetPoint is ALWAYS 0
-    const float P     = Kp * Error;
-    const float D     = Kd * (Error - Derivator);  Derivator = Error;   // derivative of error (per-tick, no dt)
-    Integrator        = Clamp(Integrator + Error, IntegMin, IntegMax);  // anti-windup clamp
-    const float I     = Ki * Integrator;
-    return P + I + D;
-}
-```
-Notes that matter:
-- **Setpoint is hardwired to 0**; the caller passes the *error signal* as `CurrentValue` (e.g. `RollRef - Phi`). The
-  controller regulates that error to zero.
-- **No `dt`** — gains are tuned per **60 Hz tick** (the rate the autopilot runs). Changing the tick rate changes the
-  effective tuning.
-- **`Ki = 0` for Roll/RollSec/Pitch** → those channels are effectively **PD controllers** with an anti-windup clamp
-  kept ready. The new **`ThrottlePID` uses `Ki = 0.004`** (it is a real PI — its integrator carries the trim throttle).
+### 2026-07-11 견고성 수정 (게인 불변 — 구조·안전 수정만)
 
-**`FPID::SetGains(Cfg)`** copies only the gains (`Kp,Ki,Kd,IntegMin,IntegMax`), **resets `Derivator`, and deliberately
-*preserves* `Integrator`**. `ApplyAutopilotToPawn` calls it on all four PIDs every tick to pick up live Details-panel
-edits. This fixes a real bug: the old code copied the whole `FPID` struct each tick, which **zeroed the integrator
-every frame** — so the autothrottle could never build its steady-state trim and was stuck P-only (throttle pinned
-≈0.46, unable to hold speed). Roll/Pitch are `Ki=0` so resetting their integrators is harmless.
+- **Course/Yaw 분리**: course 피드백은 이제 ground course(atan2(Ve,Vn)) 기준.
+  yaw(기수 방위)는 지상속도 < 30 m/s(설정 `CourseMinGroundSpeedMps`)일 때 폴백으로만 사용.
+  목표−현재 모두 ground course — "Target Course − Yaw" 구조 제거.
+- **p/q/r의 실제 의미**: 플러그인 `AircraftState.EulerRates` = JSBSim
+  `FGAuxiliary::GetEulerRates` = **오일러각 변화율(φ̇,θ̇,ψ̇), rad/s** — body rate p,q,r가
+  아니며, 수신부가 deg/s로 변환해 전달한다. (수정 전에는 rad/s를 deg/s로 오독 →
+  레이트 항이 사실상 0이었으나 전 게이트 PASS — D항이 지배 감쇠였음.)
+- **감쇠 방식 분리(§5)**: `EDampingMode::DerivOnMeas`(A, 기본 — PID D항) vs
+  `BodyRate`(B — Kd=0 + 명시적 레이트 항). 동시 활성화 금지. A/B 하네스 비교(전 게이트
+  PASS 동일, 오버슛 A 8.3°/B 6.3°, 포화 0%): 기본 = **A** — UE 경로가 body rate를
+  제공하지 않고, UE 인엔진 실검증 이력과 동일 동작이므로.
+- **Throttle = Trim FF + PI 보정**: `ThrottleTrimNorm`(기본 0.26 — V1 실측: 220 m/s
+  0.289 / 150 m/s 0.225) + Speed PI 보정(±`MaxThrottleCorr` 1.0, 실효 [0,1] 경계로
+  anti-windup 정합). `FFlightReference.ThrottleRefNorm >= 0`이면 그 값이 FF (TECS류 확장
+  자리). 오차 0에서 스로틀 ≈ 트림 — 구 구조의 "속도 떨어진 뒤 적분기로 회복" 제거.
+- **dt/NaN 유효성(§2)**: 세 계층 모두 dt∉유효범위 또는 비유한 입력 시 상태 미갱신;
+  Guidance는 마지막 정상 target/reference를, 컨트롤러는 마지막 정상 명령을 유지한다.
+  컨트롤러는 `InvalidInputTimeoutS`(1s) 지속 시 Failsafe(중립 조종면+트림
+  스로틀 — 상위 수신부의 소실 홀드가 1차 정책, 이것은 최후 단계). 유도 계층은 dt를
+  NominalDtS(1/60)로 위생 처리.
+- **Speedbrake 설정화**: `SpeedbrakeStartOverspeedMps`(5)–`Full`(20) 선형 —
+  기존 코드 동작 유지(주석의 "8 m/s"가 오기였음), 역전 설정은 계단형으로 안전 강등.
+- **최소 안전거리 = '감속 보조'(Minimum-Separation Speed-Reduction Assist)**:
+  airspeed reference만 낮추는 보조 기능 — **완전한 충돌 회피가 아니다** (측면·정면 회피
+  Roll/Path 법칙 없음 → 별도 Collision Avoidance 모듈 필요). 속도가 하한인데 접근이
+  지속되면 `separation_warning`(5006 guidance 오브젝트)으로 BT에 경고.
+- **상태 초기화(§9)**: 모드 전환 시 Controller.Reset()+Guidance.Reset()(roll_ref 슬루가
+  현재 φ에서 범프리스 재시작, 스로틀은 트림에서 시작), 리더 변경 시 Formation.Reset().
+  같은 모드·리더 유지 중에는 리셋하지 않음.
+- 단위 테스트: `Tools/build_verify_units.sh` (JSBSim/UE 불필요, g++ 단독).
 
-### 3.2 `GetControlInput` — two-mode outer loop + speed-hold
-Inputs: `DiffHeadDeg` (signed heading error, [-180,180]), `DiffAltM` (target − current altitude, m), `CurrentPhiDeg`
-(roll), `CurrentThetaDeg` (pitch), `CurrentSpeedMps`, `TargetSpeedMps` (last two default 0). Returns
-`{Aileron, Elevator, 0, Throttle}`. The **lateral/vertical** law picks a mode from the heading/altitude error
-magnitudes; the **speed-hold** (§3.5) then runs unconditionally and fills in `Throttle`.
+## 3. 프로토콜 (AircraftSetpoint v2)
 
-**Hard-turn mode** — `|DiffHead| ≥ HeadActSpace` AND `|DiffAlt| ≤ AltActSpace`:
-- Commit to a max-bank turn toward the target heading:
-  `BankRef = sign(DiffHead) · RollMax (80°)` → `SetRollPID(BankRef)`.
-- Hold altitude during the turn: `SetPitchPID(atan2(DiffAlt, TanRef))`.
-- Hysteresis: widen `AltActSpace→max (2000)`, then **re-arm the stay-in-turn threshold to
-  `HeadActSpace = min(HeadActSpaceMin, HeadActSpaceMax)`**. The stay-in threshold must be **≤** the enter
-  threshold (`HeadActSpaceMax`); the `min(…)` clamp guarantees that even if a level's `NavParams` override sets
-  `HeadActSpaceMin > Max` (which would invert the hysteresis, flicker hard-turn off every tick, and leave the
-  aircraft never turning — the "UAV won't turn at corners" bug on the RL_2 map). **This clamp is currently an
-  uncommitted working-tree change.**
+신규 필드: `capture_tolerance_m`(기본 30) / `maintain_tolerance_m`(기본 50) /
+`minimum_separation_m`(0=off) / `maximum_closing_speed_mps`(0=off) /
+`sequence_id`(bridge 자동 증가, UE는 낡은 seq 폐기) / `timestamp` / `protocol_version`(=2).
+삭제: `use_waypoint`, `target_x/y/z` (GetStick 유물).
+UE 수신 검증: NaN/Inf 필드 → 패킷 폐기, 빈 aircraft_name → 무시, seq 역행 → 폐기.
 
-**Precision mode** — otherwise (wings level, control altitude with pitch):
-- `ThetaRef = clamp(atan2(DiffAlt, TanRef), DiveThetaMax −45°, ClimbThetaMax +45°)`, `SetRollPID(0)` (level wings),
-  `SetPitchPID(ThetaRef)`.
-- Three sub-states adjust `ThetaActSpace` for chatter-free behavior: **PREC-CLIMB** (`|DiffAlt|>1500`),
-  **PREC-SETTLE** (`|DiffAlt|<1500` and `|Theta|>ThetaActSpace`), **PREC-LEVEL** (else).
-- Hysteresis: widen `HeadActSpace→max (35)`.
+## 4. 삭제된 구형 제어기 (2026-07-11)
 
-The `*ActSpace` members (`AltActSpace`, `HeadActSpace`, `ThetaActSpace`) are **stateful hysteresis thresholds**
-(min↔max) so the autopilot doesn't oscillate between hard-turn and precision modes.
-
-### 3.3 Roll / pitch helpers
-```cpp
-SetRollPID(RollRef, bUseSecondary=false, Phi):
-    Diff = RollCircleClip(clamp(RollRef,±180) − Phi)        // shortest angular error
-    AileronCmd = clamp(−RollPID.Update(Diff), −1, 1)        // outer minus cancels the PID's internal sign
-
-SetPitchPID(ThetaRef, Theta):
-    ElevatorCmd = clamp(PitchPID.Update(clamp(ThetaRef,±90) − Theta), −1, 1)
-```
-- `bUseSecondary` would select `RollSecPID`, but it is **always called with `false`** → `RollSecPID` is currently
-  **unused** (dead, but tunable).
-
-### 3.4 `SetThrottlePID` — autothrottle / speed-hold (NEW)
-```cpp
-SetThrottlePID(CurrentSpeedMps, TargetSpeedMps):
-    if (TargetSpeedMps <= 0)  { ThrottleCmd = -1; return; }      // speed-hold OFF → caller uses open-loop throttle
-    ThrottleCmd = clamp(ThrottlePID.Update(CurrentSpeedMps − TargetSpeedMps), 0, 1)
-```
-- Runs **every tick, in both hard-turn and precision mode** (it is energy management, not a mode) — it is the last
-  thing `GetControlInput` does before returning.
-- **Sign trick:** `FPID::Update` computes `error = 0 − CurrentValue`, so passing `(V − Vtarget)` yields
-  `error = (Vtarget − V)`. Slower than target → positive error → throttle **up**; faster → throttle **down**.
-- `ThrottlePID = {0.02, 0.004, 0, 0, 250}` is a **PI** (no D). The integrator (clamped `[0, 250]`) supplies the
-  steady-state trim: `Ki · IntegMax = 0.004 · 250 = 1.0`, i.e. it can drive throttle across the full `[0,1]` range.
-  This is why `SetGains` must preserve the integrator (§3.1).
-- **Disabled path:** `TargetSpeedMps ≤ 0` → `Throttle = −1`, signalling the caller to fall back to the open-loop
-  `Setpoint.Throttle` (backward compatible with setpoints that don't request a speed).
-
-### 3.5 Angle utilities
-- `DeltaHeading(target, current)` = `((target−current+180) mod 360) − 180` → shortest signed heading error, [-180,180].
-  Called by `UDPControlReceiver` to build `DiffHead`.
-- `RollCircleClip(D)` wraps a roll difference into (−180, 180].
-
----
-
-## 4. Default gains (from `f16_config.py`)
-
-Set both in the `FAircraftAutopilot` constructor and (authoritatively at runtime) by `AUDPControlReceiver`'s configs:
-
-| Channel / param | Kp | Ki | Kd | Integ min/max |
-|---|---|---|---|---|
-| `RollPID` | 0.01 | 0 | 0.9 | −0.2 / 0.2 |
-| `RollSecPID` (unused) | 0.2 | 0 | 0.2 | −1.0 / 1.0 |
-| `PitchPID` | 0.3 | 0 | 1.0 | −1.0 / 1.0 |
-| `ThrottlePID` (autothrottle, NEW) | 0.02 | 0.004 | 0 | 0 / 250 |
-
-| NavParam | Value | Used? |
-|---|---|---|
-| `AltActSpaceMin / Max` | 1000 / 2000 m | ✅ |
-| `HeadActSpaceMin / Max` | 10 / 35° | ✅ |
-| `ThetaActSpaceMin / Max` | 10 / 30° | ✅ |
-| `RollMax` | 80° | ✅ (hard-turn bank) |
-| `TanRef` | 2000 | ✅ (altitude→pitch slope) |
-| `DiveThetaMax / ClimbThetaMax` | −45 / +45° | ✅ (pitch clamp) |
-| `BankGain` | 0.8 | ❌ **declared but never referenced** in the control law |
-
----
-
-## 5. How it is wired into `AUDPControlReceiver`
-
-```
-AUDPControlReceiver  (level Actor, owns: TMap<FString,FUavSetpoint>       Setpoints
-                                          TMap<FString,FAircraftAutopilot> Autopilots)
-│
-├─ BeginPlay():  start a 60 Hz timer → AutopilotTick.  (Autopilots are created lazily, per UAV.)
-│
-├─ ReceiveSetpointData()  (each Tick, drains UDP 5010 JSON):
-│      parses {aircraft_name, heading_deg, altitude_m, throttle_norm, target_speed_mps, launch_missile}
-│      → Setpoints.FindOrAdd(aircraft_name).
-│
-└─ AutopilotTick()  (60 Hz):
-       if bUseDebugSetpoint → inject a setpoint for CachedTargetPawn from DebugTarget* UPROPERTYs;
-       if (Setpoints.Num() == 0) return;
-       for each (name → setpoint):
-         resolve the pawn (exact name match, else unique substring; ambiguous → warn & skip);
-         └─ ApplyAutopilotToPawn(Pawn, name, setpoint):
-              FAircraftAutopilot& AP = Autopilots.FindOrAdd(name);  // this UAV's own PID/hysteresis state
-              AP.RollPID/RollSecPID/PitchPID/ThrottlePID.SetGains(...Config);   // gains only, keep integrators
-              AP.NavParams = NavParams;
-              S = JSBSim->AircraftState;
-              AltM     = Pawn->GetActorLocation().Z / 100;            // UE world-Z (cm→m), NOT JSBSim ASL
-              SpeedMps = S.TotalVelocityKts * 0.514444;
-              DiffHead = DeltaHeading(setpoint.HeadingDeg, S.Yaw);    // compass error
-              DiffAlt  = setpoint.AltitudeM − AltM;
-              Out = AP.GetControlInput(DiffHead, DiffAlt, S.Roll, S.Pitch, SpeedMps, setpoint.TargetSpeedMps);
-              ThrottleOut = (Out.Throttle >= 0) ? Out.Throttle : setpoint.Throttle;   // autothrottle else open-loop
-              JSBSim->Commands.{Aileron,Elevator,Rudder} = Out.*;    // Rudder 0
-              JSBSim->EngineCommands[0].Throttle = ThrottleOut;
-              AutopilotAileron/Elevator = Out.*;                     // cached for HUD/Blueprint read
-```
-
-Key wiring facts:
-- **One autopilot per UAV** — `Autopilots` is a `TMap` keyed by aircraft name; each named pawn gets its own
-  PID/hysteresis/integrator state, so multiple UAVs never share controller state. (See [README_UDP_Comms.md]
-  for the name-based addressing.)
-- **Frames the autopilot sees:** *heading* is **compass** (`DiffHead` from `DeltaHeading`, fed a compass setpoint that
-  the BT builds upstream as `atan2(Δx, −Δy)`); *altitude* uses **UE world `Location.Z/100`**, **not** JSBSim ASL —
-  the same `z` value `BuildPawnState` publishes and the BT computes setpoints against. (Using JSBSim ASL here made the
-  controller sit at `setpoint + origin-altitude offset`, so the BT never saw the target reached.)
-- **Throttle:** when speed-hold is active (`Out.Throttle ≥ 0`) the **autothrottle output** is used; otherwise the
-  **open-loop `Setpoint.Throttle`** is forwarded (backward compatible with speed-less setpoints).
-- **State feedback** (Phi/Theta/Psi/speed) is read from the target pawn's JSBSim `AircraftState`.
-- **Output is written directly** into `JSBSim->Commands` / `EngineCommands[0]` — it bypasses the pawn's `UDP_*`
-  Blueprint variables (unlike the JSON 5005 path). The JSBSim plugin then pushes them into the FDM on its own tick.
-- Runs at **60 Hz** (its own timer), independent of both the render frame rate and JSBSim's substep.
-
----
-
-## 6. Notes / gaps / caveats
-
-- **Roll/Pitch are PD only** — `Ki=0` on those channels; the integral path exists but is inert. **`ThrottlePID` is a
-  real PI** (`Ki=0.004`) — its integrator carries the trim throttle, so `SetGains` preserves it (§3.1).
-- **No `dt` term** — tuning is implicitly tied to the 60 Hz tick.
-- **`RollSecPID` unused** (`bUseSecondary` is never true) and **`BankGain` unused** — both are tunable but dead.
-- **Rudder always 0** — no yaw/coordination control; turns are bank-only.
-- **Autothrottle is opt-in** — speed-hold only engages when the setpoint carries `target_speed_mps > 0`; otherwise the
-  open-loop `throttle_norm` is forwarded. The BT requests speed via the `AircraftSetpoint.target_speed_mps` field
-  (see [README_ROS_Bridge.md](README_ROS_Bridge.md)).
-- **Hysteresis re-arm clamp is uncommitted** — `HeadActSpace = min(HeadActSpaceMin, HeadActSpaceMax)` in the hard-turn
-  branch lives only in the working tree (not yet committed); without it a `Min>Max` NavParams override (RL_2) inverts
-  the turn hysteresis and the UAV won't turn.
-- **Multi-UAV** — `AutopilotTick` loops over every setpoint and drives each named pawn with its own autopilot. Running
-  the JSON 5005 manual path and the 5010 autopilot path on the *same* pawn would still make them fight.
-
----
-
-## 7. Relationship to the target architecture
-
-This autopilot is the concrete **Action-level Autonomy** the target diagram wants — but it lives in UE C++ and is fed
-by raw UDP, not by a ROS action interface. With the autothrottle in place it now accepts a full
-`(heading, altitude, speed)` setpoint, which the BT supplies via `AircraftSetpoint`. The remaining integration step
-(P1 in [ARCHITECTURE.md](ARCHITECTURE.md)) is to expose it as a `MoveTo(heading, altitude, speed)`-style ROS action that
-a BT leaf maps onto, with a single source of truth so two autopilots never fight.
-
----
-
-## 8. Key file paths
-
-| Item | Path |
+| 파일 | 정체 |
 |---|---|
-| Autopilot declarations | `Source/MUMT_Sim/Public/BVRGymAutopilot.h` |
-| Autopilot implementation | `Source/MUMT_Sim/Private/BVRGymAutopilot.cpp` |
-| Only owner / driver | `Source/MUMT_Sim/Private/UDPControlReceiver.cpp` (`TMap Autopilots`, `AutopilotTick`, `ApplyAutopilotToPawn`) |
-| Gain configs (UPROPERTY) | `Source/MUMT_Sim/Public/UDPControlReceiver.h` (`RollPIDConfig`, `RollSecPIDConfig`, `PitchPIDConfig`, `ThrottlePIDConfig`, `NavParams`) |
-| Flight model it commands | `Plugins/JSBSimFlightDynamicsModel/.../JSBSimMovementComponent.{h,cpp}` |
-| Upstream origin | Python BVRGym: `autopilot.py`, `control.py`, `navigation.py`, `f16_config.py` |
+| `BVRGymAutopilot.h/.cpp` | BVRGym 캐스케이드 PID(FAircraftAutopilot→FPID 잔존) — 전 계보 제거 |
+| `Controller_CY.h/.cpp` | Geometry StickController(GetStick 조준 제어기) — 휴면 상태였음 |
+| `Public/BT_Geometry/` | Controller_CY 전용 수학 라이브러리 (원본은 ~/dev/Geometry에 보존) |
+| `InnerLoopAutopilot.h` | 07-09 내루프 — 법칙은 [2]/[3]으로 분할 이관 |
+| `Scripts/control_sender.py` | 레거시 Python 무인기 제어 루프 (5005 raw) |
+| `Config/JSBSim/control.json` | GetStick 시대 정적 명령 기본값 (참조 0) |

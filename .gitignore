@@ -22,3 +22,9 @@ ros2/*/log/
 ros2/*/__pycache__/
 ros2/*/*/__pycache__/
 ros2/*/*.egg-info/
+
+# OMC session state (operational, never committed)
+.omc/
+
+# generated verification run logs
+formation_run.csv

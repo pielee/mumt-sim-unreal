@@ -1,6 +1,5 @@
 #include "UDPControlReceiver.h"
 
-#include "BVRGymAutopilot.h"
 #include "Common/UdpSocketBuilder.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
@@ -17,24 +16,44 @@
 #include "TimerManager.h"
 #include "UObject/UnrealType.h"
 #include "WeaponComponent.h"
-#include "InnerLoopAutopilot.h"   // PID 내루프 (GetStick 조준 제어기 대체)
-#include "FormationGuidance.h"    // 인엔진 60Hz 유도 (편대 슬롯 / 추격) — Phase 4
+// 3계층 무인기 제어 스택 — 최종 JSBSim 명령을 쓰는 무인기 제어기는 이 체인 하나뿐이다.
+#include "FormationGuidance.h"     // [1] 편대 슬롯·오차 (리더 직독 60Hz)
+#include "FixedWingGuidance.h"     // [2] 비행 Reference (벡터필드 횡 / 고도·속도 종) + 추격
+#include "F16CommandController.h"  // [3] Reference → fcs/*-cmd-norm
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #include "HAL/PlatformMisc.h"
 
-// Per-UAV control state. The inner-loop PIDs hold integrator/derivative state
-// that must persist per aircraft across the 60 Hz ticks, so one instance per name.
+// Per-UAV control state — 3계층 스택 인스턴스. PID 적분기·필터·슬루 상태가 기체별로
+// 60Hz 틱을 넘어 유지돼야 하므로 이름당 1개.
 struct FUavControl
 {
-    FInnerLoopAutopilot Inner;      // PID 내루프: heading/alt/speed/roll_ff → 조종면+스로틀
-    FFormationGuidance  Formation;  // 편대 유도 (리더 ω 필터 상태 보유)
-    FPursuitGuidance    Pursuit;    // 추격 유도 (무상태)
-    FGuidanceCmd        LastGuidCmd;          // 리더/표적 일시 소실 시 홀드용
-    double              LastGuidTime = -1.0;  // World seconds (마지막 유효 유도 계산 시각)
-    bool                bHasGuidCmd  = false;
+    FFormationGuidance    Formation;   // [1] 슬롯·오차 (리더 ω 필터·캡처 판정 상태 보유)
+    FFixedWingGuidance    Guidance;    // [2] Reference (REJOIN·roll_ref 슬루 상태 보유)
+    FF16CommandController Controller;  // [3] cmd-norm (PID 적분기 보유)
+    FPursuitGuidance      Pursuit;     // 추격 유도 (무상태 — StepDirect로 유입)
+    FDirectCmd            LastGuidCmd;           // 리더/표적 일시 소실 시 홀드용
+    double                LastGuidTime = -1.0;   // World seconds (마지막 유효 유도 계산 시각)
+    bool                  bHasGuidCmd  = false;
+    // 모드/리더 변경 감지 [§9] — 변경 '시점에만' 리셋 (같은 모드·리더 유지 중 매 틱 리셋 금지)
+    EGuidanceMode         LastMode = EGuidanceMode::Direct;
+    FString               LastLeaderName;
+    bool                  bHasLastMode = false;
+};
+
+// 마지막 유도 계산 결과 — 5006 상태 배치의 "guidance" 오브젝트로 BT에 피드백된다.
+// (BT의 CheckFormationCaptured/CheckFormationMaintained가 소비 — BT는 오차를 재계산하지 않는다.)
+struct FUavGuidanceStatus
+{
+    EGuidanceMode Mode = EGuidanceMode::Direct;
+    double EAlongM = 0.0, ECrossM = 0.0, EVertM = 0.0;
+    double ClosingMps = 0.0, SeparationM = 0.0, SlotDistM = 0.0;
+    bool   bCaptured = false, bMaintained = false, bRejoin = false, bSepBreach = false;
+    bool   bSepWarning = false;   // 감속 보조가 하한에 걸렸는데 거리 계속 감소 [§7]
+    uint32 SeqId = 0;
+    double RollRefDeg = 0.0, PitchRefDeg = 0.0, AirspeedRefMps = 0.0;
 };
 
 // ─── 인엔진 편대 시험 ────────────────────────────────────────────────────────
@@ -376,24 +395,34 @@ void AUDPControlReceiver::ReceiveSetpointData()
 
             bool bReset = false;
             if (O->TryGetBoolField(TEXT("reset"), bReset) && bReset)
+            {
                 UavControls.Remove(Name);   // next tick rebuilds a fresh controller
+                LastSetpointSeq.Remove(Name);
+            }
+
+            // ── 수치 검증: NaN/Inf가 하나라도 있으면 패킷 전체 폐기 ──
+            bool bFinite = true;
+            auto GetNum = [&O, &bFinite](const TCHAR* Field, double& Out) -> bool
+            {
+                double V = 0.0;
+                if (!O->TryGetNumberField(Field, V)) return false;
+                if (!FMath::IsFinite(V)) { bFinite = false; return false; }
+                Out = V;
+                return true;
+            };
 
             FUavSetpoint SP;
             double V;
-            if (O->TryGetNumberField(TEXT("heading_deg"),     V)) SP.HeadingDeg     = (float)V;
-            if (O->TryGetNumberField(TEXT("altitude_m"),      V)) SP.AltitudeM      = (float)V;
-            if (O->TryGetNumberField(TEXT("roll_ff_deg"),     V)) SP.RollFfDeg      = (float)V;
-            if (O->TryGetNumberField(TEXT("throttle_norm"),   V)) SP.Throttle       = FMath::Clamp((float)V, 0.f, 1.f);
-            if (O->TryGetNumberField(TEXT("target_speed_mps"),V)) SP.TargetSpeedMps = (float)V;
+            if (GetNum(TEXT("heading_deg"),     V)) SP.HeadingDeg     = (float)V;
+            if (GetNum(TEXT("altitude_m"),      V)) SP.AltitudeM      = (float)V;
+            if (GetNum(TEXT("roll_ff_deg"),     V)) SP.RollFfDeg      = (float)V;
+            if (GetNum(TEXT("throttle_norm"),   V)) SP.Throttle       = FMath::Clamp((float)V, 0.f, 1.f);
+            if (GetNum(TEXT("target_speed_mps"),V)) SP.TargetSpeedMps = (float)V;
             O->TryGetBoolField(TEXT("launch_missile"), SP.LaunchMissile);
             O->TryGetBoolField(TEXT("gun_firing"), SP.bGunFiring);
-            if (O->TryGetNumberField(TEXT("missile_fire_id"), V)) SP.MissileFireId = (int64)V;
-            O->TryGetBoolField(TEXT("use_waypoint"), SP.bUseWaypoint);
-            if (O->TryGetNumberField(TEXT("target_x"), V)) SP.TargetX = (float)V;
-            if (O->TryGetNumberField(TEXT("target_y"), V)) SP.TargetY = (float)V;
-            if (O->TryGetNumberField(TEXT("target_z"), V)) SP.TargetZ = (float)V;
+            if (GetNum(TEXT("missile_fire_id"), V)) SP.MissileFireId = (int64)V;
 
-            // ── 유도 모드 (Phase 4). 미지정/""/direct → Direct (구 발신자 호환) ──
+            // ── 유도 모드. 미지정/""/direct → Direct (구 발신자 호환) ──
             FString ModeStr;
             if (O->TryGetStringField(TEXT("guidance_mode"), ModeStr))
             {
@@ -404,12 +433,36 @@ void AUDPControlReceiver::ReceiveSetpointData()
             }
             O->TryGetStringField(TEXT("leader_name"), SP.LeaderName);
             O->TryGetStringField(TEXT("target_name"), SP.TargetName);
-            if (O->TryGetNumberField(TEXT("slot_front_m"),  V)) SP.SlotFrontM = (float)V;
-            if (O->TryGetNumberField(TEXT("slot_right_m"),  V)) SP.SlotRightM = (float)V;
-            if (O->TryGetNumberField(TEXT("slot_up_m"),     V)) SP.SlotUpM    = (float)V;
-            if (O->TryGetNumberField(TEXT("min_speed_mps"), V) && V > 0.0) SP.MinSpeedMps = (float)V;
-            if (O->TryGetNumberField(TEXT("max_speed_mps"), V) && V > 0.0) SP.MaxSpeedMps = (float)V;
-            if (O->TryGetNumberField(TEXT("min_alt_m"),     V)) SP.MinAltM = (float)V;
+            if (GetNum(TEXT("slot_front_m"),  V)) SP.SlotFrontM = (float)V;
+            if (GetNum(TEXT("slot_right_m"),  V)) SP.SlotRightM = (float)V;
+            if (GetNum(TEXT("slot_up_m"),     V)) SP.SlotUpM    = (float)V;
+            if (GetNum(TEXT("min_speed_mps"), V) && V > 0.0) SP.MinSpeedMps = (float)V;
+            if (GetNum(TEXT("max_speed_mps"), V) && V > 0.0) SP.MaxSpeedMps = (float)V;
+            if (GetNum(TEXT("min_alt_m"),     V)) SP.MinAltM = (float)V;
+
+            // ── 편대 판정·안전 한계 (프로토콜 v2 — 0/미지정이면 UE 기본값) ──
+            if (GetNum(TEXT("capture_tolerance_m"),        V) && V > 0.0) SP.CaptureTolM    = (float)V;
+            if (GetNum(TEXT("maintain_tolerance_m"),       V) && V > 0.0) SP.MaintainTolM   = (float)V;
+            if (GetNum(TEXT("minimum_separation_m"),       V) && V > 0.0) SP.MinSeparationM = (float)V;
+            if (GetNum(TEXT("maximum_closing_speed_mps"),  V) && V > 0.0) SP.MaxClosingMps  = (float)V;
+            if (GetNum(TEXT("sequence_id"),      V)) SP.SequenceId      = (uint32)FMath::Max(0.0, V);
+            if (GetNum(TEXT("timestamp"),        V)) SP.TimestampS      = V;
+            if (GetNum(TEXT("protocol_version"), V)) SP.ProtocolVersion = (uint8)FMath::Clamp(V, 0.0, 255.0);
+
+            if (!bFinite)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[AP] '%s' setpoint에 NaN/Inf — 패킷 폐기"), *Name);
+                return;
+            }
+
+            // ── 낡은 sequence_id 폐기 (seq=0은 구 발신자 — 검사 생략) ──
+            if (SP.SequenceId > 0)
+            {
+                const uint32* Last = LastSetpointSeq.Find(Name);
+                if (Last && SP.SequenceId <= *Last)
+                    return;   // out-of-order/중복 UDP — 최신 명령 유지
+                LastSetpointSeq.Add(Name, SP.SequenceId);
+            }
 
             Setpoints.Add(Name, SP);   // latest-wins per aircraft
         };
@@ -434,19 +487,16 @@ void AUDPControlReceiver::ReceiveSetpointData()
 
 void AUDPControlReceiver::AutopilotTick()
 {
-    // Debug: fly the cached target toward a point ahead of its nose (PIE tuning
-    // without ROS) — drives the same waypoint/stick path as a real setpoint.
+    // Debug: direct 모드 setpoint 주입 (ROS 없이 PIE에서 reference 추종 튜닝).
+    // 현재 헤딩 유지 + DebugUpM 상승 + DebugTargetSpeedMps 유지.
     if (bUseDebugSetpoint && IsValid(CachedTargetPawn))
     {
-        FUavSetpoint& SP  = Setpoints.FindOrAdd(PawnIdName(CachedTargetPawn));
-        const FVector Loc = CachedTargetPawn->GetActorLocation();
-        const FVector Fwd = CachedTargetPawn->GetActorForwardVector();
-        const FVector VP  = Loc + Fwd * (DebugForwardM * 100.f) + FVector(0.f, 0.f, DebugUpM * 100.f);
-        SP.bUseWaypoint   = true;
-        SP.TargetX        = (float)VP.X;
-        SP.TargetY        = (float)VP.Y;
-        SP.TargetZ        = (float)VP.Z;
+        FUavSetpoint& SP = Setpoints.FindOrAdd(PawnIdName(CachedTargetPawn));
+        if (UJSBSimMovementComponent* DbgJSB = FindJSBSimMovementComponent(CachedTargetPawn))
+            SP.HeadingDeg = (float)DbgJSB->AircraftState.LocalEulerAngles.Yaw;
+        SP.AltitudeM      = (float)(CachedTargetPawn->GetActorLocation().Z / 100.0) + DebugUpM;
         SP.TargetSpeedMps = DebugTargetSpeedMps;
+        SP.Mode           = EGuidanceMode::Direct;
     }
 
     UWorld* World = GetWorld();
@@ -710,50 +760,85 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
         if (!Health->IsAlive())
         {
             UavControls.Remove(Key);
+            GuidanceStatusByPawn.Remove(PawnIdName(Pawn));
             return;
         }
     }
 
-    // Per-UAV stick controller + autothrottle, created on first use — their internal
-    // filter/integrator state must persist across ticks (see FUavControl).
+    // Per-UAV 3계층 제어 스택, created on first use — 내부 필터/적분기/슬루 상태가
+    // 틱을 넘어 유지돼야 한다 (see FUavControl).
     TSharedPtr<FUavControl>& Ctl = UavControls.FindOrAdd(Key);
     if (!Ctl.IsValid()) Ctl = MakeShared<FUavControl>();
 
     const FAircraftState& S = JSBSim->AircraftState;
 
-    // 현재 상태: JSBSim aero 오일러(LocalEulerAngles, deg, ψ 0=북), UE-Z 고도.
+    // 현재 상태: JSBSim aero 오일러(LocalEulerAngles, deg, ψ 0=북=기수방위 yaw), UE-Z 고도.
     const double PhiDeg   = S.LocalEulerAngles.Roll;
     const double ThetaDeg = S.LocalEulerAngles.Pitch;
-    const double PsiDeg   = S.LocalEulerAngles.Yaw;
+    const double PsiDeg   = S.LocalEulerAngles.Yaw;        // yaw — course 피드백은 FWG가
+                                                           // ground velocity로 계산 [§3]
     const float  AltM     = (float)(Pawn->GetActorLocation().Z / 100.0);
     const float  SpeedMps = (float)(S.TotalVelocityKts * KnotToMetersPerSecond);
     const double ClimbMps = S.AltitudeRateFtps * 0.3048;   // +위
-    // 플러그인 규약(JSBSimMovementComponent.cpp:784): EulerRates = (X=φ̇, Y=θ̇, Z=ψ̇).
-    // 종전 Z(=요레이트)를 롤 댐핑에 쓰던 버그 수정 — PIE 세션 로그로 발견(2026-07-09).
-    const double PDps     = S.EulerRates.X;                 // 롤 레이트 φ̇ (deg/s)
-    const double QDps     = S.EulerRates.Y;                 // 피치 레이트 θ̇ (deg/s)
+    // EulerRates 출처 [§1-6,7]: 플러그인 784행 = JSBSim FGAuxiliary::GetEulerRates(ePhi/eTht/ePsi)
+    // → '오일러각 변화율(φ̇,θ̇,ψ̇)'이며 body angular rate p,q,r가 아니다. 단위는 rad/s
+    // (LocalEulerAngles만 RadiansToDegrees 변환됨) → 여기서 deg/s로 변환한다.
+    // ※ 수정 전에는 rad/s를 deg/s로 오독 → 레이트 항이 사실상 0이었으나 전 게이트 PASS —
+    //   감쇠는 PID D항이 지배(§5 방식 A 기본 선택 근거). 종전 Z(요레이트)→X 축 버그는 2026-07-09 수정.
+    const double PhiDotDps   = MumtCtl::RadToDeg(S.EulerRates.X);   // φ̇ (deg/s)
+    const double ThetaDotDps = MumtCtl::RadToDeg(S.EulerRates.Y);   // θ̇ (deg/s)
+    const double PsiDotDps   = MumtCtl::RadToDeg(S.EulerRates.Z);   // ψ̇ (deg/s)
+    // 자기 ground velocity (NED m/s): course 피드백[§3]과 편대 유도가 공용 — 참벡터.
+    const double OwnVn = S.VelocityNEDfps.X * 0.3048;
+    const double OwnVe = S.VelocityNEDfps.Y * 0.3048;
+    constexpr double kDt  = 1.0 / 60.0;   // BeginPlay SetTimer(1/60) 고정 주기 [§1-5]
 
-    // ── 유도 명령 결정 (Phase 4) ─────────────────────────────────────────────
-    // Direct: setpoint의 heading/alt/speed/roll_ff 그대로 (기존 경로, 완전 호환).
-    // Formation/Attack: 리더/표적 pawn을 같은 월드에서 직독(지연 0)해 60Hz로 계산.
-    double HeadingCmd = Setpoint.HeadingDeg;
-    double AltCmd     = Setpoint.AltitudeM;
-    double SpeedCmd   = Setpoint.TargetSpeedMps;
-    double RollFf     = Setpoint.RollFfDeg;
+    // ── [1]+[2] 유도: 모드별로 FFlightReference 생성 ─────────────────────────
+    // Direct: setpoint의 heading/alt/speed/roll_ff → StepDirect (기존 경로, 완전 호환).
+    // Formation: 리더 직독 → FormationGuidance(슬롯·오차) → StepFormation.
+    // Attack: 표적 직독 → FPursuitGuidance → StepDirect.
+    FFlightReference Refs;
+    bool bHaveRefs = false;
+    FUavGuidanceStatus Status;
+    Status.Mode  = Setpoint.Mode;
+    Status.SeqId = Setpoint.SequenceId;
+
+    // ── 모드/리더 변경 시 상태 초기화 [§9] — 변경 시점에만, 매 틱 아님 ──
+    // 모드 변경: 컨트롤러 PID(트림 FF에서 범프리스 재시작) + FWG(roll_ref 슬루가 현재 φ에서
+    // 재시작, REJOIN 해제). 리더 변경: 편대 추정기(ω 필터·캡처 래치)까지 리셋.
+    if (Ctl->bHasLastMode && Ctl->LastMode != Setpoint.Mode)
+    {
+        Ctl->Controller.Reset();
+        Ctl->Guidance.Reset();
+        if (Setpoint.Mode == EGuidanceMode::Formation)
+            Ctl->Formation.Reset();
+        UE_LOG(LogTemp, Log, TEXT("[AP] %s 모드 전환 %d→%d — 제어 상태 리셋"),
+            *Key, (int32)Ctl->LastMode, (int32)Setpoint.Mode);
+    }
+    else if (Setpoint.Mode == EGuidanceMode::Formation &&
+             !Ctl->LastLeaderName.IsEmpty() && Ctl->LastLeaderName != Setpoint.LeaderName)
+    {
+        Ctl->Formation.Reset();
+        Ctl->Guidance.bRejoin = false;
+        UE_LOG(LogTemp, Log, TEXT("[AP] %s 리더 변경 '%s'→'%s' — 편대 추정기 리셋"),
+            *Key, *Ctl->LastLeaderName, *Setpoint.LeaderName);
+    }
+    Ctl->LastMode = Setpoint.Mode;
+    Ctl->bHasLastMode = true;
+    if (Setpoint.Mode == EGuidanceMode::Formation)
+        Ctl->LastLeaderName = Setpoint.LeaderName;
 
     if (Setpoint.Mode != EGuidanceMode::Direct)
     {
         // 편대/추격은 리더보다 선회 여유가 있어야 컷인 가능(요-SAS 페널티 +9°) — 단
         // 65°+ 지속 뱅크는 bank-to-turn 모델 밖(피치 push와 결합 시 요 역행·발산,
         // PIE 2026-07-09 실측: 72° 고착 → km 발산 반복) → 캡 62°.
-        Ctl->Inner.BankLimitDeg = 62.0;
+        Ctl->Guidance.BankLimitDeg = 62.0;
 
-        // 자기 상태 (NED m / m/s): north=-Y/100, east=X/100. 속도는 참벡터(ft/s→m/s).
+        // 자기 위치 (NED m): north=-Y/100, east=X/100. (속도 OwnVn/OwnVe는 위에서 공용 계산)
         const FVector OwnLoc = Pawn->GetActorLocation();
         const double OwnN  = -OwnLoc.Y * 0.01;
         const double OwnE  =  OwnLoc.X * 0.01;
-        const double OwnVn = S.VelocityNEDfps.X * 0.3048;
-        const double OwnVe = S.VelocityNEDfps.Y * 0.3048;
 
         const FString& RefName = (Setpoint.Mode == EGuidanceMode::Formation)
             ? Setpoint.LeaderName : Setpoint.TargetName;
@@ -778,9 +863,12 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
             const double RefVe    = R.VelocityNEDfps.Y * 0.3048;
             const double RefClimb = R.VelocityNEDfps.Z * 0.3048;  // 플러그인이 -vDown 저장 → +위
 
-            // 1초 이상 유도가 끊겼다 재개되면 ω 미분 상태가 낡음 → 리셋(범프리스)
+            // 1초 이상 유도가 끊겼다 재개되면 ω 미분·REJOIN 상태가 낡음 → 리셋(범프리스)
             if (Setpoint.Mode == EGuidanceMode::Formation && Now - Ctl->LastGuidTime > 1.0)
+            {
                 Ctl->Formation.Reset();
+                Ctl->Guidance.bRejoin = false;
+            }
 
             // 리더 미비행(지상활주/정지) 가드: 슬롯이 지상에 있고 track이 무의미 →
             // 슬롯 추종 대신 안전 홀드(현재 헤딩·고도 유지, 순항 220). PIE 2026-07-09:
@@ -788,81 +876,145 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
             const double RefGs = std::sqrt(RefVn * RefVn + RefVe * RefVe);
             if (Setpoint.Mode == EGuidanceMode::Formation && RefGs < 50.0)
             {
-                FGuidanceCmd Hold;
-                Hold.HeadingDeg = PsiDeg;
-                Hold.AltM       = std::max((double)AltM, (double)Setpoint.MinAltM + 150.0);
-                Hold.SpeedMps   = 220.0;
-                Hold.RollFfDeg  = 0.0;
+                FDirectCmd Hold;
+                Hold.CourseDeg = PsiDeg;
+                Hold.AltM      = std::max((double)AltM, (double)Setpoint.MinAltM + 150.0);
+                Hold.SpeedMps  = 220.0;
+                Hold.RollFfDeg = 0.0;
                 Ctl->Formation.Reset();
+                Ctl->Guidance.bRejoin = false;
                 Ctl->LastGuidCmd = Hold; Ctl->LastGuidTime = Now; Ctl->bHasGuidCmd = true;
-                HeadingCmd = Hold.HeadingDeg; AltCmd = Hold.AltM;
-                SpeedCmd   = Hold.SpeedMps;   RollFf = Hold.RollFfDeg;
+                Refs = Ctl->Guidance.StepDirect(Hold, OwnVn, OwnVe, PhiDeg, ThetaDeg, PsiDeg,
+                                                (double)AltM, (double)SpeedMps, ClimbMps, kDt);
+                bHaveRefs = true;
             }
-            else
+            else if (Setpoint.Mode == EGuidanceMode::Formation)
             {
-            FGuidanceCmd Cmd;
-            if (Setpoint.Mode == EGuidanceMode::Formation)
-            {
-                Cmd = Ctl->Formation.Step(
+                // 판정·안전 파라미터 (setpoint 0 = 기본값 유지)
+                if (Setpoint.CaptureTolM    > 0.f) Ctl->Formation.CaptureTolM    = Setpoint.CaptureTolM;
+                if (Setpoint.MaintainTolM   > 0.f) Ctl->Formation.MaintainTolM   = Setpoint.MaintainTolM;
+                Ctl->Formation.MinSeparationM = Setpoint.MinSeparationM;
+
+                // [1] 슬롯·오차
+                const FFormationTarget T = Ctl->Formation.Step(
                     RefN, RefE, RefAlt, RefVn, RefVe, RefClimb,
-                    OwnN, OwnE, OwnVn, OwnVe,
-                    Setpoint.SlotFrontM, Setpoint.SlotRightM, Setpoint.SlotUpM,
+                    OwnN, OwnE, (double)AltM, OwnVn, OwnVe,
+                    Setpoint.SlotFrontM, Setpoint.SlotRightM, Setpoint.SlotUpM, kDt);
+
+                // [2] 비행 Reference
+                Refs = Ctl->Guidance.StepFormation(
+                    T, OwnN, OwnE, OwnVn, OwnVe,
+                    PhiDeg, ThetaDeg, PsiDeg, (double)AltM, (double)SpeedMps, ClimbMps,
                     Setpoint.MinSpeedMps, Setpoint.MaxSpeedMps, Setpoint.MinAltM,
-                    /*dt=*/1.0 / 60.0);
+                    Setpoint.MaxClosingMps, kDt);
+                bHaveRefs = true;
+
+                // 소실 홀드용 direct 등가 명령 + BT 피드백 상태
+                FDirectCmd Hold;
+                Hold.CourseDeg = Refs.CourseRefDeg; Hold.AltM = Refs.AltRefM;
+                Hold.SpeedMps  = Refs.AirspeedRefMps; Hold.RollFfDeg = 0.0;
+                Ctl->LastGuidCmd = Hold; Ctl->LastGuidTime = Now; Ctl->bHasGuidCmd = true;
+
+                Status.EAlongM = T.EAlongM;   Status.ECrossM = T.ECrossM; Status.EVertM = T.EVertM;
+                Status.ClosingMps = T.ClosingSpeedMps; Status.SeparationM = T.SeparationM;
+                Status.SlotDistM = T.SlotDist3M;
+                Status.bCaptured = T.bCaptured; Status.bMaintained = T.bMaintained;
+                Status.bRejoin = Ctl->Guidance.bRejoin; Status.bSepBreach = T.bSeparationBreach;
+                Status.bSepWarning = Ctl->Guidance.bSepWarning;
+                // 감속 보조 발동/한계 경고 로그 [§7-2,3] (1Hz 스로틀)
+                if (Ctl->Guidance.bSepWarning)
+                {
+                    static double LastSepWarnLog = -10.0;
+                    if (Now - LastSepWarnLog > 1.0)
+                    {
+                        LastSepWarnLog = Now;
+                        UE_LOG(LogTemp, Warning,
+                            TEXT("[Guid] %s ★분리 경고: 속도 하한인데 접근 지속 (sep=%.0fm rate=%.1fm/s) — 감속 보조 한계"),
+                            *Key, T.SeparationM, T.SeparationRateMps);
+                    }
+                }
             }
             else // Attack
             {
-                Cmd = Ctl->Pursuit.Step(
+                const FDirectCmd Cmd = Ctl->Pursuit.Step(
                     RefN, RefE, RefAlt, RefVn, RefVe,
                     OwnN, OwnE,
                     Setpoint.MinSpeedMps, Setpoint.MaxSpeedMps, Setpoint.MinAltM);
+                Ctl->LastGuidCmd  = Cmd;
+                Ctl->LastGuidTime = Now;
+                Ctl->bHasGuidCmd  = true;
+                Refs = Ctl->Guidance.StepDirect(Cmd, OwnVn, OwnVe, PhiDeg, ThetaDeg, PsiDeg,
+                                                (double)AltM, (double)SpeedMps, ClimbMps, kDt);
+                bHaveRefs = true;
             }
-            Ctl->LastGuidCmd  = Cmd;
-            Ctl->LastGuidTime = Now;
-            Ctl->bHasGuidCmd  = true;
-            HeadingCmd = Cmd.HeadingDeg; AltCmd = Cmd.AltM;
-            SpeedCmd   = Cmd.SpeedMps;   RollFf = Cmd.RollFfDeg;
-            }   // 리더 비행 중 (RefGs >= 50)
         }
         else if (Ctl->bHasGuidCmd && Now - Ctl->LastGuidTime < 5.0)
         {
             // 리더/표적 일시 소실 → 마지막 유도 명령 홀드
-            HeadingCmd = Ctl->LastGuidCmd.HeadingDeg; AltCmd = Ctl->LastGuidCmd.AltM;
-            SpeedCmd   = Ctl->LastGuidCmd.SpeedMps;   RollFf = Ctl->LastGuidCmd.RollFfDeg;
+            Refs = Ctl->Guidance.StepDirect(Ctl->LastGuidCmd, OwnVn, OwnVe, PhiDeg, ThetaDeg, PsiDeg,
+                                            (double)AltM, (double)SpeedMps, ClimbMps, kDt);
+            bHaveRefs = true;
         }
         else
         {
             // 5초 초과 소실 → 현재 헤딩·고도 수평 유지 (순항 200)
-            HeadingCmd = PsiDeg;
-            AltCmd     = (double)AltM;
-            SpeedCmd   = 200.0;
-            RollFf     = 0.0;
+            FDirectCmd Hold;
+            Hold.CourseDeg = PsiDeg;
+            Hold.AltM      = (double)AltM;
+            Hold.SpeedMps  = 200.0;
+            Hold.RollFfDeg = 0.0;
+            Refs = Ctl->Guidance.StepDirect(Hold, OwnVn, OwnVe, PhiDeg, ThetaDeg, PsiDeg,
+                                            (double)AltM, (double)SpeedMps, ClimbMps, kDt);
+            bHaveRefs = true;
         }
     }
 
+    if (!bHaveRefs)
+    {
+        // Direct: setpoint 그대로 → Reference (기존 시나리오 완전 호환 경로)
+        FDirectCmd Cmd;
+        Cmd.CourseDeg = Setpoint.HeadingDeg;
+        Cmd.AltM      = Setpoint.AltitudeM;
+        Cmd.SpeedMps  = Setpoint.TargetSpeedMps;
+        Cmd.RollFfDeg = Setpoint.RollFfDeg;
+        Refs = Ctl->Guidance.StepDirect(Cmd, OwnVn, OwnVe, PhiDeg, ThetaDeg, PsiDeg,
+                                        (double)AltM, (double)SpeedMps, ClimbMps, kDt);
+    }
+
+    // ── [3] F16 Command Controller: Reference → fcs/*-cmd-norm ──────────────
     // 조종면 부호 미세조정(PIE 튜닝) 반영.
-    Ctl->Inner.AilSign = StickAileronScale;
-    Ctl->Inner.ElvSign = StickElevatorScale;
+    Ctl->Controller.AilSign = StickAileronScale;
+    Ctl->Controller.ElvSign = StickElevatorScale;
 
-    // PID 내루프: (heading, altitude, speed, roll_ff) → 조종면 + 스로틀.
-    const FInnerLoopOutput O = Ctl->Inner.Step(
-        HeadingCmd, AltCmd, SpeedCmd, RollFf,
-        PhiDeg, ThetaDeg, PsiDeg, (double)AltM, (double)SpeedMps, ClimbMps, PDps, QDps,
-        (double)Setpoint.Throttle, /*dt=*/1.0 / 60.0);
+    const FF16ControlCommand O = Ctl->Controller.Step(
+        Refs.RollRefDeg, Refs.PitchRefDeg, Refs.AirspeedRefMps, Refs.ThrottleRefNorm,
+        PhiDeg, ThetaDeg, PhiDotDps, ThetaDotDps, PsiDotDps,
+        (double)SpeedMps, (double)Setpoint.Throttle, kDt);
 
-    const float Ail = O.Aileron, Elv = O.Elevator, Rud = O.Rudder, ThrottleOut = O.Throttle;
+    // 최종 JSBSim 명령 기록 — 무인기 제어 경로에서 이 지점 하나뿐이다.
+    const float Ail = O.AileronCmdNorm, Elv = O.ElevatorCmdNorm;
+    const float Rud = O.RudderCmdNorm,  ThrottleOut = O.ThrottleCmdNorm;
     JSBSim->Commands.Aileron    = Ail;
     JSBSim->Commands.Elevator   = Elv;
     JSBSim->Commands.Rudder     = Rud;
-    JSBSim->Commands.SpeedBrake = O.SpeedBrake;   // 과속 시 감속 보조 (리더 급감속 추종)
+    JSBSim->Commands.SpeedBrake = O.SpeedbrakeCmdNorm;   // 과속 시 감속 보조 (리더 급감속 추종)
     if (JSBSim->EngineCommands.Num() > 0)
         JSBSim->EngineCommands[0].Throttle = ThrottleOut;
+
+    // BT 피드백 상태 (5006 배치의 "guidance" 오브젝트)
+    Status.RollRefDeg = Refs.RollRefDeg; Status.PitchRefDeg = Refs.PitchRefDeg;
+    Status.AirspeedRefMps = Refs.AirspeedRefMps;
+    TSharedPtr<FUavGuidanceStatus>& StatusSlot = GuidanceStatusByPawn.FindOrAdd(PawnIdName(Pawn));
+    if (!StatusSlot.IsValid()) StatusSlot = MakeShared<FUavGuidanceStatus>();
+    *StatusSlot = Status;
 
     // Weapon triggers ride along with the setpoint (Phase 3). Missile edge
     // detection lives in UWeaponComponent; only forward ids > 0 so the msg
     // default (0 = never fired) can't be mistaken for a first shot.
     if (UWeaponComponent* Weapon = Pawn->FindComponentByClass<UWeaponComponent>())
     {
+        if (Setpoint.bGunFiring != Weapon->bGunFiring)   // [SGF-SP] TEMP: 5010 setpoint 경로 발원지 태그
+            UE_LOG(LogTemp, Warning, TEXT("[SGF-SP] %s req=%d"), *Pawn->GetName(), Setpoint.bGunFiring ? 1 : 0);
         Weapon->SetGunFiring(Setpoint.bGunFiring);
         if (Setpoint.MissileFireId > 0)
             Weapon->ConsumeMissileFireId(Setpoint.MissileFireId);
@@ -878,16 +1030,24 @@ void AUDPControlReceiver::ApplyAutopilotToPawn(APawn* Pawn, const FString& Key, 
         const TCHAR* ModeTag =
             (Setpoint.Mode == EGuidanceMode::Formation) ? TEXT("FORM") :
             (Setpoint.Mode == EGuidanceMode::Attack)    ? TEXT("ATK")  : TEXT("DIR");
+        // [§13] 현재 course와 yaw를 함께 기록 (course 피드백 검증용), 스로틀 FF/보정 분해.
         UE_LOG(LogTemp, Warning,
-            TEXT("[Inner] %s [%s] -> Hdg=%.0f Alt=%.0f V=%.0f Rff=%.1f | Psi=%.0f Phi=%.0f Alt=%.0f V=%.0f | Ail=%.2f Elv=%.2f Thr=%.2f"),
-            *Key, ModeTag, (float)HeadingCmd, (float)AltCmd, (float)SpeedCmd, (float)RollFf,
-            (float)PsiDeg, (float)PhiDeg, AltM, SpeedMps,
-            Ail, Elv, ThrottleOut);
+            TEXT("[Ref] %s [%s] -> CrsRef=%.0f RollRef=%.1f PitchRef=%.1f Vref=%.0f | Crs=%.0f Yaw=%.0f Phi=%.0f Alt=%.0f V=%.0f | Ail=%.2f Elv=%.2f Thr=%.2f(FF %.2f%+.2f)%s%s"),
+            *Key, ModeTag, (float)Refs.CourseRefDeg, (float)Refs.RollRefDeg,
+            (float)Refs.PitchRefDeg, (float)Refs.AirspeedRefMps,
+            (float)Ctl->Guidance.LastCurrentCourseDeg, (float)PsiDeg, (float)PhiDeg, AltM, SpeedMps,
+            Ail, Elv, ThrottleOut,
+            (float)Ctl->Controller.LastThrottleFF, (float)Ctl->Controller.LastThrottleCorr,
+            Ctl->Controller.bAilSaturated ? TEXT(" AIL-SAT") : TEXT(""),
+            Ctl->Controller.bElvSaturated ? TEXT(" ELV-SAT") : TEXT(""));
         if (Setpoint.Mode == EGuidanceMode::Formation)
-            UE_LOG(LogTemp, Warning, TEXT("[Guid] %s along=%+.0f cross=%+.0f omega=%+.2fdps%s"),
-                *Key, (float)Ctl->Formation.LastEAlongM, (float)Ctl->Formation.LastECrossM,
-                (float)(Ctl->Formation.OmegaFilt * 57.29577951),
-                Ctl->Formation.bRejoin ? TEXT(" REJOIN") : TEXT(""));
+            UE_LOG(LogTemp, Warning,
+                TEXT("[Guid] %s along=%+.0f cross=%+.0f vert=%+.0f omega=%+.2fdps sep=%.0f cap=%d mnt=%d%s%s"),
+                *Key, (float)Status.EAlongM, (float)Status.ECrossM, (float)Status.EVertM,
+                (float)(Ctl->Formation.OmegaFilt * 57.29577951), (float)Status.SeparationM,
+                Status.bCaptured ? 1 : 0, Status.bMaintained ? 1 : 0,
+                Status.bRejoin ? TEXT(" REJOIN") : TEXT(""),
+                Status.bSepWarning ? TEXT(" ★SEP-WARN") : TEXT(""));
     }
 }
 
@@ -1141,6 +1301,7 @@ bool AUDPControlReceiver::ApplyControlCommandToPawn(APawn* Pawn, const FRemoteCo
         if (!Health->IsAlive())
         {
             UavControls.Remove(PawnIdName(Pawn));
+            GuidanceStatusByPawn.Remove(PawnIdName(Pawn));
             return false;
         }
     }
@@ -1196,6 +1357,8 @@ bool AUDPControlReceiver::ApplyControlCommandToPawn(APawn* Pawn, const FRemoteCo
     // Weapon triggers (Phase 3) — same semantics as the autopilot path.
     if (UWeaponComponent* Weapon = Pawn->FindComponentByClass<UWeaponComponent>())
     {
+        if (Command.bGunFiring != Weapon->bGunFiring)   // [SGF-CMD] TEMP: 5005 수동조종 경로 발원지 태그
+            UE_LOG(LogTemp, Warning, TEXT("[SGF-CMD] %s req=%d"), *Pawn->GetName(), Command.bGunFiring ? 1 : 0);
         Weapon->SetGunFiring(Command.bGunFiring);
         if (Command.MissileFireId > 0)
         {
@@ -1399,6 +1562,36 @@ TSharedPtr<FJsonObject> AUDPControlReceiver::BuildPawnState(APawn* Pawn)
     if (const UWeaponComponent* Weapon = Pawn->FindComponentByClass<UWeaponComponent>())
     {
         PawnJson->SetNumberField(TEXT("missile_count"), Weapon->MissileCount);
+    }
+
+    // 유도 상태 피드백 — BT의 CheckFormationCaptured/Maintained가 소비한다.
+    // (BT가 편대 오차를 재계산하지 않도록 UE가 판정 결과를 내려보낸다.)
+    if (const TSharedPtr<FUavGuidanceStatus>* Found = GuidanceStatusByPawn.Find(PawnIdName(Pawn)))
+    {
+        if (Found->IsValid())
+        {
+            const FUavGuidanceStatus& G = **Found;
+            const TSharedPtr<FJsonObject> GuidJson = MakeShared<FJsonObject>();
+            GuidJson->SetStringField(TEXT("mode"),
+                G.Mode == EGuidanceMode::Formation ? TEXT("formation") :
+                G.Mode == EGuidanceMode::Attack    ? TEXT("attack")    : TEXT("direct"));
+            GuidJson->SetNumberField(TEXT("e_along_m"),    G.EAlongM);
+            GuidJson->SetNumberField(TEXT("e_cross_m"),    G.ECrossM);
+            GuidJson->SetNumberField(TEXT("e_vert_m"),     G.EVertM);
+            GuidJson->SetNumberField(TEXT("closing_mps"),  G.ClosingMps);
+            GuidJson->SetNumberField(TEXT("separation_m"), G.SeparationM);
+            GuidJson->SetNumberField(TEXT("slot_dist_m"),  G.SlotDistM);
+            GuidJson->SetBoolField(TEXT("captured"),   G.bCaptured);
+            GuidJson->SetBoolField(TEXT("maintained"), G.bMaintained);
+            GuidJson->SetBoolField(TEXT("rejoin"),     G.bRejoin);
+            GuidJson->SetBoolField(TEXT("sep_breach"), G.bSepBreach);
+            GuidJson->SetBoolField(TEXT("separation_warning"), G.bSepWarning);   // [§7-6]
+            GuidJson->SetNumberField(TEXT("seq"),        G.SeqId);
+            GuidJson->SetNumberField(TEXT("roll_ref"),   G.RollRefDeg);
+            GuidJson->SetNumberField(TEXT("pitch_ref"),  G.PitchRefDeg);
+            GuidJson->SetNumberField(TEXT("speed_ref"),  G.AirspeedRefMps);
+            PawnJson->SetObjectField(TEXT("guidance"), GuidJson);
+        }
     }
 
     const TSharedPtr<FJsonObject> WeaponsJson = MakeShared<FJsonObject>();

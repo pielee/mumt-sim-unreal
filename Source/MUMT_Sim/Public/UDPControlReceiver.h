@@ -1,7 +1,6 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "BVRGymAutopilot.h"
 #include "Dom/JsonObject.h"
 #include "GameFramework/Actor.h"
 #include "IPAddress.h"
@@ -11,9 +10,11 @@
 
 class APawn;
 class UJSBSimMovementComponent;
-// Per-UAV stick-controller + autothrottle state; defined in the .cpp so
-// Controller_CY.h (which redefines PI via BT_Geometry) stays out of this header.
+// Per-UAV 3계층 제어 스택 상태 (FormationGuidance/FixedWingGuidance/F16CommandController)
+// — .cpp 정의 (헤더 의존 최소화).
 struct FUavControl;
+// 마지막 유도 계산 결과 (5006 상태 피드백용) — .cpp 정의.
+struct FUavGuidanceStatus;
 // 인엔진 편대 시험 상태 (스크립트 리더 + 슬롯오차 기록) — .cpp 정의.
 struct FFormationTest;
 
@@ -29,24 +30,24 @@ struct FRemoteControlCommand
     int64 MissileFireId = 0;   // 0 = never fired (msg default); fire on change of id > 0
 };
 
-// 유도 모드: BT는 모드·대상만 지정하고 heading/alt/speed 숫자 계산은 UE가 60Hz로 수행.
+// 유도 모드: BT는 모드·대상만 지정하고 연속 수치 계산은 UE 3계층 스택이 60Hz로 수행.
 // Direct = 기존 방식(setpoint의 heading/alt/speed 그대로) — 구 시나리오 완전 호환.
 enum class EGuidanceMode : uint8
 {
-    Direct,      // ""/"direct"
-    Formation,   // leader_name pawn 직독 → 슬롯+ω×r+벡터필드+roll_ff (FFormationGuidance)
-    Attack,      // target_name pawn 직독 → pursuit heading/alt/speed (FPursuitGuidance)
+    Direct,      // ""/"direct" — heading/alt/speed → FixedWingGuidance::StepDirect
+    Formation,   // leader_name pawn 직독 → FormationGuidance → FixedWingGuidance
+    Attack,      // target_name pawn 직독 → FPursuitGuidance → StepDirect
 };
 
 // High-level autopilot setpoint for one UAV (heading/altitude/speed-or-throttle).
 struct FUavSetpoint
 {
-    float HeadingDeg     = 0.f;   // 목표 헤딩(0=북) → 내루프 roll_ref
-    float AltitudeM      = 0.f;   // 목표 고도(UE-Z, m) → 내루프 theta_ref
-    float RollFfDeg      = 0.f;   // 뱅크 피드포워드(deg) — 편대 유도의 선회 지연 보상
+    float HeadingDeg     = 0.f;   // 목표 헤딩(0=북) → course reference
+    float AltitudeM      = 0.f;   // 목표 고도(UE-Z, m) → altitude reference
+    float RollFfDeg      = 0.f;   // 뱅크 피드포워드(deg) — direct 모드 외부 보상용
     float Throttle       = 0.8f;  // used only when TargetSpeedMps <= 0 (open-loop)
-    float TargetSpeedMps = 0.f;   // >0 → autothrottle holds this airspeed
-    // ── 유도 모드 (Phase 4: 인엔진 60Hz 유도) ──
+    float TargetSpeedMps = 0.f;   // >0 → airspeed reference (속도 PI가 유지)
+    // ── 유도 모드 ──
     EGuidanceMode Mode = EGuidanceMode::Direct;
     FString LeaderName;           // formation: 리더 pawn 이름 (setpoint 키와 동일 매칭 규칙)
     FString TargetName;           // attack: 표적 pawn 이름
@@ -56,16 +57,19 @@ struct FUavSetpoint
     float MinSpeedMps = 70.f;     // 유도 속도 한계
     float MaxSpeedMps = 335.f;
     float MinAltM     = 0.f;      // 유도 고도 하한(UE-Z m). 0 = 가드 없음
+    // ── 편대 판정·안전 한계 (신규 프로토콜 v2) ──
+    float CaptureTolM    = 0.f;   // 슬롯 캡처 톨러런스(3D m). 0 → 기본 30
+    float MaintainTolM   = 0.f;   // 편대 유지 톨러런스(3D m). 0 → 기본 50
+    float MinSeparationM = 0.f;   // 리더와의 3D 최소 안전거리. 0 = 검사 없음
+    float MaxClosingMps  = 0.f;   // 슬롯 접근 폐속도 상한. 0 = 제한 없음
+    // ── 패킷 검증 (신규 프로토콜 v2) ──
+    uint32 SequenceId      = 0;   // 0 = 미사용. >0 이면 기체별 단조증가 — 낡은 패킷 폐기
+    double TimestampS      = 0.0; // 송신 unix 시각(초). 진단용
+    uint8  ProtocolVersion = 0;   // 0/1 = 구 발신자, 2 = 편대 프로토콜
     bool  LaunchMissile  = false; // deprecated — use MissileFireId
     // Weapon triggers (Phase 3) — optional fields, keep defaults for old senders.
     bool  bGunFiring     = false; // level-triggered: fire while true
     int64 MissileFireId  = 0;     // edge-triggered: one shot per new id (0 = never fired)
-    // Waypoint control (StickController). Target point in UE world coords (cm),
-    // same frame as BuildPawnState x/y/z. UE converts to N/E/Up meters for GetStick.
-    bool  bUseWaypoint   = false; // true → fly to Target* via stick controller
-    float TargetX        = 0.f;   // UE world X (East, cm)
-    float TargetY        = 0.f;   // UE world Y (South, cm)
-    float TargetZ        = 0.f;   // UE world Z (Up, cm)
 };
 
 UCLASS()
@@ -135,9 +139,11 @@ private:
 
     // Autopilot state (game-thread only) — PER-UAV, keyed by aircraft name.
     // Multiple UAVs (each driven by its own BT) get their own setpoint slot and
-    // their own PID controller instance (so their control state never mixes).
+    // their own control-stack instance (so their control state never mixes).
     TMap<FString, FUavSetpoint>            Setpoints;    // aircraft name -> latest setpoint
-    TMap<FString, TSharedPtr<FUavControl>> UavControls;  // aircraft name -> stick controller + autothrottle
+    TMap<FString, TSharedPtr<FUavControl>> UavControls;  // aircraft name -> 3계층 제어 스택
+    TMap<FString, uint32>                  LastSetpointSeq;      // aircraft name -> 마지막 sequence_id
+    TMap<FString, TSharedPtr<FUavGuidanceStatus>> GuidanceStatusByPawn; // pawn 이름 -> 5006 피드백
     TSharedPtr<FFormationTest>             FormationTest;
     FTimerHandle AutopilotTimerHandle;
     FTimerHandle StateSendTimerHandle;
@@ -167,49 +173,45 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
     FString UavNamePattern = TEXT("UAV");
 
-    // ── BVRGym Autopilot ─────────────────────────────────────────────────
+    // ── Autopilot (3계층 스택) ────────────────────────────────────────────
 
-    // Port the bridge sends binary setpoint packets to (msg_type 0x01)
+    // Port the bridge sends JSON setpoint packets to
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|UDP")
     int32 SetpointListenPort = 5010;
 
-    // Enable to fly the cached target toward a point ahead of its nose, driving the
-    // same waypoint/stick path as a real setpoint (PIE tuning without ROS).
+    // Enable to fly the cached target straight ahead (direct 모드 setpoint 주입) —
+    // ROS 없이 PIE에서 reference 추종/게인 튜닝용.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Debug")
     bool bUseDebugSetpoint = false;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Debug",
               meta = (EditCondition = "bUseDebugSetpoint"))
-    float DebugForwardM = 3000.f;      // look-at point this far ahead of the nose
+    float DebugUpM = 1000.f;           // climb this far above the spawn altitude
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Debug",
               meta = (EditCondition = "bUseDebugSetpoint"))
-    float DebugUpM = 1000.f;           // ...and this far above current altitude
+    float DebugTargetSpeedMps = 220.f; // airspeed reference for the debug flight
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Debug",
-              meta = (EditCondition = "bUseDebugSetpoint"))
-    float DebugTargetSpeedMps = 220.f; // autothrottle target for the debug flight
-
-    // Autothrottle (speed-hold). Output is throttle [0,1]; integrator carries the
-    // trim throttle, so Ki*IntegMax should be ≈ 1. Active only when a setpoint
-    // provides target_speed_mps > 0. (Surface control is now StickController;
-    // BVRGym's surface PIDs/NavParams were removed.)
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Gains")
-    FPID ThrottlePIDConfig = {0.02f, 0.004f, 0.f, 0.f, 250.f};
+    // ── 유인기 조종 형성 레이어 (기본값 = 전부 OFF) ────────────────────────────
+    // 기본값에서 조이스틱 명령은 가공 없이 그대로 JSBSim에 들어간다
+    // (Aileron=Roll, Elevator=Pitch, Rudder=Yaw, Throttle=Throttle).
+    // 아래 셋을 켜면 편대비행용 형성 레이어가 다시 얹힌다:
+    //   MannedSpeedLimitMps 300 / MannedControlAuthority 0.4 / bMannedRollAssist true
 
     // Manned top-speed governor (m/s). Full power below the limit; throttle
-    // authority tapers above it (soft FBW-style speed protection). Default 300
-    // leaves the formation UAV (cap 335 = measured f16 Vmax) ~35 m/s closure
-    // margin so it can always catch the leader. 0 = off.
+    // authority tapers above it (soft FBW-style speed protection). 300 leaves the
+    // formation UAV (cap 335 = measured f16 Vmax) ~35 m/s closure margin so it can
+    // always catch the leader. 0 = off (raw throttle passthrough).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
-    float MannedSpeedLimitMps = 300.f;
+    float MannedSpeedLimitMps = 0.f;
 
     // Manned control authority: scales the joystick PITCH/YAW commands before the
     // flight model (roll too, but only when bMannedRollAssist is off). Throttle is
     // NOT scaled (governor handles top speed). Manned/joystick path only.
+    // 1.0 = no scaling (raw passthrough).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target",
               meta = (ClampMin = "0.05", ClampMax = "1.0"))
-    float MannedControlAuthority = 0.4f;
+    float MannedControlAuthority = 1.0f;
 
     // ── 유인기 Roll Assist (FBWA/PX4-Stabilized류 스틱 해석층) ─────────────────
     // f16 FCS는 rate-command FBW라 스틱 유지 = 무한정 롤(뱅크 상한 없음) → 리더 선회율이
@@ -217,8 +219,9 @@ public:
     //   목표뱅크 = 스틱 × BankLimit → 필요 롤레이트 = Kp×(목표−현재), ±RateLimit
     //   → /180 정규화(f16 FCS 규격: 1.0 = 180°/s) → aileron-cmd.
     // 효과: 스틱 유지 = 그 뱅크 유지(선회 유지), 놓으면 수평 복귀, 리더 ω 유계·평활.
+    // 기본 false = 스틱이 롤레이트 명령으로 그대로 통과(f16 FCS 원래 계약).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
-    bool bMannedRollAssist = true;
+    bool bMannedRollAssist = false;
 
     // 풀스틱 뱅크각. 무인기 뱅크캡이 70°이므로 65~70이 '편대 추종 보장' 범위 —
     // 그 이상은 도그파이트용(무인기가 순간적으로 밀릴 수 있음).
@@ -236,9 +239,8 @@ public:
               meta = (EditCondition = "bMannedRollAssist"))
     float MannedRollRateLimitDps = 120.f;
 
-    // StickController output → JSBSim surface sign/scale. Verify in PIE and flip a
-    // sign here (no recompile) if a surface is inverted. BVRGym left rudder at 0;
-    // StickController drives an active rudder, so its sign is unverified in-sim.
+    // F16CommandController 조종면 부호 미세조정 (PIE에서 리컴파일 없이 뒤집기).
+    // 이름은 구 튜닝값(배치된 레벨 액터에 직렬화)과의 호환을 위해 유지한다.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Stick")
     float StickAileronScale  = 1.f;
 
@@ -266,9 +268,6 @@ public:
     // 시험 종료 시 프로세스 종료 (헤드리스 배치 실행용). -FormationTestExit 로도 설정.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Test")
     bool bTestExitOnFinish = false;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Autopilot|Stick")
-    float StickRudderScale   = 1.f;
 
     // Read-only state display
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Autopilot|State")
